@@ -1,0 +1,53 @@
+{
+  "name": "@synonymdev/pubky-pulse-web",
+  "version": "0.1.0",
+  "description": "Pubky Pulse browser SDK",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc --noEmit && tsup",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jasonvdb/pubky-pulse-web.git"
+  },
+  "homepage": "https://github.com/Jasonvdb/pubky-pulse-web",
+  "bugs": "https://github.com/Jasonvdb/pubky-pulse-web/issues",
+  "keywords": [
+    "pubky-pulse",
+    "pubky",
+    "analytics",
+    "observability",
+    "browser"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

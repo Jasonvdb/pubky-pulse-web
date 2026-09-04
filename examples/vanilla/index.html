@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pubky Pulse web SDK playground</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --paper: #fbfbfa;
+        --surface: #ffffff;
+        --field: #f2f3f4;
+        --ink: #14181d;
+        --ink-soft: #5c646e;
+        --line: #dcdfe4;
+        --signal: #0f6a6a;
+        --warn: #8a5a06;
+        --danger: #a32f22;
+        --stream: #f6f7f7;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --paper: #101317;
+          --surface: #171b20;
+          --field: #1f242a;
+          --ink: #e7eaed;
+          --ink-soft: #98a1ab;
+          --line: #2b3138;
+          --signal: #4fb3ad;
+          --warn: #d3a548;
+          --danger: #e2705f;
+          --stream: #12161a;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+        font-size: 15px;
+        line-height: 1.55;
+      }
+
+      main {
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 40px 24px 64px;
+        display: grid;
+        gap: 32px;
+        grid-template-columns: minmax(0, 340px) minmax(0, 1fr);
+        align-items: start;
+      }
+
+      @media (max-width: 860px) {
+        main {
+          grid-template-columns: minmax(0, 1fr);
+          padding: 28px 18px 48px;
+        }
+      }
+
+      header {
+        grid-column: 1 / -1;
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 20px;
+      }
+
+      h1 {
+        margin: 0 0 6px;
+        font-size: 26px;
+        font-weight: 620;
+        letter-spacing: -0.015em;
+      }
+
+      header p {
+        margin: 0;
+        max-width: 62ch;
+        color: var(--ink-soft);
+      }
+
+      h2 {
+        margin: 0 0 12px;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--ink-soft);
+      }
+
+      section + section {
+        margin-top: 28px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 12px;
+        font-size: 13px;
+        color: var(--ink-soft);
+      }
+
+      input {
+        display: block;
+        width: 100%;
+        margin-top: 4px;
+        padding: 9px 11px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--field);
+        color: var(--ink);
+        font: inherit;
+        font-size: 14px;
+      }
+
+      input:focus-visible,
+      button:focus-visible {
+        outline: 2px solid var(--signal);
+        outline-offset: 2px;
+      }
+
+      button {
+        padding: 8px 13px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--ink);
+        font: inherit;
+        font-size: 14px;
+        cursor: pointer;
+      }
+
+      button:hover:not(:disabled) {
+        border-color: var(--signal);
+        color: var(--signal);
+      }
+
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+
+      button.primary {
+        background: var(--signal);
+        border-color: var(--signal);
+        color: var(--paper);
+        font-weight: 560;
+      }
+
+      button.primary:hover:not(:disabled) {
+        color: var(--paper);
+        filter: brightness(1.08);
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .state {
+        margin: 14px 0 0;
+        font-size: 13px;
+        color: var(--ink-soft);
+      }
+
+      .state b {
+        font-weight: 560;
+        color: var(--ink);
+      }
+
+      .stream {
+        background: var(--stream);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        min-height: 420px;
+        max-height: 70vh;
+        overflow-y: auto;
+        padding: 6px 0;
+      }
+
+      .stream p {
+        margin: 0;
+        padding: 24px 18px;
+        color: var(--ink-soft);
+        max-width: 46ch;
+      }
+
+      .line {
+        display: grid;
+        grid-template-columns: 68px minmax(0, 1fr);
+        gap: 12px;
+        padding: 5px 16px 5px 13px;
+        border-left: 3px solid transparent;
+        font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+        font-size: 12.5px;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .line time {
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .line.info {
+        border-left-color: var(--signal);
+      }
+
+      .line.warn {
+        border-left-color: var(--warn);
+      }
+
+      .line.error {
+        border-left-color: var(--danger);
+        color: var(--danger);
+      }
+
+      .line.note {
+        color: var(--ink-soft);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Pubky Pulse web SDK playground</h1>
+        <p>
+          Point this page at a Pubky Pulse server, configure the SDK, then fire events and watch
+          what the SDK reports. Everything below runs the built SDK from
+          <code>dist/index.js</code>, so build it first with <code>npm run build</code>.
+        </p>
+      </header>
+
+      <div>
+        <section>
+          <h2>Connection</h2>
+          <label>
+            Endpoint
+            <input id="endpoint" type="url" value="http://localhost:4010" />
+          </label>
+          <label>
+            Client API key
+            <input id="api-key" type="text" placeholder="pulse_client_…" autocomplete="off" />
+          </label>
+          <label>
+            Bundle id
+            <input id="bundle-id" type="text" placeholder="com.example.web" autocomplete="off" />
+          </label>
+          <div class="actions">
+            <button id="configure" class="primary" type="button">Configure</button>
+            <button id="flush" type="button" disabled>Flush now</button>
+          </div>
+          <p class="state" id="state">Not configured yet.</p>
+        </section>
+
+        <section>
+          <h2>Send something</h2>
+          <div class="actions">
+            <button id="send-event" type="button" disabled>Log an event</button>
+            <button id="send-error" type="button" disabled>Throw an error</button>
+            <button id="send-metric" type="button" disabled>Time an operation</button>
+            <button id="send-step" type="button" disabled>Record a funnel step</button>
+            <button id="set-user" type="button" disabled>Identify user</button>
+            <button id="send-feedback" type="button" disabled>Send feedback</button>
+          </div>
+        </section>
+      </div>
+
+      <section>
+        <h2>Live stream</h2>
+        <div class="stream" id="stream" role="log" aria-live="polite">
+          <p>Fill in a key and bundle id, then configure. Events show up here as they are logged.</p>
+        </div>
+      </section>
+    </main>
+
+    <script type="module">
+      import { Pulse } from "../../dist/index.js";
+
+      const stream = document.getElementById("stream");
+      const state = document.getElementById("state");
+      const gated = [...document.querySelectorAll("button[disabled]")];
+      let started = 0;
+
+      function append(level, text) {
+        stream.querySelector("p")?.remove();
+        const line = document.createElement("div");
+        line.className = `line ${level}`;
+        const elapsed = started ? (performance.now() - started) / 1000 : 0;
+        const stamp = document.createElement("time");
+        stamp.textContent = `+${elapsed.toFixed(2)}s`;
+        const body = document.createElement("span");
+        body.textContent = text;
+        line.append(stamp, body);
+        stream.append(line);
+        stream.scrollTop = stream.scrollHeight;
+      }
+
+      // Mirror the SDK's own console output into the pane so the stream shows
+      // what the SDK reports, not just what this page asked it to do.
+      for (const [method, level] of [
+        ["log", "info"],
+        ["warn", "warn"],
+        ["error", "error"],
+      ]) {
+        const original = console[method].bind(console);
+        console[method] = (...args) => {
+          original(...args);
+          if (typeof args[0] === "string" && args[0].startsWith("[pulse]")) {
+            append(level, args[0].slice(8));
+          }
+        };
+      }
+
+      function refreshState() {
+        state.innerHTML = `Session <b>${Pulse.sessionId ?? "—"}</b> · user <b>${
+          Pulse.currentUserId ?? "—"
+        }</b>`;
+      }
+
+      document.getElementById("configure").addEventListener("click", () => {
+        try {
+          Pulse.configure({
+            endpoint: document.getElementById("endpoint").value.trim(),
+            apiKey: document.getElementById("api-key").value.trim(),
+            bundleId: document.getElementById("bundle-id").value.trim(),
+            appVersion: "0.0.0-playground",
+            debug: true,
+          });
+        } catch (err) {
+          append("error", err instanceof Error ? err.message : String(err));
+          return;
+        }
+        started = performance.now();
+        for (const button of gated) button.disabled = false;
+        append("note", "configured");
+        refreshState();
+      });
+
+      document.getElementById("send-event").addEventListener("click", () => {
+        Pulse.info("playground_event", { source: "vanilla-example" });
+      });
+
+      document.getElementById("send-error").addEventListener("click", () => {
+        try {
+          throw new Error("Playground failure");
+        } catch (err) {
+          Pulse.error(err, "checkout failed", { cart_size: "3" });
+        }
+      });
+
+      document.getElementById("send-metric").addEventListener("click", async () => {
+        const operation = Pulse.startOperation("playground-work", { size: "small" });
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        operation.complete({ items: "12" });
+      });
+
+      document.getElementById("send-step").addEventListener("click", () => {
+        Pulse.step("playground_step", { variant: "b" });
+      });
+
+      document.getElementById("set-user").addEventListener("click", async () => {
+        await Pulse.setUser(`playground-${Math.random().toString(36).slice(2, 8)}`);
+        append("note", "user identified; anonymous events claimed");
+        refreshState();
+      });
+
+      document.getElementById("send-feedback").addEventListener("click", async () => {
+        try {
+          const receipt = await Pulse.sendFeedback("Hello from the playground.", {
+            name: "Playground",
+            email: "playground@example.com",
+          });
+          append("note", `feedback stored as ${receipt.id}`);
+        } catch (err) {
+          append("error", err instanceof Error ? err.message : String(err));
+        }
+      });
+
+      document.getElementById("flush").addEventListener("click", async () => {
+        await Pulse.flush();
+        append("note", "flushed");
+      });
+    </script>
+  </body>
+</html>
