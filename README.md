@@ -326,8 +326,8 @@ await Pulse.setUserProperties({
 
 Buffered events are flushed first, so the properties attach to the same id those events carry.
 The promise resolves once the attempt finishes, not once the server has accepted the properties:
-a rejected request is dropped and an unreachable one is parked for a later retry, neither of which
-throws. Turn on `debug` to see those drops.
+a rejected request is dropped, and an unreachable one is retried a few times with backoff and then
+dropped. Neither throws — turn on `debug` to see the drops.
 
 ## Feedback
 
