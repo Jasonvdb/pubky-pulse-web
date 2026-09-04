@@ -458,6 +458,30 @@ describe("Transport", () => {
       expect(queue.read().map((e) => e.client_event_id)).toEqual(["event-0"]);
     });
 
+    it("is spilled, not resent, while a Retry-After the server asked for runs", async () => {
+      fetchMock.mockResolvedValue(
+        new Response("later", { status: 429, headers: { "Retry-After": "30" } }),
+      );
+      const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+      const flushed = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      tx.flushOnUnload();
+
+      // The server asked for thirty seconds and a hidden page is no reason to
+      // ignore it: nothing is sent, and the batch is parked for a later flush.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(queue.read().map((e) => e.client_event_id)).toEqual(["event-0"]);
+
+      await vi.advanceTimersByTimeAsync(6 * MAX_RETRY_AFTER_MS);
+      await flushed;
+
+      // The ladder gave up on a batch the unload took: still exactly one copy.
+      expect(queue.read().map((e) => e.client_event_id)).toEqual(["event-0"]);
+    });
+
     it("is parked by the ladder as usual when no unload took it", async () => {
       const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
       const { flushed } = await startStalledFlush(tx);

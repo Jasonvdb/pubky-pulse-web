@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_OFFLINE_EVENTS, OfflineQueue } from "../src/offline-queue";
 import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import type { LogEvent } from "../src/types";
@@ -34,7 +34,12 @@ function makeEvent(index: number): LogEvent {
 }
 
 function makeEvents(count: number): LogEvent[] {
-  return Array.from({ length: count }, (_, i) => makeEvent(i));
+  return makeRange(0, count);
+}
+
+/** `count` events numbered from `start`, so two batches stay tellable apart. */
+function makeRange(start: number, count: number): LogEvent[] {
+  return Array.from({ length: count }, (_, i) => makeEvent(start + i));
 }
 
 describe("OfflineQueue", () => {
@@ -202,6 +207,80 @@ describe("OfflineQueue", () => {
 
     it("writes nothing for an empty batch", () => {
       queue.spill([]);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+  });
+
+  describe("the aggregate cap", () => {
+    /** Spill at a distinct instant, so the keys sort in the order written. */
+    function spillAt(second: number, events: LogEvent[]): void {
+      vi.setSystemTime(new Date(Date.UTC(2026, 8, 4, 0, 0, second)));
+      queue.spill(events);
+    }
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("assembles spills oldest first whatever order storage lists the keys", async () => {
+      // `localStorage` promises nothing about key order; this one is hostile.
+      class ReversedStorage extends MemoryStorage {
+        override key(index: number): string | null {
+          const all = this.keys();
+          return all[all.length - 1 - index] ?? null;
+        }
+      }
+
+      Object.defineProperty(globalThis, "localStorage", {
+        value: new ReversedStorage(),
+        configurable: true,
+      });
+      try {
+        for (const index of [0, 1, 2]) spillAt(index, [makeEvent(index)]);
+
+        const ids = ["event-0", "event-1", "event-2"];
+        expect(queue.read().map((event) => event.client_event_id)).toEqual(ids);
+        expect((await queue.drain()).map((event) => event.client_event_id)).toEqual(ids);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: testLocalStorage,
+          configurable: true,
+        });
+      }
+    });
+
+    it("drops the oldest whole spill rather than growing past the cap", () => {
+      const half = MAX_OFFLINE_EVENTS / 2;
+      spillAt(0, makeRange(0, half));
+      spillAt(1, makeRange(half, half));
+      // The queue is exactly full, so this one costs the oldest spill its key.
+      spillAt(2, makeRange(MAX_OFFLINE_EVENTS, 1));
+
+      const stored = queue.read();
+      expect(spillKeys()).toHaveLength(2);
+      expect(stored).toHaveLength(half + 1);
+      expect(stored[0]?.client_event_id).toBe(`event-${half}`);
+      expect(stored.at(-1)?.client_event_id).toBe(`event-${MAX_OFFLINE_EVENTS}`);
+    });
+
+    it("trims to the newest events when the shared key alone fills the cap", async () => {
+      await queue.append(makeRange(0, MAX_OFFLINE_EVENTS));
+      // Nothing can be shed here — rewriting the shared key needs the lock a
+      // spill has no turn to await — so the readers trim instead.
+      spillAt(0, makeRange(MAX_OFFLINE_EVENTS, 100));
+
+      const stored = queue.read();
+      expect(stored).toHaveLength(MAX_OFFLINE_EVENTS);
+      expect(stored[0]?.client_event_id).toBe("event-100");
+      expect(stored.at(-1)?.client_event_id).toBe(`event-${MAX_OFFLINE_EVENTS + 99}`);
+
+      const drained = await queue.drain();
+      expect(drained).toHaveLength(MAX_OFFLINE_EVENTS);
+      expect(drained[0]?.client_event_id).toBe("event-100");
       expect(testLocalStorage.keys()).toEqual([]);
     });
   });

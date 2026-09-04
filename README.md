@@ -498,7 +498,9 @@ itself offline queue up rather than fail.
 That queue is shared by every tab on the origin, so the SDK serialises its reads and writes with the
 [Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API). The unload path has
 no turn left in which to wait for a lock, so it writes its leftovers to a key of its own that the
-next flush folds back in and removes.
+next flush folds back in and removes. While a `Retry-After` the server asked for is still running it
+sends nothing at all and parks everything instead, so a page merely going hidden cannot talk the SDK
+out of the delay.
 
 A failed request is retried with exponential backoff, one second doubling to thirty. A `Retry-After`
 header on a `429` or a `503` extends that wait — it never shortens it — to at most a minute. A batch

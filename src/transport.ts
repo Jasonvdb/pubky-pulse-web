@@ -100,6 +100,12 @@ export class Transport {
   private inFlight: LogEvent[] | null = null;
   /** True once the unload flush took `inFlight`, so it is not parked twice. */
   private inFlightTaken = false;
+  /**
+   * The instant a `Retry-After` asked us to wait until, or 0 when no request
+   * is serving one out. The unload flush honours it rather than resending the
+   * sleeping batch straight away over keepalive.
+   */
+  private backoffUntil = 0;
 
   constructor(
     config: ValidatedConfig,
@@ -184,6 +190,14 @@ export class Transport {
       // park everything rather than firing a request that cannot succeed.
       this.queue.spill(pending);
       this.onDebug?.("offline, skipping keepalive flush");
+      return;
+    }
+
+    if (now < this.backoffUntil) {
+      // The server asked for a delay and a hidden page is no reason to ignore
+      // it. Park everything instead; it goes out on the next flush or load.
+      this.queue.spill(pending);
+      this.onDebug?.("waiting out Retry-After, skipping keepalive flush");
       return;
     }
 
@@ -400,7 +414,14 @@ export class Transport {
           this.onDebug?.(`offline, abandoning ${label}`);
           return "park";
         }
-        await sleep(retryDelayMs(attempt, retryAfterMs));
+        const delay = retryDelayMs(attempt, retryAfterMs);
+        // Only a delay the server asked for parks the unload flush; a plain
+        // backoff is our own guess, which a page going away may cut short.
+        // Cleared on the way out, so the next attempt — and the request
+        // succeeding or the ladder ending — leaves nothing behind.
+        if (retryAfterMs !== null) this.backoffUntil = Date.now() + delay;
+        await sleep(delay);
+        this.backoffUntil = 0;
       }
     }
 
