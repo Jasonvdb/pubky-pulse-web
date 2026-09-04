@@ -31,8 +31,11 @@ export async function gzip(value: string): Promise<Uint8Array<ArrayBuffer> | nul
   try {
     const stream = new Ctor("gzip");
     const writer = stream.writable.getWriter();
-    void writer.write(new TextEncoder().encode(value));
-    void writer.close();
+    // The rejections surface through the awaited read below; without these
+    // no-op handlers a mid-flight codec failure escapes as an unhandled
+    // rejection, which the SDK's own global hook would report as an app error.
+    writer.write(new TextEncoder().encode(value)).catch(() => {});
+    writer.close().catch(() => {});
     const buffer = await new Response(stream.readable).arrayBuffer();
     return new Uint8Array(buffer);
   } catch {

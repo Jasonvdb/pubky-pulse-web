@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AttachmentUploader, inferContentType } from "../src/attachment-uploader";
+import {
+  AttachmentUploader,
+  inferContentType,
+  MAX_ATTACHMENT_BYTES,
+  MAX_UPLOAD_TIMEOUT_MS,
+  uploadTimeoutMs,
+} from "../src/attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "../src/configuration";
+import { REQUEST_TIMEOUT_MS } from "../src/transport";
 import { resetTestEnvironment } from "./setup";
 
 const EVENT_ID = "11111111-1111-4111-8111-111111111111";
@@ -57,6 +64,14 @@ describe("inferContentType", () => {
   });
 });
 
+describe("uploadTimeoutMs", () => {
+  it("scales with size and stays under the ceiling", () => {
+    expect(uploadTimeoutMs(1)).toBeGreaterThan(REQUEST_TIMEOUT_MS);
+    expect(uploadTimeoutMs(8 * 1024 * 1024)).toBeGreaterThan(uploadTimeoutMs(1024));
+    expect(uploadTimeoutMs(MAX_ATTACHMENT_BYTES)).toBe(MAX_UPLOAD_TIMEOUT_MS);
+  });
+});
+
 describe("AttachmentUploader", () => {
   beforeEach(() => {
     resetTestEnvironment();
@@ -68,6 +83,37 @@ describe("AttachmentUploader", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("aborts a stalled reserve at the ingest budget and the put on a size-scaled one", async () => {
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    const bytes = new Uint8Array(3 * 1024 * 1024);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: bytes, filename: "big.bin" }]);
+    await uploader.flush();
+
+    expect(timeout).toHaveBeenNthCalledWith(1, REQUEST_TIMEOUT_MS);
+    expect(timeout).toHaveBeenNthCalledWith(2, uploadTimeoutMs(bytes.length));
+    expect(callsTo("/v1/ingest/attachment")[0]![1].signal).toBeInstanceOf(AbortSignal);
+    expect(callsTo("uploads.example.com")[0]![1].signal).toBeInstanceOf(AbortSignal);
+    timeout.mockRestore();
+  });
+
+  it("hashes only the bytes a view spans, not its backing buffer", async () => {
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    const backing = new Uint8Array([9, 9, 1, 2, 3, 4, 9, 9]);
+    const view = backing.subarray(2, 6);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: view, filename: "slice.bin" }]);
+    await uploader.flush();
+
+    const body = JSON.parse(callsTo("/v1/ingest/attachment")[0]![1].body as string) as {
+      sha256: string;
+      size_bytes: number;
+    };
+    expect(body.size_bytes).toBe(4);
+    expect(body.sha256).toBe(sha256(new Uint8Array([1, 2, 3, 4])));
   });
 
   it("reserves then uploads a Uint8Array", async () => {

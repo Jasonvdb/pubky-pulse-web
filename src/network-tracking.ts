@@ -47,8 +47,42 @@ export function stripQuery(url: string): string {
   return cut === -1 ? url : url.slice(0, cut);
 }
 
-function matchesPrefix(candidates: string[], prefixes: string[]): boolean {
-  return prefixes.some((prefix) => prefix !== "" && candidates.some((c) => c.startsWith(prefix)));
+/** A prefix may only end at the url's end or at a `/`, `?` or `#` boundary. */
+function boundedPrefix(candidate: string, prefix: string): boolean {
+  if (!candidate.startsWith(prefix)) return false;
+  const next = candidate.charAt(prefix.length);
+  return next === "" || next === "/" || next === "?" || next === "#";
+}
+
+/**
+ * Both sides are absolutised first, so a relative prefix such as `/api` keeps
+ * working and `https://api.example.com` cannot match the look-alike host
+ * `https://api.example.com.attacker.tld`.
+ */
+function matchesPrefix(raw: string, absolute: string | undefined, prefixes: string[]): boolean {
+  return prefixes.some((prefix) => {
+    if (prefix === "") return false;
+    const resolvedPrefix = absoluteUrl(prefix);
+    if (absolute === undefined || resolvedPrefix === undefined) return raw.startsWith(prefix);
+    // `new URL("https://a.example").href` gains a trailing slash; drop it so
+    // the boundary check, not the slash, decides the match.
+    return boundedPrefix(absolute, resolvedPrefix.replace(/\/$/, ""));
+  });
+}
+
+/**
+ * Userinfo is stripped alongside the query: `https://user:token@host/path`
+ * would otherwise ship the embedded credentials to the ingest endpoint.
+ */
+function sanitizeUrl(raw: string, absolute: string | undefined): string {
+  try {
+    const parsed = new URL(absolute ?? raw);
+    parsed.username = "";
+    parsed.password = "";
+    return stripQuery(parsed.href);
+  } catch {
+    return stripQuery(absolute ?? raw);
+  }
 }
 
 /** Debug for a healthy response, warn for anything the server refused. */
@@ -72,12 +106,11 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
   const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const raw = requestUrl(input);
     const absolute = absoluteUrl(raw);
-    const candidates = absolute && absolute !== raw ? [raw, absolute] : [raw];
 
-    if (matchesPrefix(candidates, [options.endpoint])) return call(input, init);
+    if (matchesPrefix(raw, absolute, [options.endpoint])) return call(input, init);
 
     let nextInit = init;
-    if (matchesPrefix(candidates, options.propagateSessionTo)) {
+    if (matchesPrefix(raw, absolute, options.propagateSessionTo)) {
       const sessionId = options.sessionId();
       if (sessionId) {
         // Passing the Request through as `input` keeps its method and body;
@@ -91,7 +124,7 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
     if (!options.trackRequests) return call(input, nextInit);
 
     const method = requestMethod(input, init);
-    const url = stripQuery(absolute ?? raw);
+    const url = sanitizeUrl(raw, absolute);
     const startedAt = nowMs();
 
     try {

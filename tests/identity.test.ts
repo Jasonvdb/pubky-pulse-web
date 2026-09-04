@@ -157,6 +157,38 @@ describe("IdentityManager", () => {
     expect(stored(ANONYMOUS_ID_KEY)).toBe(manager.anonymous);
   });
 
+  it("does not re-identify the user when clearUser lands during an in-flight claim", async () => {
+    const gate = deferred();
+    claim = vi.fn(() => gate.promise);
+
+    const manager = makeManager();
+    manager.load();
+    const anonymousId = manager.anonymous;
+
+    const pending = manager.setUser("user-8");
+    manager.clearUser();
+    gate.resolve();
+    await pending;
+
+    expect(manager.currentId).toBe(anonymousId);
+    expect(stored(USER_ID_KEY)).toBeNull();
+  });
+
+  it("settles two overlapping setUser calls on the latest caller", async () => {
+    const gate = deferred();
+    claim = vi.fn(() => gate.promise);
+
+    const manager = makeManager();
+    manager.load();
+
+    const pendingFirst = manager.setUser("user-9");
+    const pendingSecond = manager.setUser("user-10");
+    gate.resolve();
+    await Promise.all([pendingFirst, pendingSecond]);
+
+    expect(manager.currentId).toBe("user-10");
+  });
+
   it("can identify a new user after clearing the previous one", async () => {
     const manager = makeManager();
     manager.load();

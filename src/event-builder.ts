@@ -59,10 +59,15 @@ export function normalizeAttributes(
 ): Record<string, string> | undefined {
   if (!attrs) return undefined;
 
-  const result: Record<string, string> = {};
+  // Prototype-free: an own-property lookup keeps a key such as `toString`
+  // from resolving to an inherited function and bypassing the cap, and lets a
+  // `__proto__` key be stored as an ordinary attribute.
+  const result: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const [key, value] of Object.entries(attrs)) {
     if (value === undefined || value === null) continue;
-    const cap = RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES[key] ?? MAX_ATTRIBUTE_VALUE_LENGTH;
+    const cap = Object.hasOwn(RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES, key)
+      ? RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES[key]!
+      : MAX_ATTRIBUTE_VALUE_LENGTH;
     const str = typeof value === "string" ? value : String(value);
     result[key] = str.length > cap ? str.slice(0, cap) : str;
   }

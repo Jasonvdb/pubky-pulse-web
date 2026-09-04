@@ -127,6 +127,49 @@ describe("installNetworkTracking", () => {
     expect(sentHeaders(1).has(SESSION_HEADER)).toBe(false);
   });
 
+  it("refuses a look-alike host that merely starts with the prefix", async () => {
+    install({ propagateSessionTo: ["https://api.example.com"] });
+
+    await fetch("https://api.example.com.attacker.tld/orders");
+    await fetch("https://api.example.comx/orders");
+    await fetch("https://api.example.com/orders");
+
+    expect(sentHeaders(0).has(SESSION_HEADER)).toBe(false);
+    expect(sentHeaders(1).has(SESSION_HEADER)).toBe(false);
+    expect(sentHeaders(2).get(SESSION_HEADER)).toBe("session-1");
+  });
+
+  it("matches a relative prefix only at a path boundary", async () => {
+    install({ propagateSessionTo: ["/api"] });
+
+    await fetch("/api/orders");
+    await fetch("/api");
+    await fetch("/apixyz/orders");
+
+    expect(sentHeaders(0).get(SESSION_HEADER)).toBe("session-1");
+    expect(sentHeaders(1).get(SESSION_HEADER)).toBe("session-1");
+    expect(sentHeaders(2).has(SESSION_HEADER)).toBe(false);
+  });
+
+  it("still tracks a host that merely starts with the sdk endpoint", async () => {
+    install();
+
+    await fetch(`${ENDPOINT}.attacker.tld/v1/ingest`);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]![1]._http_url).toBe("https://pulse.example.com.attacker.tld/v1/ingest");
+  });
+
+  it("strips embedded credentials from the reported url", async () => {
+    const failure = new TypeError("Failed to fetch");
+    fetchMock.mockRejectedValue(failure);
+    install();
+
+    await expect(fetch("https://user:token@api.example.com/x?q=1")).rejects.toBe(failure);
+
+    expect(requests[0]![1]._http_url).toBe("https://api.example.com/x");
+  });
+
   it("keeps existing headers and the Request input intact", async () => {
     install({ propagateSessionTo: ["https://api.example.com"] });
     const request = new Request("https://api.example.com/orders", {

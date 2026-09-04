@@ -9,6 +9,37 @@ async function gunzip(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   return new Response(stream.readable).text();
 }
 
+/** A gzip stand-in whose transform fails after the writer accepted the chunk. */
+class FailingCompressionStream {
+  readable: ReadableStream<Uint8Array>;
+  writable: WritableStream<Uint8Array>;
+
+  constructor() {
+    const transform = new TransformStream<Uint8Array, Uint8Array>({
+      transform() {
+        throw new Error("codec failed");
+      },
+    });
+    this.readable = transform.readable;
+    this.writable = transform.writable;
+  }
+}
+
+async function withCompressionStream<T>(ctor: unknown, run: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "CompressionStream");
+  Object.defineProperty(globalThis, "CompressionStream", {
+    configurable: true,
+    writable: true,
+    value: ctor,
+  });
+  try {
+    return await run();
+  } finally {
+    Reflect.deleteProperty(globalThis, "CompressionStream");
+    if (original) Object.defineProperty(globalThis, "CompressionStream", original);
+  }
+}
+
 async function withoutCompressionStream<T>(run: () => Promise<T>): Promise<T> {
   const original = Object.getOwnPropertyDescriptor(globalThis, "CompressionStream");
   Reflect.deleteProperty(globalThis, "CompressionStream");
@@ -34,6 +65,24 @@ describe("gzip", () => {
     const compressed = await gzip(large);
     expect(compressed).toBeInstanceOf(Uint8Array);
     expect(await gunzip(compressed as Uint8Array<ArrayBuffer>)).toBe(large);
+  });
+
+  it("returns null without leaking an unhandled rejection when the codec fails", async () => {
+    const rejections: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      await withCompressionStream(FailingCompressionStream, async () => {
+        expect(await gzip(large)).toBeNull();
+      });
+      // Node reports an unhandled rejection a macrotask after it settles.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(rejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   it("returns null when the platform has no CompressionStream", async () => {

@@ -5,10 +5,27 @@
  */
 
 import type { ValidatedConfig } from "./configuration";
+import { REQUEST_TIMEOUT_MS } from "./transport";
 import type { PulseAttachment } from "./types";
 
 /** Absolute SDK safety net. Real limits are the project's server-side quotas. */
 export const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
+
+/** Fixed part of an upload's budget, before the size allowance. */
+export const UPLOAD_TIMEOUT_BASE_MS = 30_000;
+/** Allowance per megabyte, generous enough for a slow mobile connection. */
+export const UPLOAD_TIMEOUT_PER_MB_MS = 10_000;
+/** Ceiling, so a stalled upload can never hold `flush()` open indefinitely. */
+export const MAX_UPLOAD_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * Attachments run to 2 GiB, so the 10s ingest budget would abort legitimate
+ * large uploads; the PUT gets a size-derived budget instead.
+ */
+export function uploadTimeoutMs(sizeBytes: number): number {
+  const allowance = Math.ceil(sizeBytes / (1024 * 1024)) * UPLOAD_TIMEOUT_PER_MB_MS;
+  return Math.min(UPLOAD_TIMEOUT_BASE_MS + allowance, MAX_UPLOAD_TIMEOUT_MS);
+}
 
 const EXTENSION_CONTENT_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -54,9 +71,9 @@ function subtleCrypto(): SubtleCrypto | undefined {
 }
 
 async function sha256Hex(bytes: Uint8Array, subtle: SubtleCrypto): Promise<string> {
-  // Copy into a standalone ArrayBuffer: a view into a larger buffer would hash
-  // the wrong bytes.
-  const digest = await subtle.digest("SHA-256", bytes.slice().buffer);
+  // `digest` honours the view's byteOffset/byteLength, so a subarray hashes
+  // exactly its own bytes; the cast only satisfies the narrowed lib type.
+  const digest = await subtle.digest("SHA-256", bytes as unknown as BufferSource);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
@@ -182,6 +199,7 @@ export class AttachmentUploader {
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (!response.ok) {
         this.onDebug?.(`attachment reserve for "${args.filename}" failed (${response.status})`);
@@ -208,6 +226,7 @@ export class AttachmentUploader {
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: bytes as unknown as BodyInit,
+        signal: AbortSignal.timeout(uploadTimeoutMs(bytes.length)),
       });
       if (!response.ok) {
         this.onDebug?.(`attachment upload "${name}" failed (${response.status})`);

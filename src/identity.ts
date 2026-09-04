@@ -30,6 +30,12 @@ export class IdentityManager {
   private anonymousId: string;
   private savedUserId: string | undefined;
   private pending: Promise<void> = Promise.resolve();
+  /**
+   * Bumped by every `setUser`/`clearUser`. A claim that settles after its
+   * generation was superseded must not write back the id it was started for,
+   * or a logout during an in-flight claim would silently re-identify the user.
+   */
+  private generation = 0;
 
   constructor(hooks: IdentityHooks) {
     this.hooks = hooks;
@@ -67,6 +73,7 @@ export class IdentityManager {
 
     this.savedUserId = localStore.get(USER_ID_KEY) ?? undefined;
     if (this.savedUserId && this.savedUserId !== this.anonymousId) {
+      this.generation += 1;
       this.pending = this.runClaim(this.anonymousId, this.savedUserId);
     }
   }
@@ -86,11 +93,15 @@ export class IdentityManager {
 
     localStore.set(USER_ID_KEY, userId);
     const anonymousId = this.anonymousId;
+    this.generation += 1;
+    const generation = this.generation;
 
     this.pending = this.runClaim(anonymousId, userId).finally(() => {
       // Switch even when the claim failed: the id is persisted, so the next
       // configure() retries the claim, and events must not stay anonymous
-      // after the app told us who this is.
+      // after the app told us who this is. A clearUser (or a later setUser)
+      // in the meantime wins, so the switch is skipped.
+      if (generation !== this.generation) return;
       this.savedUserId = userId;
     });
     await this.pending;
@@ -102,6 +113,7 @@ export class IdentityManager {
    * one who just logged out.
    */
   clearUser(options?: { newAnonymousId?: boolean }): void {
+    this.generation += 1;
     localStore.remove(USER_ID_KEY);
     this.savedUserId = undefined;
 

@@ -59,6 +59,17 @@ describe("normalizeAttributes", () => {
     const stack = "x".repeat(20000);
     expect(normalizeAttributes({ _error_stack: stack })?._error_stack).toHaveLength(16000);
   });
+
+  it("caps a value stored under a key inherited from Object.prototype", () => {
+    const result = normalizeAttributes({ toString: "x".repeat(1000) });
+    expect(result?.["toString"]).toHaveLength(MAX_ATTRIBUTE_VALUE_LENGTH);
+  });
+
+  it("keeps an attribute named __proto__ as an ordinary own key", () => {
+    const result = normalizeAttributes({ ["__proto__"]: "v" });
+    expect(Object.hasOwn(result!, "__proto__")).toBe(true);
+    expect(result?.["__proto__"]).toBe("v");
+  });
 });
 
 describe("buildEvent", () => {
