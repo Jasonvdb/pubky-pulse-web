@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Pulse } from "../src/index";
 import type { IngestRequest, LogEvent } from "../src/types";
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
+import { resetSlugWarning } from "../src/metrics";
 import { STORAGE_PREFIX } from "../src/storage";
 import {
   resetTestEnvironment,
@@ -50,6 +51,8 @@ function appEvents(): LogEvent[] {
 describe("Pulse", () => {
   beforeEach(() => {
     resetTestEnvironment();
+    resetSlugWarning();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
     fetchMock = vi.fn((_url: string, _init?: RequestInit) =>
       Promise.resolve(new Response("{}", { status: 200 })),
     );
@@ -420,6 +423,85 @@ describe("Pulse", () => {
     expect(
       sentEvents().filter((e) => e.message === "sdk:session_started").map((e) => e.session_id),
     ).toEqual([first, Pulse.sessionId]);
+  });
+
+  it("sends a metric operation as a start and a terminal event", async () => {
+    Pulse.configure(config);
+    const operation = Pulse.startOperation("photo-upload", { size: "big" });
+    operation.complete({ frames: "24" });
+    await Pulse.flush();
+
+    const events = appEvents();
+    expect(events.map((e) => e.message)).toEqual([
+      "metric:photo-upload:start",
+      "metric:photo-upload:complete",
+    ]);
+    expect(events[0]?.custom_attributes?.tracking_id).toBe(operation.trackingId);
+    expect(events[0]?.custom_attributes?.size).toBe("big");
+    expect(events[1]?.custom_attributes?.tracking_id).toBe(operation.trackingId);
+    expect(events[1]?.custom_attributes?.duration_ms).toMatch(/^\d+$/);
+  });
+
+  it("sends a failed operation at error level with the error attribute", async () => {
+    Pulse.configure(config);
+    Pulse.startOperation("photo upload").fail(new Error("upload rejected"));
+    await Pulse.flush();
+
+    const failure = appEvents()[1];
+    expect(failure?.message).toBe("metric:photo-upload:fail");
+    expect(failure?.level).toBe("error");
+    expect(failure?.custom_attributes?.error).toBe("upload rejected");
+  });
+
+  it("ignores a second finish on the same operation", async () => {
+    Pulse.configure(config);
+    const operation = Pulse.startOperation("checkout");
+    operation.complete();
+    operation.complete();
+    operation.fail("too late");
+    await Pulse.flush();
+
+    expect(appEvents().map((e) => e.message)).toEqual([
+      "metric:checkout:start",
+      "metric:checkout:complete",
+    ]);
+  });
+
+  it("sends single-shot metrics and funnel steps", async () => {
+    Pulse.configure(config);
+    Pulse.recordMetric("Cache Hit", { source: "memory" });
+    Pulse.step("checkout_started", { cart_size: "3" });
+    await Pulse.flush();
+
+    const events = appEvents();
+    expect(events.map((e) => e.message)).toEqual([
+      "metric:cache-hit:record",
+      "step:checkout_started",
+    ]);
+    expect(events.every((e) => e.level === "info")).toBe(true);
+    expect(events[0]?.custom_attributes).toEqual({ source: "memory" });
+    expect(events[1]?.custom_attributes).toEqual({ cart_size: "3" });
+  });
+
+  it("suppresses metric starts in the console but prints the terminal event", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    Pulse.configure({ ...config, consoleLogging: true });
+
+    Pulse.startOperation("photo-upload").complete();
+    Pulse.recordMetric("cache-hit");
+
+    const printed = log.mock.calls.map((call) => String(call[0]));
+    expect(printed.some((line) => line.includes("metric:photo-upload:start"))).toBe(false);
+    expect(printed.some((line) => line.includes("metric:photo-upload:complete"))).toBe(true);
+    expect(printed.some((line) => line.includes("metric:cache-hit:record"))).toBe(true);
+  });
+
+  it("ignores metric calls before configure", () => {
+    vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    expect(() => Pulse.startOperation("photo-upload").complete()).not.toThrow();
+    expect(() => Pulse.recordMetric("photo-upload")).not.toThrow();
+    expect(() => Pulse.step("checkout_started")).not.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("ignores trackScreen before configure", () => {

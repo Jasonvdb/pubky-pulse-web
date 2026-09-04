@@ -4,8 +4,10 @@ import { extractErrorAttributes } from "./error-extraction";
 import { buildEvent, type EventContext } from "./event-builder";
 import { IdentityManager } from "./identity";
 import { installLifecycle } from "./lifecycle";
+import { metricMessage, stepMessage } from "./metrics";
 import { installNetworkTracking } from "./network-tracking";
 import { OfflineQueue } from "./offline-queue";
+import { PulseOperation } from "./operation";
 import { PageTracker, type ScreenCallbacks } from "./page-tracking";
 import { SessionManager } from "./session";
 import { localStore } from "./storage";
@@ -18,6 +20,7 @@ import type {
   PulseLogOptions,
 } from "./types";
 
+export { PulseOperation } from "./operation";
 export type {
   LogEvent,
   PulseAttachment,
@@ -222,6 +225,15 @@ export interface PulseApi {
    * The name also becomes the default `screen_name` for later events.
    */
   trackScreen(name: string): void;
+  /** Record one funnel step as `step:<name>`. */
+  step(name: string, attributes?: PulseAttributes): void;
+  /**
+   * Start a tracked operation: emits `metric:<slug>:start` now and one
+   * terminal event when the returned handle is completed, failed or cancelled.
+   */
+  startOperation(metric: string, attributes?: PulseAttributes): PulseOperation;
+  /** Record a single-shot metric as `metric:<slug>:record`. */
+  recordMetric(metric: string, attributes?: PulseAttributes): void;
   /**
    * Identify the person using the app. Buffered anonymous events are sent and
    * claimed server-side before the id switches, so nothing is orphaned.
@@ -314,6 +326,24 @@ export const Pulse: PulseApi = {
       return;
     }
     pageTracker.trackScreen(name);
+  },
+
+  step(name: string, attributes?: PulseAttributes): void {
+    log("info", stepMessage(name), attributes);
+  },
+
+  startOperation(metric: string, attributes?: PulseAttributes): PulseOperation {
+    return new PulseOperation(
+      (level, message, operationAttributes) => {
+        log(level, message, operationAttributes);
+      },
+      metric,
+      attributes,
+    );
+  },
+
+  recordMetric(metric: string, attributes?: PulseAttributes): void {
+    log("info", metricMessage(metric, "record"), attributes);
   },
 
   async setUser(identifier: string): Promise<void> {
