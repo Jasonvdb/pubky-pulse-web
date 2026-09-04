@@ -315,6 +315,15 @@ Pulse.clearUser({ newAnonymousId: true }); // sign-out on a shared device
 
 Call `setUser` on every page load where you know who the user is; the claim is idempotent.
 
+The promise waits for the flush and the claim request attempts. Those retry with exponential
+backoff, so against an endpoint that is failing or hanging the await can take a couple of minutes.
+When the browser is offline nothing is attempted: `setUser` returns straight away and the claim is
+retried on the next `configure()`. Don't await it on a sign-in path that has to stay responsive:
+
+```ts
+void Pulse.setUser(userId); // fire and forget; the id is switched when the claim settles
+```
+
 ## User properties
 
 ```ts
@@ -329,6 +338,10 @@ Buffered events are flushed first, so the properties attach to the same id those
 The promise resolves once the attempt finishes, not once the server has accepted the properties:
 a rejected request is dropped, and an unreachable one is retried a few times with backoff and then
 dropped. Neither throws — turn on `debug` to see the drops.
+
+Like `setUser`, the promise waits for the request attempts, and the retry backoff means it can take
+a couple of minutes when the endpoint is failing or hanging. Offline it returns straight away
+without sending. Use `void Pulse.setUserProperties({ ... })` when the caller does not need to wait.
 
 ## Feedback
 
