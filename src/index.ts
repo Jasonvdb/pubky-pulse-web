@@ -1,9 +1,11 @@
 import { validateConfiguration, type ValidatedConfig } from "./configuration";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
-import { buildEvent, randomUuid, type EventContext } from "./event-builder";
+import { buildEvent, type EventContext } from "./event-builder";
+import { IdentityManager } from "./identity";
 import { OfflineQueue } from "./offline-queue";
-import { localStore, sessionStore } from "./storage";
+import { SessionManager } from "./session";
+import { localStore } from "./storage";
 import { Transport } from "./transport";
 import type {
   PulseAttributes,
@@ -21,16 +23,12 @@ export type {
   PulseLogOptions,
 } from "./types";
 
-const ANONYMOUS_ID_KEY = "anonymous_id";
-const ANONYMOUS_ID_PREFIX = "pulse_anon_";
-const SESSION_ID_KEY = "session_id";
-
 let config: ValidatedConfig | null = null;
 let transport: Transport | null = null;
 let offlineQueue: OfflineQueue | null = null;
 let deviceInfo: DeviceInfo = {};
-let sessionId: string | null = null;
-let activeUserId: string | undefined;
+let session: SessionManager | null = null;
+let identity: IdentityManager | null = null;
 let unconfiguredWarningShown = false;
 let unloadHandler: (() => void) | null = null;
 let visibilityHandler: (() => void) | null = null;
@@ -75,46 +73,26 @@ function printToConsole(
   }
 }
 
-function loadAnonymousId(): string {
-  const existing = localStore.get(ANONYMOUS_ID_KEY);
-  if (existing) return existing;
-  const created = `${ANONYMOUS_ID_PREFIX}${randomUuid()}`;
-  localStore.set(ANONYMOUS_ID_KEY, created);
-  return created;
-}
-
 /**
- * Minimal session handling for the core pipeline: reuse the id already in
- * `sessionStorage`, otherwise mint one. Idle expiry, `sdk:session_started` /
- * `sdk:session_ended` and activity tracking arrive with the session manager.
+ * Build and buffer one event. `sessionIdOverride` exists for `sdk:session_ended`,
+ * which belongs to the session that just expired rather than the new one.
  */
-function loadSessionId(): string {
-  const existing = sessionStore.get(SESSION_ID_KEY);
-  if (existing) return existing;
-  const created = randomUuid();
-  sessionStore.set(SESSION_ID_KEY, created);
-  return created;
-}
-
-function eventContext(): EventContext | null {
-  if (!config || !sessionId) return null;
-  return { config, deviceInfo, sessionId, userId: activeUserId };
-}
-
-function log(
+function recordEvent(
   level: PulseLogLevel,
   message: string,
   attributes?: PulseAttributes,
   options?: PulseLogOptions,
+  sessionIdOverride?: string,
 ): void {
-  const ctx = eventContext();
-  if (!ctx || !transport) {
-    if (!unconfiguredWarningShown) {
-      unconfiguredWarningShown = true;
-      console.debug("Pubky Pulse: log call before configure() was ignored.");
-    }
-    return;
-  }
+  const sessionId = sessionIdOverride ?? session?.id;
+  if (!config || !identity || !sessionId || !transport) return;
+
+  const ctx: EventContext = {
+    config,
+    deviceInfo,
+    sessionId,
+    userId: identity.currentId,
+  };
 
   try {
     const event = buildEvent(ctx, level, message, attributes, options?.screenName);
@@ -124,6 +102,36 @@ function log(
     debugLog("failed to record event", err);
   }
 }
+
+function log(
+  level: PulseLogLevel,
+  message: string,
+  attributes?: PulseAttributes,
+  options?: PulseLogOptions,
+): void {
+  if (!config || !session || !transport) {
+    if (!unconfiguredWarningShown) {
+      unconfiguredWarningShown = true;
+      console.debug("Pubky Pulse: log call before configure() was ignored.");
+    }
+    return;
+  }
+
+  // Every call counts as activity, and may roll the session over first.
+  session.touch();
+  recordEvent(level, message, attributes, options);
+}
+
+/** Emits the session lifecycle events as the session manager rolls over. */
+const sessionCallbacks = {
+  onStarted(startedId: string, launchMs?: number): void {
+    const attributes = launchMs === undefined ? undefined : { _launch_ms: String(launchMs) };
+    recordEvent("info", "sdk:session_started", attributes, undefined, startedId);
+  },
+  onEnded(endedId: string): void {
+    recordEvent("info", "sdk:session_ended", undefined, undefined, endedId);
+  },
+};
 
 function installUnloadHandlers(): void {
   const win = (globalThis as { window?: Window }).window;
@@ -164,10 +172,24 @@ export interface PulseApi {
     attributes?: PulseAttributes,
     options?: PulseLogOptions,
   ): void;
+  /**
+   * Identify the person using the app. Buffered anonymous events are sent and
+   * claimed server-side before the id switches, so nothing is orphaned.
+   */
+  setUser(identifier: string): Promise<void>;
+  /** Forget the identified user; `newAnonymousId` also resets the anon id. */
+  clearUser(options?: { newAnonymousId?: boolean }): void;
+  /** Merge properties onto the current user. An empty value deletes a key. */
+  setUserProperties(properties: Record<string, string>): Promise<void>;
   flush(): Promise<void>;
   shutdown(): Promise<void>;
   /** Session id for the current page, or undefined before `configure`. */
   readonly sessionId: string | undefined;
+  /**
+   * The id stamped on outgoing events: the identifier from `setUser` when one
+   * is set, otherwise this browser's anonymous id. Undefined before `configure`.
+   */
+  readonly currentUserId: string | undefined;
 }
 
 export const Pulse: PulseApi = {
@@ -189,17 +211,28 @@ export const Pulse: PulseApi = {
 
     config = validated;
     deviceInfo = collectDeviceInfo(validated.supportedLanguages);
-    sessionId = loadSessionId();
-    activeUserId = loadAnonymousId();
     offlineQueue = new OfflineQueue(localStore, (message) => {
       debugLog(message);
     });
     transport = new Transport(validated, offlineQueue, debugLog);
     unconfiguredWarningShown = false;
 
+    // Identity first: the session events below must carry the right user id.
+    // Its background re-claim needs the transport, which now exists.
+    identity = new IdentityManager({
+      claim: async (anonymousId, userId) => {
+        await transport?.claimIdentity(anonymousId, userId);
+      },
+      onDebug: debugLog,
+    });
+    identity.load();
+
+    session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks);
+    session.start();
+
     installUnloadHandlers();
-    // Extension points for later phases: session lifecycle events, page-view
-    // tracking, unhandled-error capture and fetch instrumentation hook in here.
+    // Extension points for later phases: page-view tracking, unhandled-error
+    // capture and fetch instrumentation hook in here.
   },
 
   info(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void {
@@ -227,6 +260,32 @@ export const Pulse: PulseApi = {
     log("error", message, merged, fourth as PulseLogOptions | undefined);
   },
 
+  async setUser(identifier: string): Promise<void> {
+    if (!identity) {
+      debugLog("setUser called before configure()");
+      return;
+    }
+    await identity.setUser(identifier);
+  },
+
+  clearUser(options?: { newAnonymousId?: boolean }): void {
+    if (!identity) {
+      debugLog("clearUser called before configure()");
+      return;
+    }
+    identity.clearUser(options);
+  },
+
+  async setUserProperties(properties: Record<string, string>): Promise<void> {
+    if (!identity || !transport) {
+      debugLog("setUserProperties called before configure()");
+      return;
+    }
+    // Buffered events land under the same id the properties attach to.
+    await transport.flush();
+    await transport.setUserProperties(identity.currentId, properties);
+  },
+
   async flush(): Promise<void> {
     await transport?.flush();
   },
@@ -237,13 +296,17 @@ export const Pulse: PulseApi = {
     transport = null;
     offlineQueue = null;
     config = null;
-    sessionId = null;
-    activeUserId = undefined;
+    session = null;
+    identity = null;
     deviceInfo = {};
   },
 
   get sessionId(): string | undefined {
-    return sessionId ?? undefined;
+    return session?.id ?? undefined;
+  },
+
+  get currentUserId(): string | undefined {
+    return identity?.currentId;
   },
 };
 

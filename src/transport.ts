@@ -146,6 +146,31 @@ export class Transport {
     }
   }
 
+  /**
+   * Reassign this browser's anonymous events to a real user. Pending events
+   * are flushed first so the server's `UPDATE` sees them; anything still
+   * buffered afterwards is already stamped with the new id by the caller.
+   */
+  async claimIdentity(anonymousId: string, userId: string): Promise<boolean> {
+    await this.flush();
+    const outcome = await this.post(
+      "/v1/identity/claim",
+      { anonymous_id: anonymousId, user_id: userId },
+      "identity claim",
+    );
+    return outcome === "sent";
+  }
+
+  /** Merge properties onto the user server-side. An empty value deletes a key. */
+  async setUserProperties(userId: string, properties: Record<string, string>): Promise<boolean> {
+    const outcome = await this.post(
+      "/v1/identity/properties",
+      { user_id: userId, properties },
+      "user properties",
+    );
+    return outcome === "sent";
+  }
+
   private async runFlush(): Promise<void> {
     if (!isOnline()) {
       this.onDebug?.("offline, skipping flush");
@@ -169,11 +194,24 @@ export class Transport {
 
   private async sendBatch(events: LogEvent[]): Promise<BatchOutcome> {
     const request: IngestRequest = { bundle_id: this.config.bundleId, events };
+    const outcome = await this.post("/v1/ingest", request, `${events.length} events`);
+    if (outcome === "dropped") {
+      this.onDebug?.(`dropping ${events.length} events`);
+    }
+    return outcome;
+  }
+
+  /**
+   * POST a JSON body with the shared retry policy: 2xx succeeds, a 4xx other
+   * than 429 is permanent and drops the payload, everything else is retried
+   * with exponential backoff before the caller decides what to do.
+   */
+  private async post(path: string, payload: unknown, label: string): Promise<BatchOutcome> {
     let encoded: EncodedBody;
     try {
-      encoded = await encodeBody(JSON.stringify(request), this.config.compressionEnabled);
+      encoded = await encodeBody(JSON.stringify(payload), this.config.compressionEnabled);
     } catch (err) {
-      this.onDebug?.("failed to encode batch", err);
+      this.onDebug?.(`failed to encode ${label}`, err);
       return "dropped";
     }
 
@@ -185,7 +223,7 @@ export class Transport {
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       try {
-        const response = await fetch(`${this.config.endpoint}/v1/ingest`, {
+        const response = await fetch(`${this.config.endpoint}${path}`, {
           method: "POST",
           headers,
           body: encoded.body as BodyInit,
@@ -196,13 +234,13 @@ export class Transport {
 
         // 4xx other than 429 will fail identically forever: drop the batch.
         if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-          this.onDebug?.(`ingest rejected with ${response.status}, dropping ${events.length} events`);
+          this.onDebug?.(`${path} rejected with ${response.status}`);
           return "dropped";
         }
 
-        this.onDebug?.(`ingest failed with ${response.status}`);
+        this.onDebug?.(`${path} failed with ${response.status}`);
       } catch (err) {
-        this.onDebug?.("network error during ingest", err);
+        this.onDebug?.(`network error during ${path}`, err);
       }
 
       if (attempt < MAX_RETRIES) {
@@ -210,7 +248,7 @@ export class Transport {
       }
     }
 
-    this.onDebug?.(`parking ${events.length} events after ${MAX_RETRIES + 1} attempts`);
+    this.onDebug?.(`giving up on ${label} after ${MAX_RETRIES + 1} attempts`);
     return "park";
   }
 }

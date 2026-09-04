@@ -317,6 +317,60 @@ describe("Transport", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
   });
+
+  describe("identity", () => {
+    it("flushes buffered events before posting the claim", async () => {
+      const tx = createTransport({ flushThreshold: 1000 });
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(true);
+
+      expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+        "https://pulse.example.com/v1/ingest",
+        "https://pulse.example.com/v1/identity/claim",
+      ]);
+      const claim = fetchMock.mock.calls[1]!;
+      expect(JSON.parse((claim[1] as RequestInit).body as string)).toEqual({
+        anonymous_id: "pulse_anon_1",
+        user_id: "user-1",
+      });
+      expect(requestHeaders(claim).Authorization).toBe("Bearer pulse_client_abc");
+    });
+
+    it("retries a claim on a 5xx and reports success", async () => {
+      fetchMock
+        .mockResolvedValueOnce(new Response("", { status: 500 }))
+        .mockResolvedValueOnce(ok());
+      const tx = createTransport();
+
+      const claimed = tx.claimIdentity("pulse_anon_1", "user-1");
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+
+      await expect(claimed).resolves.toBe(true);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not retry a claim the server rejected with a 4xx", async () => {
+      fetchMock.mockResolvedValue(new Response("", { status: 400 }));
+      const tx = createTransport();
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("posts user properties without flushing first", async () => {
+      const tx = createTransport();
+
+      await expect(tx.setUserProperties("user-1", { plan: "pro" })).resolves.toBe(true);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock.mock.calls[0]![0]).toBe("https://pulse.example.com/v1/identity/properties");
+      expect(JSON.parse((fetchMock.mock.calls[0]![1] as RequestInit).body as string)).toEqual({
+        user_id: "user-1",
+        properties: { plan: "pro" },
+      });
+    });
+  });
 });
 
 describe("Transport compression", () => {
