@@ -526,3 +526,172 @@ describe("Pulse", () => {
     expect(() => Pulse.configure({ ...config, apiKey: "nope" })).toThrow(/pulse_client_/);
   });
 });
+
+describe("Pulse feedback, questionnaires and attachments", () => {
+  beforeEach(() => {
+    resetTestEnvironment();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/v1/feedback")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ id: "fb_1", created_at: "2026-09-04T10:00:00.000Z" }), {
+            status: 201,
+          }),
+        );
+      }
+      if (url.includes("/v1/questionnaires/dismiss")) {
+        return Promise.resolve(
+          new Response(JSON.stringify({ dismissed_at: "2026-09-04T11:00:00.000Z" }), {
+            status: 200,
+          }),
+        );
+      }
+      if (url.includes("/responses")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              id: "r1",
+              created_at: "2026-09-04T10:00:00.000Z",
+              was_submitted: true,
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      if (url.includes("/v1/questionnaires/")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              eligible: true,
+              questionnaire: {
+                id: "q1",
+                slug: "nps-2026",
+                name: "NPS",
+                description: null,
+                schema: {
+                  version: 1,
+                  questions: [
+                    { id: "score", type: "nps", title: "Recommend us?", required: true },
+                  ],
+                },
+              },
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (url.includes("/v1/ingest/attachment")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              attachment_id: "att_1",
+              upload_url: "https://uploads.example.com/att_1",
+            }),
+            { status: 201 },
+          ),
+        );
+      }
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(async () => {
+    await Pulse.shutdown();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("submits feedback and records the audit event", async () => {
+    Pulse.configure(config);
+
+    const receipt = await Pulse.sendFeedback("  the export button is hiding  ", {
+      email: " ada@example.com ",
+    });
+    await Pulse.flush();
+
+    expect(receipt.id).toBe("fb_1");
+    expect(receipt.createdAt.toISOString()).toBe("2026-09-04T10:00:00.000Z");
+
+    const call = fetchMock.mock.calls.find((c) => (c[0] as string).endsWith("/v1/feedback"))!;
+    const body = JSON.parse((call[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.message).toBe("the export button is hiding");
+    expect(body.submitter_email).toBe("ada@example.com");
+    expect(body).not.toHaveProperty("submitter_name");
+    expect(body.bundle_id).toBe("com.example.web");
+    expect(body.session_id).toBe(Pulse.sessionId);
+    expect(body.user_id).toBe(Pulse.currentUserId);
+    expect(body.environment).toBe("web");
+
+    const audit = sentEvents().find((event) => event.message === "sdk:feedback_submitted");
+    expect(audit?.custom_attributes).toEqual({ has_email: "true", has_name: "false" });
+  });
+
+  it("rejects an empty or oversized feedback message without calling the server", async () => {
+    Pulse.configure(config);
+
+    await expect(Pulse.sendFeedback("   ")).rejects.toThrow(/feedback message is required/);
+    await expect(Pulse.sendFeedback("m".repeat(4001))).rejects.toThrow(/at most 4000/);
+    expect(fetchMock.mock.calls.some((c) => (c[0] as string).endsWith("/v1/feedback"))).toBe(
+      false,
+    );
+  });
+
+  it("refuses feedback and questionnaire calls before configure", async () => {
+    await expect(Pulse.sendFeedback("hi")).rejects.toThrow(/before configure/);
+    await expect(Pulse.fetchQuestionnaire("nps-2026")).rejects.toMatchObject({
+      reason: "not_configured",
+    });
+    await expect(Pulse.saveQuestionnaireResponse("nps-2026", {}, false)).rejects.toMatchObject({
+      reason: "not_configured",
+    });
+    await expect(Pulse.dismissQuestionnaires()).rejects.toMatchObject({
+      reason: "not_configured",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetches, saves and dismisses questionnaires with the configured identity", async () => {
+    Pulse.configure(config);
+
+    const result = await Pulse.fetchQuestionnaire("nps-2026");
+    expect(result.questionnaire?.slug).toBe("nps-2026");
+    const fetched = new URL(
+      fetchMock.mock.calls.find((c) => (c[0] as string).includes("/v1/questionnaires/nps"))![0] as
+        string,
+    );
+    expect(fetched.searchParams.get("bundle_id")).toBe("com.example.web");
+    expect(fetched.searchParams.get("user_id")).toBe(Pulse.currentUserId);
+
+    const receipt = await Pulse.saveQuestionnaireResponse("nps-2026", { score: 9 }, true);
+    expect(receipt.wasSubmitted).toBe(true);
+    const saveCall = fetchMock.mock.calls.find((c) => (c[0] as string).endsWith("/responses"))!;
+    const saved = JSON.parse((saveCall[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(saved.answers).toEqual({ score: 9 });
+    expect(saved.is_complete).toBe(true);
+    expect(saved.session_id).toBe(Pulse.sessionId);
+
+    const dismissedAt = await Pulse.dismissQuestionnaires();
+    expect(dismissedAt).toEqual(new Date("2026-09-04T11:00:00.000Z"));
+  });
+
+  it("uploads attachments for the event that carried them", async () => {
+    Pulse.configure(config);
+
+    Pulse.error("upload_failed", undefined, {
+      attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+    });
+    await Pulse.flush();
+
+    const event = appEvents().find((e) => e.message === "upload_failed");
+    const reserve = fetchMock.mock.calls.find((c) =>
+      (c[0] as string).includes("/v1/ingest/attachment"),
+    )!;
+    const body = JSON.parse((reserve[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.client_event_id).toBe(event?.client_event_id);
+    expect(body.original_filename).toBe("trace.log");
+    expect(
+      fetchMock.mock.calls.some((c) => (c[0] as string).startsWith("https://uploads.example.com/")),
+    ).toBe(true);
+  });
+});

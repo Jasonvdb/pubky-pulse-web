@@ -104,3 +104,35 @@ export interface IngestResponse {
   rejected: number;
   errors?: Array<{ index: number; message: string }>;
 }
+
+/** Server-side cap on a feedback message, enforced client-side too. */
+export const MAX_FEEDBACK_MESSAGE_LENGTH = 4000;
+
+/** Optional contact details attached to a feedback submission. */
+export interface PulseFeedbackOptions {
+  name?: string;
+  email?: string;
+}
+
+/** Body accepted by `POST /v1/feedback`. */
+export interface FeedbackSubmission {
+  bundle_id: string;
+  message: string;
+  session_id?: string;
+  user_id?: string;
+  submitter_name?: string;
+  submitter_email?: string;
+  app_version?: string;
+  sdk_name: string;
+  sdk_version: string;
+  environment: typeof ENVIRONMENT;
+  device_model?: string;
+  os_version?: string;
+  is_dev: boolean;
+}
+
+/** What the caller gets back from `Pulse.sendFeedback`. */
+export interface PulseFeedbackReceipt {
+  id: string;
+  createdAt: Date;
+}

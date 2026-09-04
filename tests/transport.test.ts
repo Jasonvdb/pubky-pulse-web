@@ -432,3 +432,79 @@ describe("Transport compression", () => {
     expect(typeof init.body).toBe("string");
   });
 });
+
+describe("Transport.submitFeedback", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  let transport: Transport;
+
+  const body = {
+    bundle_id: BUNDLE_ID,
+    message: "the export button is hiding",
+    sdk_name: "pubky-pulse-web",
+    sdk_version: "0.1.0",
+    environment: "web" as const,
+    is_dev: true,
+  };
+
+  beforeEach(() => {
+    resetTestEnvironment();
+    fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    transport = new Transport(makeConfig({ flushIntervalMs: 60_000 }), new OfflineQueue(new SafeStorage("local")));
+  });
+
+  afterEach(async () => {
+    await transport.shutdown();
+    vi.unstubAllGlobals();
+  });
+
+  it("posts the submission and parses the receipt", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "fb_1", created_at: "2026-09-04T10:00:00.000Z" }), {
+        status: 201,
+      }),
+    );
+
+    const receipt = await transport.submitFeedback(body);
+
+    expect(receipt.id).toBe("fb_1");
+    expect(receipt.createdAt.toISOString()).toBe("2026-09-04T10:00:00.000Z");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://pulse.example.com/v1/feedback");
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer pulse_client_abc");
+    expect(JSON.parse(init.body as string)).toEqual(body);
+  });
+
+  it("throws without retrying when the server rejects", async () => {
+    fetchMock.mockResolvedValue(new Response("message is required", { status: 400 }));
+
+    await expect(transport.submitFeedback(body)).rejects.toThrow(
+      /sendFeedback rejected \(400\): message is required/,
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes a single attempt on a 5xx", async () => {
+    fetchMock.mockResolvedValue(new Response("boom", { status: 500 }));
+
+    await expect(transport.submitFeedback(body)).rejects.toThrow(/sendFeedback rejected \(500\)/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("wraps a network failure", async () => {
+    fetchMock.mockRejectedValue(new Error("offline"));
+
+    await expect(transport.submitFeedback(body)).rejects.toThrow(
+      "Pubky Pulse: sendFeedback failed: offline",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a malformed receipt", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ id: 7 }), { status: 201 }));
+
+    await expect(transport.submitFeedback(body)).rejects.toThrow(/malformed response/);
+  });
+});

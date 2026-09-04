@@ -2,7 +2,12 @@ import { encodeBody, byteLength, type EncodedBody } from "./compression";
 import type { ValidatedConfig } from "./configuration";
 import { isOnline } from "./device-info";
 import type { OfflineQueue } from "./offline-queue";
-import type { IngestRequest, LogEvent } from "./types";
+import type {
+  FeedbackSubmission,
+  IngestRequest,
+  LogEvent,
+  PulseFeedbackReceipt,
+} from "./types";
 
 /** Events per request. The server accepts up to 100; 20 keeps bodies small. */
 export const MAX_BATCH_SIZE = 20;
@@ -169,6 +174,52 @@ export class Transport {
       "user properties",
     );
     return outcome === "sent";
+  }
+
+  /**
+   * Submit one feedback row. A person is waiting on this, so it is a single
+   * attempt with no retry and no offline parking: a failure is thrown for the
+   * caller's UI to show.
+   */
+  async submitFeedback(body: FeedbackSubmission): Promise<PulseFeedbackReceipt> {
+    let response: Response;
+    try {
+      response = await fetch(`${this.config.endpoint}/v1/feedback`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (err) {
+      this.onDebug?.("network error during sendFeedback", err);
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`Pubky Pulse: sendFeedback failed: ${detail}`);
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      this.onDebug?.(`sendFeedback rejected with ${response.status}`);
+      throw new Error(
+        `Pubky Pulse: sendFeedback rejected (${response.status})${text ? `: ${text}` : ""}`,
+      );
+    }
+
+    const payload = (await response.json().catch(() => undefined)) as
+      | { id?: unknown; created_at?: unknown }
+      | undefined;
+    if (!payload || typeof payload.id !== "string") {
+      throw new Error("Pubky Pulse: sendFeedback returned a malformed response");
+    }
+    const createdAt =
+      typeof payload.created_at === "string" ? new Date(payload.created_at) : new Date(NaN);
+    if (Number.isNaN(createdAt.getTime())) {
+      throw new Error("Pubky Pulse: sendFeedback returned an invalid created_at");
+    }
+
+    return { id: payload.id, createdAt };
   }
 
   private async runFlush(): Promise<void> {

@@ -1,3 +1,4 @@
+import { AttachmentUploader } from "./attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "./configuration";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
@@ -9,23 +10,71 @@ import { installNetworkTracking } from "./network-tracking";
 import { OfflineQueue } from "./offline-queue";
 import { PulseOperation } from "./operation";
 import { PageTracker, type ScreenCallbacks } from "./page-tracking";
+import {
+  dismissQuestionnaires as dismissQuestionnairesRequest,
+  fetchQuestionnaire as fetchQuestionnaireRequest,
+  PulseQuestionnaireError,
+  saveQuestionnaireResponse as saveQuestionnaireResponseRequest,
+  type PulseQuestionnaireAnswers,
+  type PulseQuestionnaireFetchResult,
+  type PulseQuestionnaireReceipt,
+  type QuestionnaireContext,
+} from "./questionnaires";
 import { SessionManager } from "./session";
 import { localStore } from "./storage";
 import { Transport } from "./transport";
 import { installUnhandledCapture, type UnhandledKind } from "./unhandled-capture";
-import type {
-  PulseAttributes,
-  PulseConfiguration,
-  PulseLogLevel,
-  PulseLogOptions,
+import {
+  ENVIRONMENT,
+  MAX_FEEDBACK_MESSAGE_LENGTH,
+  SDK_NAME,
+  SDK_VERSION,
+  type FeedbackSubmission,
+  type PulseAttributes,
+  type PulseConfiguration,
+  type PulseFeedbackOptions,
+  type PulseFeedbackReceipt,
+  type PulseLogLevel,
+  type PulseLogOptions,
 } from "./types";
 
 export { PulseOperation } from "./operation";
+export {
+  collected,
+  createAnswerStore,
+  firstUnansweredIndex,
+  hasAllRequired,
+  isAnswered,
+  setAnswer,
+} from "./questionnaire-answers";
+export type { PulseQuestionnaireAnswerStore } from "./questionnaire-answers";
+export { PulseQuestionnaireError } from "./questionnaires";
+export type {
+  PulseQuestionnaire,
+  PulseQuestionnaireAnswers,
+  PulseQuestionnaireAnswerValue,
+  PulseQuestionnaireDraft,
+  PulseQuestionnaireErrorReason,
+  PulseQuestionnaireFetchResult,
+  PulseQuestionnaireIneligibleReason,
+  PulseQuestionnaireMultiChoiceQuestion,
+  PulseQuestionnaireNpsQuestion,
+  PulseQuestionnaireOption,
+  PulseQuestionnaireQuestion,
+  PulseQuestionnaireQuestionType,
+  PulseQuestionnaireRatingQuestion,
+  PulseQuestionnaireReceipt,
+  PulseQuestionnaireSchema,
+  PulseQuestionnaireSingleChoiceQuestion,
+  PulseQuestionnaireTextQuestion,
+} from "./questionnaires";
 export type {
   LogEvent,
   PulseAttachment,
   PulseAttributes,
   PulseConfiguration,
+  PulseFeedbackOptions,
+  PulseFeedbackReceipt,
   PulseLogLevel,
   PulseLogOptions,
 } from "./types";
@@ -38,6 +87,7 @@ let session: SessionManager | null = null;
 let identity: IdentityManager | null = null;
 let unconfiguredWarningShown = false;
 let pageTracker: PageTracker | null = null;
+let attachments: AttachmentUploader | null = null;
 /** Uninstallers for everything `configure()` hooked into the page. */
 const uninstallers: Array<() => void> = [];
 
@@ -107,6 +157,9 @@ function recordEvent(
     const event = buildEvent(ctx, level, message, attributes, options?.screenName);
     printToConsole(level, event.message, event.custom_attributes);
     transport.enqueue(event);
+    if (options?.attachments?.length) {
+      attachments?.enqueue(event.client_event_id, identity.currentId, options.attachments);
+    }
   } catch (err) {
     debugLog("failed to record event", err);
   }
@@ -208,6 +261,29 @@ function uninstallObservers(): void {
   pageTracker = null;
 }
 
+/**
+ * Snapshot of the configured state each questionnaire request needs. Throws
+ * rather than failing quietly: these calls are awaited by the caller's UI.
+ */
+function questionnaireContext(): QuestionnaireContext {
+  if (!config) {
+    throw new PulseQuestionnaireError(
+      "not_configured",
+      "questionnaire calls require configure() first",
+    );
+  }
+  const ctx: QuestionnaireContext = {
+    endpoint: config.endpoint,
+    apiKey: config.apiKey,
+    bundleId: config.bundleId,
+    isDev: config.isDev,
+  };
+  if (identity?.currentId) ctx.userId = identity.currentId;
+  if (session?.id) ctx.sessionId = session.id;
+  if (config.appVersion) ctx.appVersion = config.appVersion;
+  return ctx;
+}
+
 export interface PulseApi {
   configure(configuration: PulseConfiguration): void;
   info(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void;
@@ -243,6 +319,31 @@ export interface PulseApi {
   clearUser(options?: { newAnonymousId?: boolean }): void;
   /** Merge properties onto the current user. An empty value deletes a key. */
   setUserProperties(properties: Record<string, string>): Promise<void>;
+  /**
+   * Submit user feedback. A single attempt: the caller is waiting on it, so a
+   * failure throws instead of being retried in the background.
+   */
+  sendFeedback(message: string, options?: PulseFeedbackOptions): Promise<PulseFeedbackReceipt>;
+  /**
+   * Fetch a questionnaire and the current user's eligibility for it. An
+   * ineligible questionnaire comes back as `ineligibleReason`, not an error;
+   * an unknown slug or a failed request throws `PulseQuestionnaireError`.
+   */
+  fetchQuestionnaire(
+    slug: string,
+    options?: { force?: boolean },
+  ): Promise<PulseQuestionnaireFetchResult>;
+  /**
+   * Save answers as a draft (`isComplete: false`) or submit them. Always pass
+   * the full accumulated answer set — `collected()` produces it.
+   */
+  saveQuestionnaireResponse(
+    slug: string,
+    answers: PulseQuestionnaireAnswers,
+    isComplete: boolean,
+  ): Promise<PulseQuestionnaireReceipt>;
+  /** Opt the current user out of every questionnaire. */
+  dismissQuestionnaires(): Promise<Date>;
   flush(): Promise<void>;
   shutdown(): Promise<void>;
   /** Session id for the current page, or undefined before `configure`. */
@@ -277,6 +378,7 @@ export const Pulse: PulseApi = {
       debugLog(message);
     });
     transport = new Transport(validated, offlineQueue, debugLog);
+    attachments = new AttachmentUploader(validated, debugLog);
     unconfiguredWarningShown = false;
 
     // Identity first: the session events below must carry the right user id.
@@ -374,17 +476,87 @@ export const Pulse: PulseApi = {
 
   async flush(): Promise<void> {
     await transport?.flush();
+    await attachments?.flush();
   },
 
   async shutdown(): Promise<void> {
     uninstallObservers();
     await transport?.shutdown();
+    await attachments?.flush();
+    attachments = null;
     transport = null;
     offlineQueue = null;
     config = null;
     session = null;
     identity = null;
     deviceInfo = {};
+  },
+
+  async sendFeedback(
+    message: string,
+    options?: PulseFeedbackOptions,
+  ): Promise<PulseFeedbackReceipt> {
+    if (!config || !transport) {
+      throw new Error("Pubky Pulse: sendFeedback called before configure()");
+    }
+
+    const trimmed = typeof message === "string" ? message.trim() : "";
+    if (!trimmed) {
+      throw new Error("Pubky Pulse: feedback message is required");
+    }
+    if (trimmed.length > MAX_FEEDBACK_MESSAGE_LENGTH) {
+      throw new Error(
+        `Pubky Pulse: feedback message must be at most ${MAX_FEEDBACK_MESSAGE_LENGTH} characters`,
+      );
+    }
+
+    const name = options?.name?.trim() || undefined;
+    const email = options?.email?.trim() || undefined;
+
+    const body: FeedbackSubmission = {
+      bundle_id: config.bundleId,
+      message: trimmed,
+      sdk_name: SDK_NAME,
+      sdk_version: SDK_VERSION,
+      environment: ENVIRONMENT,
+      is_dev: config.isDev,
+    };
+    if (session?.id) body.session_id = session.id;
+    if (identity?.currentId) body.user_id = identity.currentId;
+    if (name) body.submitter_name = name;
+    if (email) body.submitter_email = email;
+    if (config.appVersion) body.app_version = config.appVersion;
+    if (deviceInfo.deviceModel) body.device_model = deviceInfo.deviceModel;
+    if (deviceInfo.osVersion) body.os_version = deviceInfo.osVersion;
+
+    const receipt = await transport.submitFeedback(body);
+
+    // The audit event is best effort: the receipt is what the caller waited for.
+    log("info", "sdk:feedback_submitted", {
+      has_email: email ? "true" : "false",
+      has_name: name ? "true" : "false",
+    });
+
+    return receipt;
+  },
+
+  async fetchQuestionnaire(
+    slug: string,
+    options?: { force?: boolean },
+  ): Promise<PulseQuestionnaireFetchResult> {
+    return fetchQuestionnaireRequest(questionnaireContext(), slug, options);
+  },
+
+  async saveQuestionnaireResponse(
+    slug: string,
+    answers: PulseQuestionnaireAnswers,
+    isComplete: boolean,
+  ): Promise<PulseQuestionnaireReceipt> {
+    return saveQuestionnaireResponseRequest(questionnaireContext(), slug, answers, isComplete);
+  },
+
+  async dismissQuestionnaires(): Promise<Date> {
+    return dismissQuestionnairesRequest(questionnaireContext());
   },
 
   get sessionId(): string | undefined {
