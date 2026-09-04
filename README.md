@@ -325,6 +325,9 @@ await Pulse.setUserProperties({
 ```
 
 Buffered events are flushed first, so the properties attach to the same id those events carry.
+The promise resolves once the attempt finishes, not once the server has accepted the properties:
+a rejected request is dropped and an unreachable one is parked for a later retry, neither of which
+throws. Turn on `debug` to see those drops.
 
 ## Feedback
 
@@ -411,7 +414,8 @@ function Survey({ questionnaire, draft }: { questionnaire: PulseQuestionnaire; d
       <h2>{question.title}</h2>
       {question.subtitle && <p>{question.subtitle}</p>}
       {/* render by question.type: text, single_choice, multi_choice, rating, nps */}
-      <button disabled={question.required && !isAnswered(answers, question)}
+      <button type="button"
+              disabled={question.required && !isAnswered(answers, question)}
               onClick={() => setIndex(index + 1)}>
         Next
       </button>
