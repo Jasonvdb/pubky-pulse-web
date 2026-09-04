@@ -514,7 +514,7 @@ Events logged while the browser reports itself offline queue up rather than fail
 | `flushThreshold` | `number` | `20` | Buffered events that trigger an immediate flush. |
 | `maxBufferSize` | `number` | `10000` | Buffered events kept before the oldest are dropped. |
 | `sessionTimeoutMs` | `number` | `1800000` | Idle time after which a new session starts. |
-| `supportedLanguages` | `string[]` | `navigator.languages` | Overrides the reported language list. |
+| `supportedLanguages` | `string[]` | not sent | The locales your app ships. Written through to the app record on the server and used for localization-gap analysis. Set it explicitly; the SDK never derives it from the browser. |
 
 Invalid values throw at `configure()` time with a `Pubky Pulse: …` message, so a typo surfaces on
 the first page load rather than silently dropping your data.

@@ -425,6 +425,14 @@ describe("Pulse", () => {
     expect(globalThis.fetch).toBe(fetchMock);
   });
 
+  it("omits the supported languages when they are not configured", async () => {
+    Pulse.configure(config);
+    Pulse.info("signed_up");
+    await Pulse.flush();
+
+    expect(appEvents()[0]?.supported_languages).toBeUndefined();
+  });
+
   it("sends the configured supported languages on every event", async () => {
     Pulse.configure({ ...config, supportedLanguages: ["fr", "de"] });
     Pulse.info("signed_up");

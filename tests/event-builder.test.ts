@@ -129,7 +129,12 @@ describe("buildEvent", () => {
     expect(event.device_model).toBe("Chrome 120");
     expect(event.locale).toBe("en-GB");
     expect(event.preferred_language).toBe("en-GB");
-    expect(event.supported_languages).toEqual(["en-GB", "en"]);
+    expect(event.supported_languages).toBeUndefined();
+  });
+
+  it("stamps the supported languages only when the app configures them", () => {
+    const ctx = context({ deviceInfo: collectDeviceInfo(["fr", "de"]) });
+    expect(buildEvent(ctx, "info", "hello").supported_languages).toEqual(["fr", "de"]);
   });
 
   it("omits fields that have no value instead of sending null", () => {

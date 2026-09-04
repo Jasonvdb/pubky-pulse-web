@@ -87,10 +87,15 @@ describe("collectDeviceInfo", () => {
     const info = collectDeviceInfo();
     expect(info.locale).toBe("en-GB");
     expect(info.preferredLanguage).toBe("en-GB");
-    expect(info.supportedLanguages).toEqual(["en-GB", "en"]);
   });
 
-  it("prefers the configured supported languages over navigator.languages", () => {
+  it("omits the supported languages unless they are configured", () => {
+    const info = collectDeviceInfo();
+    expect(info.supportedLanguages).toBeUndefined();
+    expect("supportedLanguages" in info).toBe(false);
+  });
+
+  it("reports the configured supported languages", () => {
     expect(collectDeviceInfo(["fr", "de"]).supportedLanguages).toEqual(["fr", "de"]);
   });
 });

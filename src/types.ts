@@ -68,7 +68,11 @@ export interface PulseConfiguration {
   maxBufferSize?: number;
   /** Idle time after which a new session starts. Default: 30 minutes. */
   sessionTimeoutMs?: number;
-  /** Overrides the languages reported from `navigator.languages`. */
+  /**
+   * The locales your app ships. Written through to the app record on the
+   * server and used for localization-gap analysis. Default: not sent — set it
+   * explicitly if you want it reported.
+   */
   supportedLanguages?: string[];
 }
 

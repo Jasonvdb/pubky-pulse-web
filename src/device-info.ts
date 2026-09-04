@@ -11,13 +11,13 @@ export interface DeviceInfo {
   deviceModel?: string;
   locale?: string;
   preferredLanguage?: string;
+  /** Only set when the app explicitly configures `supportedLanguages`. */
   supportedLanguages?: string[];
 }
 
 interface NavigatorLike {
   userAgent?: string;
   language?: string;
-  languages?: readonly string[];
 }
 
 function getNavigator(): NavigatorLike | undefined {
@@ -63,15 +63,17 @@ function parseBrowser(ua: string): string | undefined {
   return undefined;
 }
 
-export function collectDeviceInfo(supportedLanguagesOverride?: string[]): DeviceInfo {
+/**
+ * `supportedLanguages` describes the locales the app itself ships and is only
+ * reported when the host app configures it. There is deliberately no
+ * `navigator.languages` fallback: the server writes this list through to the
+ * app record, so a browser-derived default would let each visitor's language
+ * preferences overwrite the app's shipped-locale list.
+ */
+export function collectDeviceInfo(supportedLanguages?: string[]): DeviceInfo {
   const nav = getNavigator();
   const ua = typeof nav?.userAgent === "string" ? nav.userAgent : "";
   const language = typeof nav?.language === "string" && nav.language ? nav.language : undefined;
-  const languages =
-    supportedLanguagesOverride ??
-    (Array.isArray(nav?.languages) && nav.languages.length > 0
-      ? [...nav.languages]
-      : undefined);
 
   const info: DeviceInfo = {};
   const osVersion = ua ? parseOsVersion(ua) : undefined;
@@ -82,7 +84,9 @@ export function collectDeviceInfo(supportedLanguagesOverride?: string[]): Device
     info.locale = language;
     info.preferredLanguage = language;
   }
-  if (languages && languages.length > 0) info.supportedLanguages = languages;
+  if (supportedLanguages && supportedLanguages.length > 0) {
+    info.supportedLanguages = [...supportedLanguages];
+  }
   return info;
 }
 
