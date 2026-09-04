@@ -1,0 +1,72 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import { isQuotaExceededError, SafeStorage, STORAGE_PREFIX } from "../src/storage";
+import { resetTestEnvironment, testLocalStorage } from "./setup";
+
+function withoutLocalStorage(run: () => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", {
+    get() {
+      throw new Error("access denied");
+    },
+    configurable: true,
+  });
+  try {
+    run();
+  } finally {
+    if (original) Object.defineProperty(globalThis, "localStorage", original);
+  }
+}
+
+describe("SafeStorage", () => {
+  beforeEach(() => {
+    resetTestEnvironment();
+  });
+
+  it("namespaces every key it writes", () => {
+    const store = new SafeStorage("local");
+    expect(store.set("anonymous_id", "abc")).toBe(true);
+    expect(testLocalStorage.keys()).toEqual([`${STORAGE_PREFIX}anonymous_id`]);
+    expect(store.get("anonymous_id")).toBe("abc");
+  });
+
+  it("removes values from the backend", () => {
+    const store = new SafeStorage("local");
+    store.set("k", "v");
+    store.remove("k");
+    expect(store.get("k")).toBeNull();
+    expect(testLocalStorage.keys()).toEqual([]);
+  });
+
+  it("falls back to memory when storage access throws", () => {
+    withoutLocalStorage(() => {
+      const store = new SafeStorage("local");
+      expect(store.set("k", "v")).toBe(false);
+      expect(store.get("k")).toBe("v");
+      expect(store.isFallback).toBe(true);
+    });
+  });
+
+  it("keeps the value in memory when a write hits quota", () => {
+    const store = new SafeStorage("local");
+    testLocalStorage.throwOnSet = "quota";
+    expect(store.set("k", "v")).toBe(false);
+    expect(store.isFallback).toBe(true);
+    expect(store.get("k")).toBe("v");
+  });
+
+  it("prefers the memory value over a stale backend value", () => {
+    const store = new SafeStorage("local");
+    store.set("k", "old");
+    testLocalStorage.throwOnSet = "error";
+    store.set("k", "new");
+    expect(store.get("k")).toBe("new");
+  });
+
+  it("recognises the browser spellings of a quota failure", () => {
+    expect(isQuotaExceededError(new DOMException("x", "QuotaExceededError"))).toBe(true);
+    expect(isQuotaExceededError({ code: 22 })).toBe(true);
+    expect(isQuotaExceededError({ name: "NS_ERROR_DOM_QUOTA_REACHED" })).toBe(true);
+    expect(isQuotaExceededError(new Error("nope"))).toBe(false);
+    expect(isQuotaExceededError(null)).toBe(false);
+  });
+});
