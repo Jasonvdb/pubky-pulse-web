@@ -136,7 +136,8 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 ```
 
 `propagateSessionTo: ["/api"]` adds an `X-Pulse-Session-Id` header to every request whose URL starts
-with `/api`. Read it in your route handlers with the
+with `/api`. The header is added by wrapping the global `fetch`, so only requests that go through it
+are annotated. Read it in your route handlers with the
 [Node SDK](https://github.com/Jasonvdb/pubky-pulse-node) and the browser session and the server
 session become one trace:
 
@@ -454,13 +455,17 @@ Pulse.configure({
 });
 ```
 
-`networkTracking` wraps `window.fetch` and logs an `sdk:network_request` event per call with the
+`networkTracking` wraps the global `fetch` and logs an `sdk:network_request` event per call with the
 method, the URL (query string stripped), the status and the duration — debug for 2xx/3xx, warn for
 anything else, error when the request throws. Requests to your Pulse endpoint are skipped.
 
+Only requests made through the global `fetch` are wrapped. `XMLHttpRequest`, `navigator.sendBeacon`
+and libraries that use their own XHR adapter (axios in its default browser build, say) are invisible
+to both the events and the header below.
+
 `propagateSessionTo` lists URL prefixes that receive the `X-Pulse-Session-Id` header, and works
-whether or not `networkTracking` is on. Only list origins you control: the header should not leak to
-third parties.
+whether or not `networkTracking` is on — the same `fetch` wrapper is installed when either is set.
+Only list origins you control: the header should not leak to third parties.
 
 ## Flush and shutdown
 
@@ -507,8 +512,10 @@ the first page load rather than silently dropping your data.
    string you pass as `bundleId`.
 2. Add the site's origin to the server's `CORS_ORIGINS`, including the port you use in development
    (`http://localhost:5173`, say). Without it the browser blocks every request.
-3. Copy the app's client key. It starts with `pulse_client_`, is public and write-only, and is meant
-   to ship in your bundle. Never put a server key (`pulse_secret_…`) in a browser.
+3. Copy the app's client key. It starts with `pulse_client_`, is meant to ship in your bundle and is
+   public: it is ingest-scoped, so it can write events, feedback and user data for this one app and
+   read that app's questionnaire specs, and it cannot read back events, metrics or project data.
+   Never put a server key (`pulse_secret_…`) in a browser.
 
 ## Browser support and SSR
 
@@ -520,10 +527,11 @@ Two features degrade rather than break:
 - **Attachments** need `crypto.subtle`, which requires a secure context (HTTPS or `localhost`).
   Elsewhere uploads are skipped and the event is still sent.
 
-The package is safe to import on the server. `configure()` checks for `window` and, when there is
-none, returns without installing anything — so a Next.js or SvelteKit server render does no work and
-throws nothing. Log calls made before a successful `configure()` are ignored, so shared code that
-logs on both sides needs no guard of its own.
+The package is safe to import on the server. `configure()` validates its configuration first, then
+checks for `window` and, when there is none, returns without installing anything — so a Next.js or
+SvelteKit server render with a valid configuration does no work. An invalid configuration still
+throws during a server render, exactly as it would in the browser. Log calls made before a successful
+`configure()` are ignored, so shared code that logs on both sides needs no guard of its own.
 
 ## Development
 
