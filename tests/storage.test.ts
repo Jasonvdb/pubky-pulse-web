@@ -24,7 +24,7 @@ describe("SafeStorage", () => {
 
   it("namespaces every key it writes", () => {
     const store = new SafeStorage("local");
-    expect(store.set("anonymous_id", "abc")).toBe(true);
+    expect(store.set("anonymous_id", "abc")).toBe("persisted");
     expect(testLocalStorage.keys()).toEqual([`${STORAGE_PREFIX}anonymous_id`]);
     expect(store.get("anonymous_id")).toBe("abc");
   });
@@ -40,7 +40,7 @@ describe("SafeStorage", () => {
   it("falls back to memory when storage access throws", () => {
     withoutLocalStorage(() => {
       const store = new SafeStorage("local");
-      expect(store.set("k", "v")).toBe(false);
+      expect(store.set("k", "v")).toBe("memory-only");
       expect(store.get("k")).toBe("v");
       expect(store.isFallback).toBe(true);
     });
@@ -49,8 +49,15 @@ describe("SafeStorage", () => {
   it("keeps the value in memory when a write hits quota", () => {
     const store = new SafeStorage("local");
     testLocalStorage.throwOnSet = "quota";
-    expect(store.set("k", "v")).toBe(false);
+    expect(store.set("k", "v")).toBe("quota");
     expect(store.isFallback).toBe(true);
+    expect(store.get("k")).toBe("v");
+  });
+
+  it("reports a non-quota write failure as memory-only, not quota", () => {
+    const store = new SafeStorage("local");
+    testLocalStorage.throwOnSet = "error";
+    expect(store.set("k", "v")).toBe("memory-only");
     expect(store.get("k")).toBe("v");
   });
 

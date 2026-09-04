@@ -10,6 +10,12 @@ export const STORAGE_PREFIX = "pulse.";
 export type StorageKind = "local" | "session";
 
 /**
+ * Outcome of a write: persisted to the backend, rejected for lack of room, or
+ * held only in the in-memory fallback.
+ */
+export type StorageWriteResult = "persisted" | "quota" | "memory-only";
+
+/**
  * True for the several spellings browsers use when a write exceeds the
  * origin quota. Safari's private mode reports code 22 with no name.
  */
@@ -69,25 +75,29 @@ export class SafeStorage {
   }
 
   /**
-   * Returns false when the value could not be persisted. Quota failures are
-   * reported rather than hidden so callers such as the offline queue can shed
-   * data and retry; the value is still mirrored in memory.
+   * Reports how the value was retained. `"quota"` is the only outcome that
+   * means the origin has no room: callers such as the offline queue may shed
+   * data and retry on it. `"memory-only"` (no backend, or a write that failed
+   * for another reason) still keeps the value in the in-memory map, so it is
+   * readable for the life of the page and must not be discarded.
    */
-  set(key: string, value: string): boolean {
+  set(key: string, value: string): StorageWriteResult {
     const backend = resolveBackend(this.kind);
+    let result: StorageWriteResult = "memory-only";
     if (backend) {
       try {
         backend.setItem(STORAGE_PREFIX + key, value);
         this.memory.delete(key);
-        return true;
-      } catch {
+        return "persisted";
+      } catch (err) {
         this.usingFallback = true;
+        if (isQuotaExceededError(err)) result = "quota";
       }
     } else {
       this.usingFallback = true;
     }
     this.memory.set(key, value);
-    return false;
+    return result;
   }
 
   remove(key: string): void {

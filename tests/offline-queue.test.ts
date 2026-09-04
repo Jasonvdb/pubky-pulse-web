@@ -98,6 +98,43 @@ describe("OfflineQueue", () => {
     }
   });
 
+  it("keeps parked events in the memory fallback when localStorage is absent", () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage")!;
+    Object.defineProperty(globalThis, "localStorage", { value: undefined, configurable: true });
+    try {
+      const messages: string[] = [];
+      const fallbackQueue = new OfflineQueue(new SafeStorage("local"), (m) => messages.push(m));
+
+      fallbackQueue.append(makeEvents(4));
+
+      expect(fallbackQueue.read().map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+        "event-2",
+        "event-3",
+      ]);
+      expect(messages).toEqual(["offline queue not persisted, kept in memory"]);
+      expect(fallbackQueue.drain()).toHaveLength(4);
+    } finally {
+      Object.defineProperty(globalThis, "localStorage", original);
+    }
+  });
+
+  it("drops parked events only when the retry also hits quota", () => {
+    testLocalStorage.throwOnSet = "quota";
+    const messages: string[] = [];
+    const quotaQueue = new OfflineQueue(new SafeStorage("local"), (m) => messages.push(m));
+
+    quotaQueue.write(makeEvents(4));
+
+    expect(messages).toEqual([
+      "offline queue over quota, dropped 2 events",
+      "offline queue could not be written, dropping parked events",
+    ]);
+    expect(testLocalStorage.getItem(QUEUE_KEY)).toBeNull();
+    expect(quotaQueue.read()).toEqual([]);
+  });
+
   it("discards a corrupt payload instead of failing every flush", () => {
     testLocalStorage.setItem(QUEUE_KEY, "{not json");
     expect(queue.read()).toEqual([]);

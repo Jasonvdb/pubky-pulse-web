@@ -137,6 +137,14 @@ export class Transport {
     const pending = [...this.queue.drain(), ...this.buffer.splice(0)];
     if (pending.length === 0) return;
 
+    if (!isOnline()) {
+      // `visibilitychange` reaches this path on a page that stays alive, so
+      // park everything rather than firing a request that cannot succeed.
+      this.queue.write(pending);
+      this.onDebug?.("offline, skipping keepalive flush");
+      return;
+    }
+
     const { batch, rest } = sliceForKeepalive(pending, this.config.bundleId);
     if (rest.length > 0) this.queue.write(rest);
     if (batch.length === 0) return;
@@ -149,10 +157,14 @@ export class Transport {
         body: JSON.stringify(body),
         keepalive: true,
       })?.catch(() => {
-        // The page is unloading; there is nothing left to recover to.
+        // On a real unload this never runs; on a live page re-park the batch
+        // so it is retried. Ingest deduplicates on `client_event_id`, and the
+        // append lands after `rest` because the events carry a timestamp.
+        this.queue.append(batch);
       });
     } catch (err) {
       this.onDebug?.("keepalive flush failed", err);
+      this.queue.append(batch);
     }
   }
 

@@ -6,6 +6,7 @@ import {
   backoffDelayMs,
   KEEPALIVE_BODY_LIMIT_BYTES,
   MAX_BATCH_SIZE,
+  MAX_INGEST_EVENTS,
   sliceForKeepalive,
   Transport,
 } from "../src/transport";
@@ -72,6 +73,17 @@ describe("sliceForKeepalive", () => {
     expect(rest.length).toBeGreaterThan(0);
     const size = JSON.stringify({ bundle_id: BUNDLE_ID, events: batch }).length;
     expect(size).toBeLessThanOrEqual(KEEPALIVE_BODY_LIMIT_BYTES);
+  });
+
+  it("stops at the server's event limit when the bytes still fit", () => {
+    const events = Array.from({ length: 150 }, (_, i) => makeEvent(i));
+    const { batch, rest } = sliceForKeepalive(events, BUNDLE_ID);
+
+    expect(batch).toHaveLength(MAX_INGEST_EVENTS);
+    expect(rest).toHaveLength(150 - MAX_INGEST_EVENTS);
+    // The count branch bit, not the byte budget.
+    const size = JSON.stringify({ bundle_id: BUNDLE_ID, events }).length;
+    expect(size).toBeLessThan(KEEPALIVE_BODY_LIMIT_BYTES);
   });
 
   it("always sends at least one event, even an oversized one", () => {
@@ -309,6 +321,52 @@ describe("Transport", () => {
       tx.flushOnUnload();
 
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("parks everything and sends nothing while offline", () => {
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      for (let i = 0; i < 5; i += 1) tx.enqueue(makeEvent(i));
+      testNavigator.onLine = false;
+
+      tx.flushOnUnload();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(queue.read().map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+        "event-2",
+        "event-3",
+        "event-4",
+      ]);
+      expect(tx.bufferSize).toBe(0);
+    });
+
+    it("re-parks the batch when the keepalive request fails", async () => {
+      fetchMock.mockRejectedValue(new TypeError("network error"));
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(queue.read().map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+        "event-2",
+      ]);
+    });
+
+    it("re-parks the batch when fetch throws synchronously", () => {
+      fetchMock.mockImplementation(() => {
+        throw new TypeError("blocked");
+      });
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      tx.enqueue(makeEvent(0));
+
+      tx.flushOnUnload();
+
+      expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
     });
 
     it("does nothing when there is nothing to send", () => {

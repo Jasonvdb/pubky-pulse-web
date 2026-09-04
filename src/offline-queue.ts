@@ -1,4 +1,4 @@
-import { isQuotaExceededError, type SafeStorage } from "./storage";
+import { type SafeStorage, type StorageWriteResult } from "./storage";
 import type { LogEvent } from "./types";
 
 const QUEUE_KEY = "offline_queue";
@@ -41,17 +41,24 @@ export class OfflineQueue {
     }
 
     let pending = events.length > MAX_OFFLINE_EVENTS ? events.slice(-MAX_OFFLINE_EVENTS) : events;
-    if (this.persist(pending)) return;
+    const first = this.persist(pending);
+    if (first === "persisted") return;
+    if (first !== "quota") {
+      // No backend, or a write that failed for another reason: the events are
+      // still held in the storage fallback, so keep them there to be drained.
+      this.onDebug?.("offline queue not persisted, kept in memory");
+      return;
+    }
 
-    // One retry after shedding the oldest half; a second failure means the
-    // origin has no room at all and the events are dropped.
+    // One retry after shedding the oldest half; a second quota failure means
+    // the origin has no room at all and the events are dropped.
     pending = pending.slice(Math.ceil(pending.length / 2));
     this.onDebug?.(`offline queue over quota, dropped ${events.length - pending.length} events`);
     if (pending.length === 0) {
       this.storage.remove(QUEUE_KEY);
       return;
     }
-    if (!this.persist(pending)) {
+    if (this.persist(pending) === "quota") {
       this.onDebug?.("offline queue could not be written, dropping parked events");
       this.storage.remove(QUEUE_KEY);
     }
@@ -69,14 +76,14 @@ export class OfflineQueue {
     return events;
   }
 
-  private persist(events: LogEvent[]): boolean {
+  private persist(events: LogEvent[]): StorageWriteResult {
     try {
       return this.storage.set(QUEUE_KEY, JSON.stringify(events));
-    } catch (err) {
-      if (!isQuotaExceededError(err)) {
-        this.onDebug?.("offline queue serialisation failed");
-      }
-      return false;
+    } catch {
+      // Only `JSON.stringify` can throw here; nothing was retained anywhere,
+      // so take the shed-and-drop path as before.
+      this.onDebug?.("offline queue serialisation failed");
+      return "quota";
     }
   }
 }
