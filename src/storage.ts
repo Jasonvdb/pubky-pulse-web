@@ -100,6 +100,34 @@ export class SafeStorage {
     return result;
   }
 
+  /**
+   * Every SDK key currently held whose name starts with `prefix`, from the
+   * backend and the in-memory fallback alike. Used to find the offline queue's
+   * spill keys, whose names are not known ahead of time.
+   */
+  keys(prefix: string): string[] {
+    const found = new Set<string>();
+    for (const key of this.memory.keys()) {
+      if (key.startsWith(prefix)) found.add(key);
+    }
+
+    const backend = resolveBackend(this.kind);
+    if (!backend) {
+      this.usingFallback = true;
+      return [...found];
+    }
+    try {
+      const scoped = STORAGE_PREFIX + prefix;
+      for (let index = 0; index < backend.length; index += 1) {
+        const raw = backend.key(index);
+        if (raw?.startsWith(scoped)) found.add(raw.slice(STORAGE_PREFIX.length));
+      }
+    } catch {
+      this.usingFallback = true;
+    }
+    return [...found];
+  }
+
   remove(key: string): void {
     this.memory.delete(key);
     const backend = resolveBackend(this.kind);

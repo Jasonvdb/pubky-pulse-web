@@ -54,11 +54,39 @@ export interface TestLocation {
   href: string;
 }
 
+/**
+ * Web Locks stand-in. One chain per lock name, granted in request order, which
+ * is the property the offline queue relies on; real locks are cross-tab, and a
+ * single chain models two tabs racing inside one process.
+ */
+export class TestLockManager {
+  private readonly chains = new Map<string, Promise<unknown>>();
+  /** Lock names requested, in order, for assertions. */
+  readonly requested: string[] = [];
+  /** When set, every request rejects with it before the callback runs. */
+  rejectWith: Error | null = null;
+
+  request<T>(name: string, callback: () => Promise<T>): Promise<T> {
+    this.requested.push(name);
+    if (this.rejectWith) return Promise.reject(this.rejectWith);
+
+    const previous = this.chains.get(name) ?? Promise.resolve();
+    const run = previous.then(() => callback());
+    this.chains.set(
+      name,
+      run.catch(() => undefined),
+    );
+    return run;
+  }
+}
+
 export interface TestNavigator {
   language: string;
   languages: string[];
   userAgent: string;
   onLine: boolean;
+  /** Absent by default: the SDK has to work without the Web Locks API. */
+  locks?: TestLockManager;
 }
 
 export interface TestHistory {
@@ -141,6 +169,7 @@ export function resetTestEnvironment(): void {
   testNavigator.language = "en-GB";
   testNavigator.languages = ["en-GB", "en"];
   testNavigator.onLine = true;
+  delete testNavigator.locks;
   testLocation.pathname = "/";
   testLocation.hostname = "app.example.com";
   testLocation.protocol = "https:";

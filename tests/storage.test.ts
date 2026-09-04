@@ -69,6 +69,35 @@ describe("SafeStorage", () => {
     expect(store.get("k")).toBe("new");
   });
 
+  it("lists the keys under a prefix, unprefixed and without the host app's", () => {
+    const store = new SafeStorage("local");
+    store.set("queue:a", "1");
+    store.set("queue:b", "2");
+    store.set("anonymous_id", "abc");
+    testLocalStorage.setItem("queue:c", "not ours");
+
+    expect(store.keys("queue:").sort()).toEqual(["queue:a", "queue:b"]);
+    expect(store.keys("nothing:")).toEqual([]);
+  });
+
+  it("lists keys held only in the memory fallback", () => {
+    const store = new SafeStorage("local");
+    store.set("queue:a", "1");
+    testLocalStorage.throwOnSet = "error";
+    store.set("queue:b", "2");
+
+    // Persisted and fallback keys alike, each listed exactly once.
+    expect(store.keys("queue:").sort()).toEqual(["queue:a", "queue:b"]);
+  });
+
+  it("lists nothing rather than throwing when storage is blocked", () => {
+    withoutLocalStorage(() => {
+      const store = new SafeStorage("local");
+      expect(store.keys("queue:")).toEqual([]);
+      expect(store.isFallback).toBe(true);
+    });
+  });
+
   it("recognises the browser spellings of a quota failure", () => {
     expect(isQuotaExceededError(new DOMException("x", "QuotaExceededError"))).toBe(true);
     expect(isQuotaExceededError({ code: 22 })).toBe(true);

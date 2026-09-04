@@ -7,6 +7,9 @@ import {
   KEEPALIVE_BODY_LIMIT_BYTES,
   MAX_BATCH_SIZE,
   MAX_INGEST_EVENTS,
+  MAX_RETRY_AFTER_MS,
+  parseRetryAfter,
+  retryDelayMs,
   sliceForKeepalive,
   Transport,
 } from "../src/transport";
@@ -55,6 +58,50 @@ describe("backoffDelayMs", () => {
     expect([0, 1, 2, 3, 4, 5, 9].map(backoffDelayMs)).toEqual([
       1000, 2000, 4000, 8000, 16000, 30000, 30000,
     ]);
+  });
+});
+
+describe("parseRetryAfter", () => {
+  const now = Date.UTC(2026, 8, 4, 10, 0, 0);
+
+  it("reads delta-seconds", () => {
+    expect(parseRetryAfter("5", now)).toBe(5000);
+    expect(parseRetryAfter(" 120 ", now)).toBe(120_000);
+    expect(parseRetryAfter("0", now)).toBe(0);
+  });
+
+  it("reads an HTTP-date as the distance from now", () => {
+    expect(parseRetryAfter(new Date(now + 30_000).toUTCString(), now)).toBe(30_000);
+  });
+
+  it("clamps a date already in the past to zero", () => {
+    expect(parseRetryAfter(new Date(now - 60_000).toUTCString(), now)).toBe(0);
+  });
+
+  it("returns null for an absent, empty or unparsable header", () => {
+    expect(parseRetryAfter(null, now)).toBeNull();
+    expect(parseRetryAfter(undefined, now)).toBeNull();
+    expect(parseRetryAfter("   ", now)).toBeNull();
+    expect(parseRetryAfter("soon", now)).toBeNull();
+  });
+});
+
+describe("retryDelayMs", () => {
+  it("falls back to the ladder without a header", () => {
+    expect(retryDelayMs(0, null)).toBe(backoffDelayMs(0));
+    expect(retryDelayMs(3, null)).toBe(backoffDelayMs(3));
+  });
+
+  it("waits the longer of the header and the ladder", () => {
+    expect(retryDelayMs(0, 5000)).toBe(5000);
+    // A server asking for less does not make its next failure any cheaper.
+    expect(retryDelayMs(2, 1000)).toBe(4000);
+    expect(retryDelayMs(2, 0)).toBe(4000);
+  });
+
+  it("caps an outlandish header", () => {
+    expect(retryDelayMs(0, 3_600_000)).toBe(MAX_RETRY_AFTER_MS);
+    expect(retryDelayMs(5, 45_000)).toBe(45_000);
   });
 });
 
@@ -193,7 +240,7 @@ describe("Transport", () => {
   });
 
   it("drains the offline queue ahead of new events", async () => {
-    queue.append([makeEvent(90), makeEvent(91)]);
+    await queue.append([makeEvent(90), makeEvent(91)]);
     const tx = createTransport({ flushThreshold: 1000 });
     tx.enqueue(makeEvent(0));
 
@@ -291,6 +338,135 @@ describe("Transport", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(queue.read()).toEqual([]);
+  });
+
+  describe("Retry-After", () => {
+    function retryAfter(status: number, value: string): Response {
+      return new Response("later", { status, headers: { "Retry-After": value } });
+    }
+
+    /** Assert the next attempt lands exactly `delay` ms after the first. */
+    async function expectNextAttemptAfter(tx: Transport, delay: number): Promise<void> {
+      tx.enqueue(makeEvent(0));
+      const pending = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(delay - 1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // Let the ladder run out so the flush never outlives the test.
+      await vi.advanceTimersByTimeAsync(6 * MAX_RETRY_AFTER_MS);
+      await pending;
+    }
+
+    it("waits the delta-seconds a 429 asked for", async () => {
+      fetchMock.mockResolvedValue(retryAfter(429, "5"));
+      // The bare ladder would have retried after 1s.
+      await expectNextAttemptAfter(createTransport({ flushThreshold: 1000 }), 5000);
+    });
+
+    it("waits until the HTTP-date a 503 asked for", async () => {
+      const at = new Date(Date.now() + 7000).toUTCString();
+      fetchMock.mockResolvedValue(retryAfter(503, at));
+      await expectNextAttemptAfter(
+        createTransport({ flushThreshold: 1000 }),
+        Date.parse(at) - Date.now(),
+      );
+    });
+
+    it("caps the wait so one header cannot stall the flush", async () => {
+      fetchMock.mockResolvedValue(retryAfter(503, "3600"));
+      await expectNextAttemptAfter(createTransport({ flushThreshold: 1000 }), MAX_RETRY_AFTER_MS);
+    });
+
+    it("keeps the ladder when the header asks for less", async () => {
+      fetchMock.mockResolvedValue(retryAfter(429, "0"));
+      await expectNextAttemptAfter(createTransport({ flushThreshold: 1000 }), backoffDelayMs(0));
+    });
+
+    it("keeps the ladder when the header is unparsable", async () => {
+      fetchMock.mockResolvedValue(retryAfter(503, "very soon"));
+      await expectNextAttemptAfter(createTransport({ flushThreshold: 1000 }), backoffDelayMs(0));
+    });
+
+    it("ignores the header on a status that is not 429 or 503", async () => {
+      fetchMock.mockResolvedValue(retryAfter(500, "5"));
+      await expectNextAttemptAfter(createTransport({ flushThreshold: 1000 }), backoffDelayMs(0));
+    });
+  });
+
+  describe("the in-flight batch", () => {
+    /**
+     * Leave a batch asleep in the retry ladder, as a slow 503 does. The flush
+     * is handed back wrapped, so awaiting this helper does not await it.
+     */
+    async function startStalledFlush(tx: Transport): Promise<{ flushed: Promise<void> }> {
+      fetchMock.mockResolvedValue(new Response("boom", { status: 503 }));
+      tx.enqueue(makeEvent(0));
+      const flushed = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      return { flushed };
+    }
+
+    it("goes out with the unload flush instead of dying with the page", async () => {
+      const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
+      const { flushed } = await startStalledFlush(tx);
+
+      tx.flushOnUnload();
+
+      const unload = fetchMock.mock.calls[1]!;
+      expect((unload[1] as RequestInit).keepalive).toBe(true);
+      expect(requestBody(unload).events.map((e) => e.client_event_id)).toEqual(["event-0"]);
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      await flushed;
+
+      // The keepalive 503 parks it; the ladder must not park a second copy.
+      expect(queue.read().map((e) => e.client_event_id)).toEqual(["event-0"]);
+    });
+
+    it("is not parked again by a ladder that gives up after the unload sent it", async () => {
+      const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
+      const { flushed } = await startStalledFlush(tx);
+
+      fetchMock.mockResolvedValueOnce(ok());
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(31_000);
+      await flushed;
+
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("is parked once when the unload flush cannot send it at all", async () => {
+      const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
+      const { flushed } = await startStalledFlush(tx);
+
+      testNavigator.onLine = false;
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(31_000);
+      await flushed;
+
+      // Nothing was sent on the unload path, and exactly one copy is parked.
+      const keepalives = fetchMock.mock.calls.filter(
+        (call) => (call[1] as RequestInit).keepalive === true,
+      );
+      expect(keepalives).toEqual([]);
+      expect(queue.read().map((e) => e.client_event_id)).toEqual(["event-0"]);
+    });
+
+    it("is parked by the ladder as usual when no unload took it", async () => {
+      const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
+      const { flushed } = await startStalledFlush(tx);
+
+      await vi.advanceTimersByTimeAsync(31_000);
+      await flushed;
+
+      expect(queue.read().map((e) => e.client_event_id)).toEqual(["event-0"]);
+    });
   });
 
   it("coalesces concurrent flushes", async () => {
