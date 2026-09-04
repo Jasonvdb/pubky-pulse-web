@@ -3,7 +3,13 @@ import { Pulse } from "../src/index";
 import type { IngestRequest, LogEvent } from "../src/types";
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { STORAGE_PREFIX } from "../src/storage";
-import { resetTestEnvironment, testDocument, testLocalStorage, testWindow } from "./setup";
+import {
+  resetTestEnvironment,
+  testDocument,
+  testLocalStorage,
+  testLocation,
+  testWindow,
+} from "./setup";
 
 const config = {
   endpoint: "https://pulse.example.com/",
@@ -283,6 +289,141 @@ describe("Pulse", () => {
     testWindow.dispatchEvent(new Event("pagehide"));
     expect(fetchMock).not.toHaveBeenCalled();
     expect(Pulse.sessionId).toBeUndefined();
+  });
+
+  it("reports the page that is open when configure runs", async () => {
+    testLocation.pathname = "/pricing";
+    Pulse.configure(config);
+    Pulse.info("viewed_plans");
+    await Pulse.flush();
+
+    const appeared = sentEvents().find((e) => e.message === "sdk:screen_appeared");
+    expect(appeared?.level).toBe("debug");
+    expect(appeared?.screen_name).toBe("/pricing");
+    expect(appEvents()[0]?.screen_name).toBe("/pricing");
+  });
+
+  it("tracks a history navigation as a screen change", async () => {
+    Pulse.configure(config);
+    history.pushState(null, "", "/checkout");
+    Pulse.info("started_checkout");
+    await Pulse.flush();
+
+    const screens = sentEvents().filter((e) => e.message.startsWith("sdk:screen_"));
+    expect(screens.map((e) => [e.message, e.screen_name])).toEqual([
+      ["sdk:screen_appeared", "/"],
+      ["sdk:screen_disappeared", "/"],
+      ["sdk:screen_appeared", "/checkout"],
+    ]);
+    expect(screens[1]?.custom_attributes?._duration_ms).toMatch(/^\d+$/);
+    expect(appEvents()[0]?.screen_name).toBe("/checkout");
+  });
+
+  it("leaves the history api alone when page tracking is off", async () => {
+    Pulse.configure({ ...config, trackPageViews: false });
+    history.pushState(null, "", "/checkout");
+    await Pulse.flush();
+
+    expect(sentEvents().filter((e) => e.message.startsWith("sdk:screen_"))).toEqual([]);
+    expect(testLocation.pathname).toBe("/checkout");
+  });
+
+  it("takes the default screen name from trackScreen", async () => {
+    Pulse.configure({ ...config, trackPageViews: false });
+    Pulse.trackScreen("Checkout modal");
+    Pulse.info("paid");
+    await Pulse.flush();
+
+    expect(sentEvents().find((e) => e.message === "sdk:screen_appeared")?.screen_name).toBe(
+      "Checkout modal",
+    );
+    expect(appEvents()[0]?.screen_name).toBe("Checkout modal");
+  });
+
+  it("captures an uncaught exception", async () => {
+    Pulse.configure(config);
+    testWindow.dispatchEvent(
+      Object.assign(new Event("error"), { error: new TypeError("boom") }),
+    );
+    await Pulse.flush();
+
+    const event = appEvents()[0];
+    expect(event?.level).toBe("error");
+    expect(event?.message).toBe("boom");
+    expect(event?.custom_attributes?._error_type).toBe("TypeError");
+    expect(event?.custom_attributes?._unhandled).toBe("uncaught_exception");
+  });
+
+  it("captures an unhandled rejection", async () => {
+    Pulse.configure(config);
+    testWindow.dispatchEvent(
+      Object.assign(new Event("unhandledrejection"), { reason: new Error("no network") }),
+    );
+    await Pulse.flush();
+
+    expect(appEvents()[0]?.custom_attributes?._unhandled).toBe("unhandled_rejection");
+  });
+
+  it("does not capture unhandled errors when the option is off", async () => {
+    Pulse.configure({ ...config, captureUnhandled: false });
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error: new Error("boom") }));
+    await Pulse.flush();
+
+    expect(appEvents()).toEqual([]);
+  });
+
+  it("records app fetch calls but not its own ingest traffic", async () => {
+    Pulse.configure({ ...config, networkTracking: true });
+    await fetch("https://api.example.com/orders?token=secret");
+    await Pulse.flush();
+
+    const network = sentEvents().filter((e) => e.message === "sdk:network_request");
+    expect(network).toHaveLength(1);
+    expect(network[0]?.level).toBe("debug");
+    expect(network[0]?.custom_attributes?._http_url).toBe("https://api.example.com/orders");
+    expect(network[0]?.custom_attributes?._http_status).toBe("200");
+  });
+
+  it("propagates the session id to the configured prefixes", async () => {
+    Pulse.configure({ ...config, propagateSessionTo: ["/api"] });
+    await fetch("/api/orders");
+    await Pulse.flush();
+
+    const call = fetchMock.mock.calls.find((c) => c[0] === "/api/orders");
+    const headers = new Headers((call?.[1] as RequestInit | undefined)?.headers);
+    expect(headers.get("X-Pulse-Session-Id")).toBe(Pulse.sessionId);
+    // Propagation alone must not turn on request events.
+    expect(sentEvents().filter((e) => e.message === "sdk:network_request")).toEqual([]);
+  });
+
+  it("restores the wrapped fetch on shutdown", async () => {
+    Pulse.configure({ ...config, networkTracking: true });
+    await Pulse.shutdown();
+
+    expect(globalThis.fetch).toBe(fetchMock);
+  });
+
+  it("renews an expired session when the page comes back into view", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    Pulse.configure({ ...config, sessionTimeoutMs: 60_000 });
+    const first = Pulse.sessionId;
+
+    testDocument.visibilityState = "hidden";
+    testDocument.dispatchEvent(new Event("visibilitychange"));
+
+    vi.setSystemTime(Date.now() + 120_000);
+    testDocument.visibilityState = "visible";
+    testDocument.dispatchEvent(new Event("visibilitychange"));
+
+    expect(Pulse.sessionId).not.toBe(first);
+    await Pulse.flush();
+    expect(
+      sentEvents().filter((e) => e.message === "sdk:session_started").map((e) => e.session_id),
+    ).toEqual([first, Pulse.sessionId]);
+  });
+
+  it("ignores trackScreen before configure", () => {
+    expect(() => Pulse.trackScreen("Nowhere")).not.toThrow();
   });
 
   it("does not install anything without a window", () => {

@@ -91,13 +91,27 @@ export const testLocation: TestLocation = {
   href: "https://app.example.com/",
 };
 
+/** Mirror a real navigation: a url argument moves `location`. */
+function applyUrl(url?: string): void {
+  if (typeof url !== "string") return;
+  try {
+    const resolved = new URL(url, testLocation.href);
+    testLocation.pathname = resolved.pathname;
+    testLocation.href = resolved.href;
+  } catch {
+    // Ignore urls a browser would reject too.
+  }
+}
+
 export const testHistory: TestHistory = {
   state: null,
-  pushState(state) {
+  pushState(state, _title, url) {
     this.state = state;
+    applyUrl(url);
   },
-  replaceState(state) {
+  replaceState(state, _title, url) {
     this.state = state;
+    applyUrl(url);
   },
 };
 

@@ -3,10 +3,14 @@ import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
 import { buildEvent, type EventContext } from "./event-builder";
 import { IdentityManager } from "./identity";
+import { installLifecycle } from "./lifecycle";
+import { installNetworkTracking } from "./network-tracking";
 import { OfflineQueue } from "./offline-queue";
+import { PageTracker, type ScreenCallbacks } from "./page-tracking";
 import { SessionManager } from "./session";
 import { localStore } from "./storage";
 import { Transport } from "./transport";
+import { installUnhandledCapture, type UnhandledKind } from "./unhandled-capture";
 import type {
   PulseAttributes,
   PulseConfiguration,
@@ -30,8 +34,9 @@ let deviceInfo: DeviceInfo = {};
 let session: SessionManager | null = null;
 let identity: IdentityManager | null = null;
 let unconfiguredWarningShown = false;
-let unloadHandler: (() => void) | null = null;
-let visibilityHandler: (() => void) | null = null;
+let pageTracker: PageTracker | null = null;
+/** Uninstallers for everything `configure()` hooked into the page. */
+const uninstallers: Array<() => void> = [];
 
 function debugLog(message: string, detail?: unknown): void {
   if (!config?.debug) return;
@@ -92,6 +97,7 @@ function recordEvent(
     deviceInfo,
     sessionId,
     userId: identity.currentId,
+    screenName: pageTracker?.screenName,
   };
 
   try {
@@ -133,31 +139,70 @@ const sessionCallbacks = {
   },
 };
 
-function installUnloadHandlers(): void {
-  const win = (globalThis as { window?: Window }).window;
-  const doc = (globalThis as { document?: Document }).document;
-  if (!win) return;
+/** Screen changes are lifecycle chatter: debug level, suppressed in console. */
+const screenCallbacks: ScreenCallbacks = {
+  onAppeared(screenName: string): void {
+    log("debug", "sdk:screen_appeared", undefined, { screenName });
+  },
+  onDisappeared(screenName: string, durationMs: number): void {
+    log("debug", "sdk:screen_disappeared", { _duration_ms: String(durationMs) }, { screenName });
+  },
+};
 
-  unloadHandler = () => {
-    transport?.flushOnUnload();
-  };
-  win.addEventListener("pagehide", unloadHandler);
+/** Errors nobody caught, tagged with the hook that saw them. */
+function recordUnhandled(value: unknown, kind: UnhandledKind): void {
+  const { message, attributes } = extractErrorAttributes(value);
+  log("error", message, { ...attributes, _unhandled: kind });
+}
 
-  if (doc) {
-    visibilityHandler = () => {
-      if (doc.visibilityState === "hidden") transport?.flushOnUnload();
-    };
-    doc.addEventListener("visibilitychange", visibilityHandler);
+function installObservers(validated: ValidatedConfig): void {
+  uninstallers.push(
+    installLifecycle({
+      onHidden(): void {
+        transport?.flushOnUnload();
+      },
+      onVisible(): void {
+        // A long stint in the background may have expired the session.
+        session?.touch();
+      },
+    }),
+  );
+
+  // The tracker owns the default screen name, so it exists even when
+  // automatic page views are off; then only `trackScreen()` moves it.
+  pageTracker = new PageTracker(screenCallbacks);
+  if (validated.trackPageViews) pageTracker.install();
+
+  if (validated.captureUnhandled) {
+    uninstallers.push(installUnhandledCapture(recordUnhandled));
+  }
+
+  // Session propagation needs the same wrapper as request tracking.
+  if (validated.networkTracking || validated.propagateSessionTo.length > 0) {
+    uninstallers.push(
+      installNetworkTracking({
+        endpoint: validated.endpoint,
+        propagateSessionTo: validated.propagateSessionTo,
+        trackRequests: validated.networkTracking,
+        sessionId: () => session?.id ?? undefined,
+        onRequest(level, attributes): void {
+          log(level, "sdk:network_request", attributes);
+        },
+      }),
+    );
   }
 }
 
-function removeUnloadHandlers(): void {
-  const win = (globalThis as { window?: Window }).window;
-  const doc = (globalThis as { document?: Document }).document;
-  if (win && unloadHandler) win.removeEventListener("pagehide", unloadHandler);
-  if (doc && visibilityHandler) doc.removeEventListener("visibilitychange", visibilityHandler);
-  unloadHandler = null;
-  visibilityHandler = null;
+function uninstallObservers(): void {
+  for (const uninstall of uninstallers.splice(0)) {
+    try {
+      uninstall();
+    } catch (err) {
+      debugLog("failed to uninstall a page hook", err);
+    }
+  }
+  pageTracker?.restore();
+  pageTracker = null;
 }
 
 export interface PulseApi {
@@ -172,6 +217,11 @@ export interface PulseApi {
     attributes?: PulseAttributes,
     options?: PulseLogOptions,
   ): void;
+  /**
+   * Report a screen the SDK cannot see itself (a modal, a wizard step, a tab).
+   * The name also becomes the default `screen_name` for later events.
+   */
+  trackScreen(name: string): void;
   /**
    * Identify the person using the app. Buffered anonymous events are sent and
    * claimed server-side before the id switches, so nothing is orphaned.
@@ -206,7 +256,7 @@ export const Pulse: PulseApi = {
     if (transport) {
       // Re-configuring replaces the pipeline; drain the old one first.
       void transport.shutdown();
-      removeUnloadHandlers();
+      uninstallObservers();
     }
 
     config = validated;
@@ -230,9 +280,7 @@ export const Pulse: PulseApi = {
     session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks);
     session.start();
 
-    installUnloadHandlers();
-    // Extension points for later phases: page-view tracking, unhandled-error
-    // capture and fetch instrumentation hook in here.
+    installObservers(validated);
   },
 
   info(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void {
@@ -258,6 +306,14 @@ export const Pulse: PulseApi = {
     // SDK-reserved keys win over caller keys so fingerprinting stays stable.
     const merged: PulseAttributes = { ...(third as PulseAttributes | undefined), ...attributes };
     log("error", message, merged, fourth as PulseLogOptions | undefined);
+  },
+
+  trackScreen(name: string): void {
+    if (!pageTracker) {
+      debugLog("trackScreen called before configure()");
+      return;
+    }
+    pageTracker.trackScreen(name);
   },
 
   async setUser(identifier: string): Promise<void> {
@@ -291,7 +347,7 @@ export const Pulse: PulseApi = {
   },
 
   async shutdown(): Promise<void> {
-    removeUnloadHandlers();
+    uninstallObservers();
     await transport?.shutdown();
     transport = null;
     offlineQueue = null;
