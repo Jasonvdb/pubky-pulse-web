@@ -491,8 +491,21 @@ await Pulse.shutdown(); // flush, then remove every page hook the SDK installed
 ```
 
 When the page is hidden or unloaded the SDK flushes on its own with a `keepalive` request and parks
-whatever does not fit in an offline queue in `localStorage`, which is drained on the next page load.
-Events logged while the browser reports itself offline queue up rather than fail.
+whatever does not fit — including the batch that was still waiting out a retry — in an offline queue
+in `localStorage`, which is drained on the next page load. Events logged while the browser reports
+itself offline queue up rather than fail.
+
+That queue is shared by every tab on the origin, so the SDK serialises its reads and writes with the
+[Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API). The unload path has
+no turn left in which to wait for a lock, so it writes its leftovers to a key of its own that the
+next flush folds back in and removes. While a `Retry-After` the server asked for is still running it
+sends nothing at all and parks everything instead, so a page merely going hidden cannot talk the SDK
+out of the delay.
+
+A failed request is retried with exponential backoff, one second doubling to thirty. A `Retry-After`
+header on a `429` or a `503` extends that wait — it never shortens it — to at most a minute. A batch
+still undelivered after six attempts is parked. Ingest deduplicates on the event id, so a batch that
+was both parked and sent is counted once.
 
 ## Configuration
 
@@ -533,12 +546,15 @@ the first page load rather than silently dropping your data.
 ## Browser support and SSR
 
 Any evergreen browser — Chrome, Edge, Firefox and Safari — is supported; the build targets ES2020.
-Two features degrade rather than break:
+Three features degrade rather than break:
 
 - **gzip** needs `CompressionStream`. Where it is missing, bodies are sent as plain JSON. Bodies
   under 512 bytes and the unload path are never compressed anyway.
 - **Attachments** need `crypto.subtle`, which requires a secure context (HTTPS or `localhost`).
   Elsewhere uploads are skipped and the event is still sent.
+- **Cross-tab queue locking** needs the Web Locks API. Without it the offline queue is written
+  unlocked, which is what every earlier version did: correct in one tab, and able to lose parked
+  events only when two tabs happen to flush at the same instant.
 
 The package is safe to import on the server. `configure()` validates its configuration first, then
 checks for `window` and, when there is none, returns without installing anything — so a Next.js or

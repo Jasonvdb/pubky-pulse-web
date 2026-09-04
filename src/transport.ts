@@ -15,6 +15,8 @@ export const MAX_BATCH_SIZE = 20;
 export const MAX_INGEST_EVENTS = 100;
 export const MAX_RETRIES = 5;
 export const MAX_BACKOFF_MS = 30_000;
+/** Ceiling on a server-requested `Retry-After`, so one header cannot stall a flush. */
+export const MAX_RETRY_AFTER_MS = 60_000;
 export const REQUEST_TIMEOUT_MS = 10_000;
 /**
  * Keepalive requests share a small per-origin budget (64 KB in Chrome), so the
@@ -27,6 +29,32 @@ const UNLOAD_DEBOUNCE_MS = 1000;
 /** `min(2^attempt, 30)` seconds, matching the other Pulse SDKs. */
 export function backoffDelayMs(attempt: number): number {
   return Math.min(2 ** attempt * 1000, MAX_BACKOFF_MS);
+}
+
+/**
+ * Milliseconds asked for by a `Retry-After` header, which is either
+ * delta-seconds or an HTTP-date. Null when the header is absent or is
+ * something neither form explains; a date already in the past means "now".
+ */
+export function parseRetryAfter(header: string | null | undefined, now: number): number | null {
+  const value = header?.trim();
+  if (!value) return null;
+  if (/^\d+$/.test(value)) return Number(value) * 1000;
+
+  const at = Date.parse(value);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - now);
+}
+
+/**
+ * How long to wait before the next attempt. A `Retry-After` only ever
+ * lengthens the ladder — the server asking for less does not make its next
+ * failure cheaper — and is capped so a hostile header cannot park a flush.
+ */
+export function retryDelayMs(attempt: number, retryAfterMs: number | null): number {
+  const backoff = backoffDelayMs(attempt);
+  if (retryAfterMs === null) return backoff;
+  return Math.min(Math.max(retryAfterMs, backoff), MAX_RETRY_AFTER_MS);
 }
 
 type BatchOutcome = "sent" | "dropped" | "park";
@@ -64,6 +92,20 @@ export class Transport {
   private flushing: Promise<void> | null = null;
   private lastUnloadFlushAt = 0;
   private stopped = false;
+  /**
+   * The batch `sendBatch` is currently working through, including the seconds
+   * it spends asleep in the retry ladder. It lives here so the unload flush can
+   * take it with everything else instead of letting the page carry it away.
+   */
+  private inFlight: LogEvent[] | null = null;
+  /** True once the unload flush took `inFlight`, so it is not parked twice. */
+  private inFlightTaken = false;
+  /**
+   * The instant a `Retry-After` asked us to wait until, or 0 when no request
+   * is serving one out. The unload flush honours it rather than resending the
+   * sleeping batch straight away over keepalive.
+   */
+  private backoffUntil = 0;
 
   constructor(
     config: ValidatedConfig,
@@ -125,32 +167,42 @@ export class Transport {
     // The flush is a no-op while offline, and the caller drops this instance
     // straight afterwards, so park whatever it could not send.
     const left = this.buffer.splice(0);
-    if (left.length > 0) this.queue.append(left);
+    if (left.length > 0) await this.queue.append(left);
     this.stopped = true;
   }
 
   /**
    * Synchronous best-effort send as the page goes away: one keepalive request
-   * with whatever fits, the rest written back to the offline queue.
+   * with whatever fits, the rest spilled to the offline queue. Nothing here
+   * may read-modify-write the shared queue key — there is no turn left to
+   * await the cross-tab lock in — so it neither drains it nor rewrites it.
    */
   flushOnUnload(): void {
     const now = Date.now();
     if (now - this.lastUnloadFlushAt < UNLOAD_DEBOUNCE_MS) return;
     this.lastUnloadFlushAt = now;
 
-    const pending = [...this.queue.drain(), ...this.buffer.splice(0)];
+    const pending = [...this.takeInFlight(), ...this.buffer.splice(0)];
     if (pending.length === 0) return;
 
     if (!isOnline()) {
       // `visibilitychange` reaches this path on a page that stays alive, so
       // park everything rather than firing a request that cannot succeed.
-      this.queue.write(pending);
+      this.queue.spill(pending);
       this.onDebug?.("offline, skipping keepalive flush");
       return;
     }
 
+    if (now < this.backoffUntil) {
+      // The server asked for a delay and a hidden page is no reason to ignore
+      // it. Park everything instead; it goes out on the next flush or load.
+      this.queue.spill(pending);
+      this.onDebug?.("waiting out Retry-After, skipping keepalive flush");
+      return;
+    }
+
     const { batch, rest } = sliceForKeepalive(pending, this.config.bundleId);
-    if (rest.length > 0) this.queue.write(rest);
+    if (rest.length > 0) this.queue.spill(rest);
     if (batch.length === 0) return;
 
     const body: IngestRequest = { bundle_id: this.config.bundleId, events: batch };
@@ -169,17 +221,31 @@ export class Transport {
           // drops here exactly as it does in `post()`.
           if (!response.ok && (response.status >= 500 || response.status === 429)) {
             this.onDebug?.(`keepalive flush failed with ${response.status}`);
-            this.queue.append(batch);
+            void this.queue.append(batch);
           }
         },
         () => {
-          this.queue.append(batch);
+          void this.queue.append(batch);
         },
       );
     } catch (err) {
+      // Still inside the unload turn, so this one has to be the sync path.
       this.onDebug?.("keepalive flush failed", err);
-      this.queue.append(batch);
+      this.queue.spill(batch);
     }
+  }
+
+  /**
+   * Hand the in-flight batch to the unload flush, marking it taken so the
+   * `sendBatch` still awaiting an answer does not park it a second time on a
+   * page that survives.
+   */
+  private takeInFlight(): LogEvent[] {
+    const batch = this.inFlight;
+    if (!batch) return [];
+    this.inFlight = null;
+    this.inFlightTaken = true;
+    return batch;
   }
 
   /**
@@ -256,7 +322,7 @@ export class Transport {
       return;
     }
 
-    const parked = this.queue.drain();
+    const parked = await this.queue.drain();
     if (parked.length > 0) this.buffer.unshift(...parked);
 
     while (this.buffer.length > 0) {
@@ -264,8 +330,10 @@ export class Transport {
       const outcome = await this.sendBatch(batch);
       if (outcome === "park") {
         // The endpoint is unreachable: park this batch and everything behind
-        // it rather than burning retries on each remaining batch.
-        this.queue.append([...batch, ...this.buffer.splice(0)]);
+        // it rather than burning retries on each remaining batch. An unload
+        // flush that already took the batch has parked or sent it itself.
+        const rest = this.buffer.splice(0);
+        await this.queue.append(this.inFlightTaken ? rest : [...batch, ...rest]);
         return;
       }
     }
@@ -273,7 +341,14 @@ export class Transport {
 
   private async sendBatch(events: LogEvent[]): Promise<BatchOutcome> {
     const request: IngestRequest = { bundle_id: this.config.bundleId, events };
-    const outcome = await this.post("/v1/ingest", request, `${events.length} events`);
+    this.inFlight = events;
+    this.inFlightTaken = false;
+    let outcome: BatchOutcome;
+    try {
+      outcome = await this.post("/v1/ingest", request, `${events.length} events`);
+    } finally {
+      this.inFlight = null;
+    }
     if (outcome === "dropped") {
       this.onDebug?.(`dropping ${events.length} events`);
     }
@@ -305,6 +380,7 @@ export class Transport {
     if (encoded.contentEncoding) headers["Content-Encoding"] = encoded.contentEncoding;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+      let retryAfterMs: number | null = null;
       try {
         const response = await fetch(`${this.config.endpoint}${path}`, {
           method: "POST",
@@ -322,6 +398,11 @@ export class Transport {
         }
 
         this.onDebug?.(`${path} failed with ${response.status}`);
+        // The two statuses a Pulse server sends `Retry-After` with: it knows
+        // when it will have room again, and guessing earlier only adds load.
+        if (response.status === 429 || response.status === 503) {
+          retryAfterMs = parseRetryAfter(response.headers.get("Retry-After"), Date.now());
+        }
       } catch (err) {
         this.onDebug?.(`network error during ${path}`, err);
       }
@@ -333,7 +414,14 @@ export class Transport {
           this.onDebug?.(`offline, abandoning ${label}`);
           return "park";
         }
-        await sleep(backoffDelayMs(attempt));
+        const delay = retryDelayMs(attempt, retryAfterMs);
+        // Only a delay the server asked for parks the unload flush; a plain
+        // backoff is our own guess, which a page going away may cut short.
+        // Cleared on the way out, so the next attempt — and the request
+        // succeeding or the ladder ending — leaves nothing behind.
+        if (retryAfterMs !== null) this.backoffUntil = Date.now() + delay;
+        await sleep(delay);
+        this.backoffUntil = 0;
       }
     }
 
