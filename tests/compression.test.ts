@@ -1,11 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  byteLength,
-  encodeBody,
-  GZIP_THRESHOLD_BYTES,
-  gzip,
-  isCompressionAvailable,
-} from "../src/compression";
+import { byteLength, encodeBody, GZIP_THRESHOLD_BYTES, gzip } from "../src/compression";
 
 async function gunzip(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   const stream = new DecompressionStream("gzip");
@@ -37,7 +31,6 @@ describe("byteLength", () => {
 
 describe("gzip", () => {
   it("round-trips through the platform gzip codec", async () => {
-    expect(isCompressionAvailable()).toBe(true);
     const compressed = await gzip(large);
     expect(compressed).toBeInstanceOf(Uint8Array);
     expect(await gunzip(compressed as Uint8Array<ArrayBuffer>)).toBe(large);
@@ -45,7 +38,6 @@ describe("gzip", () => {
 
   it("returns null when the platform has no CompressionStream", async () => {
     await withoutCompressionStream(async () => {
-      expect(isCompressionAvailable()).toBe(false);
       expect(await gzip(large)).toBeNull();
     });
   });

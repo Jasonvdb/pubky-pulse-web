@@ -1,3 +1,4 @@
+import { nowMs } from "./clock";
 import type { PulseLogLevel } from "./types";
 
 /** Header the app's own backend reads to join its logs to this session. */
@@ -48,11 +49,6 @@ export function stripQuery(url: string): string {
 
 function matchesPrefix(candidates: string[], prefixes: string[]): boolean {
   return prefixes.some((prefix) => prefix !== "" && candidates.some((c) => c.startsWith(prefix)));
-}
-
-function nowMs(): number {
-  const perf = (globalThis as { performance?: Performance }).performance;
-  return typeof perf?.now === "function" ? perf.now() : Date.now();
 }
 
 /** Debug for a healthy response, warn for anything the server refused. */

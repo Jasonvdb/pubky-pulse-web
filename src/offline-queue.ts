@@ -69,10 +69,6 @@ export class OfflineQueue {
     return events;
   }
 
-  clear(): void {
-    this.storage.remove(QUEUE_KEY);
-  }
-
   private persist(events: LogEvent[]): boolean {
     try {
       return this.storage.set(QUEUE_KEY, JSON.stringify(events));

@@ -11,13 +11,15 @@ import {
 
 export const MAX_EVENT_MESSAGE_LENGTH = 2000;
 export const MAX_ATTRIBUTE_VALUE_LENGTH = 200;
+/** A stack trace is worthless once trimmed to 200 characters. */
+export const MAX_ERROR_STACK_LENGTH = 16000;
 
 /**
  * Per-key caps for trusted SDK-reserved attributes. Mirrors the server's
  * overrides so a stack trace survives the pre-transport trim.
  */
 export const RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES: Readonly<Record<string, number>> = {
-  _error_stack: 16000,
+  _error_stack: MAX_ERROR_STACK_LENGTH,
 };
 
 /** RFC 4122 v4 id, falling back to `getRandomValues` on older browsers. */

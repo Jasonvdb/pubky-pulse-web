@@ -4,16 +4,16 @@
  * input type because JavaScript allows `throw <anything>`.
  */
 
+import { MAX_ATTRIBUTE_VALUE_LENGTH, MAX_ERROR_STACK_LENGTH } from "./event-builder";
+
 const MAX_CAUSE_DEPTH = 5;
-const MAX_STACK_LENGTH = 16000;
-const MAX_VALUE_LENGTH = 200;
 
 export interface ExtractionResult {
   message: string;
   attributes: Record<string, string>;
 }
 
-function clip(value: string, max = MAX_VALUE_LENGTH): string {
+function clip(value: string, max = MAX_ATTRIBUTE_VALUE_LENGTH): string {
   return value.length > max ? value.slice(0, max) : value;
 }
 
@@ -88,7 +88,7 @@ export function extractErrorAttributes(error: unknown, userMessage?: string): Ex
   if (error instanceof Error) {
     attrs._error_type = typeOf(error);
     if (typeof error.stack === "string" && error.stack.length > 0) {
-      attrs._error_stack = clip(error.stack, MAX_STACK_LENGTH);
+      attrs._error_stack = clip(error.stack, MAX_ERROR_STACK_LENGTH);
     }
     const code = (error as Error & { code?: unknown }).code;
     if (typeof code === "string" && code.length > 0) {

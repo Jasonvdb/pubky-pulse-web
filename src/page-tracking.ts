@@ -5,6 +5,8 @@
  * (in-page anchors) from looking like navigations.
  */
 
+import { nowMs } from "./clock";
+
 /** Set while the History API is patched, so a second install cannot stack. */
 let originalPushState: History["pushState"] | null = null;
 let originalReplaceState: History["replaceState"] | null = null;
@@ -23,12 +25,6 @@ export function currentPath(): string {
   const loc = (globalThis as { location?: Location }).location;
   const path = loc?.pathname;
   return path ? path : "/";
-}
-
-/** Monotonic clock for screen durations, falling back to the wall clock. */
-function nowMs(): number {
-  const perf = (globalThis as { performance?: Performance }).performance;
-  return typeof perf?.now === "function" ? perf.now() : Date.now();
 }
 
 function patchHistory(): void {

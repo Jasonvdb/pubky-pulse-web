@@ -20,10 +20,6 @@ function getCompressionStream(): CompressionStreamCtor | undefined {
   return (globalThis as { CompressionStream?: CompressionStreamCtor }).CompressionStream;
 }
 
-export function isCompressionAvailable(): boolean {
-  return typeof getCompressionStream() === "function";
-}
-
 export function byteLength(value: string): number {
   return new TextEncoder().encode(value).length;
 }

@@ -257,7 +257,7 @@ function parseAnswerValue(raw: unknown): PulseQuestionnaireAnswerValue | undefin
   return undefined;
 }
 
-export function parseAnswers(raw: unknown): PulseQuestionnaireAnswers {
+function parseAnswers(raw: unknown): PulseQuestionnaireAnswers {
   if (!isRecord(raw)) return {};
   const answers: PulseQuestionnaireAnswers = {};
   for (const [key, value] of Object.entries(raw)) {

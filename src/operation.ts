@@ -1,3 +1,4 @@
+import { nowMs } from "./clock";
 import { randomUuid } from "./event-builder";
 import { metricMessage, normalizeSlug, type MetricPhase } from "./metrics";
 import type { PulseAttributes, PulseLogLevel } from "./types";
@@ -8,12 +9,6 @@ export type OperationLogger = (
   message: string,
   attributes?: PulseAttributes,
 ) => void;
-
-/** Monotonic where the browser offers it; wall clock is the fallback. */
-function nowMs(): number {
-  const performanceRef = (globalThis as { performance?: { now?: () => number } }).performance;
-  return typeof performanceRef?.now === "function" ? performanceRef.now() : Date.now();
-}
 
 /** Turn whatever the caller threw into the single `error` attribute. */
 function describeError(error: unknown): string {

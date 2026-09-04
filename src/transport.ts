@@ -82,6 +82,14 @@ export class Transport {
     return this.buffer.length;
   }
 
+  /** Headers every request to the Pulse endpoint carries. */
+  private jsonHeaders(): Record<string, string> {
+    return {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.config.apiKey}`,
+    };
+  }
+
   enqueue(event: LogEvent): void {
     if (this.stopped) return;
     if (this.buffer.length >= this.config.maxBufferSize) {
@@ -137,10 +145,7 @@ export class Transport {
     try {
       void fetch(`${this.config.endpoint}/v1/ingest`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.config.apiKey}`,
-        },
+        headers: this.jsonHeaders(),
         body: JSON.stringify(body),
         keepalive: true,
       })?.catch(() => {
@@ -186,10 +191,7 @@ export class Transport {
     try {
       response = await fetch(`${this.config.endpoint}/v1/feedback`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.config.apiKey}`,
-        },
+        headers: this.jsonHeaders(),
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
@@ -266,10 +268,7 @@ export class Transport {
       return "dropped";
     }
 
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${this.config.apiKey}`,
-    };
+    const headers = this.jsonHeaders();
     if (encoded.contentEncoding) headers["Content-Encoding"] = encoded.contentEncoding;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {

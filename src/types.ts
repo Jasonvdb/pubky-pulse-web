@@ -99,12 +99,6 @@ export interface IngestRequest {
   events: LogEvent[];
 }
 
-export interface IngestResponse {
-  accepted: number;
-  rejected: number;
-  errors?: Array<{ index: number; message: string }>;
-}
-
 /** Server-side cap on a feedback message, enforced client-side too. */
 export const MAX_FEEDBACK_MESSAGE_LENGTH = 4000;
 
