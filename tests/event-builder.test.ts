@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { validateConfiguration } from "../src/configuration";
 import { collectDeviceInfo } from "../src/device-info";
 import {
@@ -31,8 +31,36 @@ function context(overrides: Partial<EventContext> = {}): EventContext {
 }
 
 describe("randomUuid", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("produces a v4 uuid", () => {
     expect(randomUuid()).toMatch(UUID_PATTERN);
+  });
+
+  it("falls back to getRandomValues without crypto.randomUUID", () => {
+    // An insecure context exposes `crypto` but not `randomUUID`.
+    vi.stubGlobal("crypto", {
+      getRandomValues: (buffer: Uint8Array) => {
+        buffer.fill(0xff);
+        return buffer;
+      },
+    });
+
+    // All-ones bytes still have to carry the version and variant nibbles.
+    expect(randomUuid()).toBe("ffffffff-ffff-4fff-bfff-ffffffffffff");
+  });
+
+  it("falls back to Math.random without any crypto object", () => {
+    vi.stubGlobal("crypto", undefined);
+
+    const first = randomUuid();
+    const second = randomUuid();
+
+    expect(first).toMatch(UUID_PATTERN);
+    expect(second).toMatch(UUID_PATTERN);
+    expect(first).not.toBe(second);
   });
 });
 

@@ -37,7 +37,9 @@ export function defaultIsDev(): boolean {
 
 function positiveInteger(value: unknown, name: string, fallback: number): number {
   if (value === undefined) return fallback;
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+  // Floor first: a fractional value like 5000.5 is accepted, but one that
+  // floors below 1 (0.5, say) is not — it would silently become 0.
+  if (typeof value !== "number" || !Number.isFinite(value) || Math.floor(value) < 1) {
     throw new Error(`Pubky Pulse: ${name} must be a positive number`);
   }
   return Math.floor(value);

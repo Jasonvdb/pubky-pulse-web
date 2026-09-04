@@ -122,6 +122,10 @@ export class Transport {
       this.timer = null;
     }
     await this.flush();
+    // The flush is a no-op while offline, and the caller drops this instance
+    // straight afterwards, so park whatever it could not send.
+    const left = this.buffer.splice(0);
+    if (left.length > 0) this.queue.append(left);
     this.stopped = true;
   }
 
@@ -156,12 +160,22 @@ export class Transport {
         headers: this.jsonHeaders(),
         body: JSON.stringify(body),
         keepalive: true,
-      })?.catch(() => {
-        // On a real unload this never runs; on a live page re-park the batch
-        // so it is retried. Ingest deduplicates on `client_event_id`, and the
-        // append lands after `rest` because the events carry a timestamp.
-        this.queue.append(batch);
-      });
+      })?.then(
+        (response) => {
+          // On a real unload neither continuation runs; on a live page re-park
+          // the batch so it is retried. Ingest deduplicates on
+          // `client_event_id`, and the append lands after `rest` because the
+          // events carry a timestamp. A 4xx other than 429 is permanent, so it
+          // drops here exactly as it does in `post()`.
+          if (!response.ok && (response.status >= 500 || response.status === 429)) {
+            this.onDebug?.(`keepalive flush failed with ${response.status}`);
+            this.queue.append(batch);
+          }
+        },
+        () => {
+          this.queue.append(batch);
+        },
+      );
     } catch (err) {
       this.onDebug?.("keepalive flush failed", err);
       this.queue.append(batch);
@@ -272,6 +286,13 @@ export class Transport {
    * with exponential backoff before the caller decides what to do.
    */
   private async post(path: string, payload: unknown, label: string): Promise<BatchOutcome> {
+    if (!isOnline()) {
+      // No attempt can succeed, and the retry ladder would stall the caller
+      // for ~31s of backoff; park immediately as the flush paths do.
+      this.onDebug?.(`offline, skipping ${label}`);
+      return "park";
+    }
+
     let encoded: EncodedBody;
     try {
       encoded = await encodeBody(JSON.stringify(payload), this.config.compressionEnabled);
@@ -306,6 +327,12 @@ export class Transport {
       }
 
       if (attempt < MAX_RETRIES) {
+        // The connection may have dropped mid-ladder: abandon the backoff
+        // rather than sleeping through attempts that cannot succeed.
+        if (!isOnline()) {
+          this.onDebug?.(`offline, abandoning ${label}`);
+          return "park";
+        }
         await sleep(backoffDelayMs(attempt));
       }
     }

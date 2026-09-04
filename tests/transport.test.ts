@@ -220,6 +220,28 @@ describe("Transport", () => {
     expect(tx.bufferSize).toBe(0);
   });
 
+  it("keeps sending later batches after a 4xx drop", async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response("bad request", { status: 400 }))
+      .mockResolvedValue(ok());
+    const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+    for (let i = 0; i < 25; i += 1) tx.enqueue(makeEvent(i));
+
+    await tx.flush();
+
+    // A permanent rejection drops its own batch only; the flush carries on.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestBody(fetchMock.mock.calls[1]!).events.map((e) => e.client_event_id)).toEqual([
+      "event-20",
+      "event-21",
+      "event-22",
+      "event-23",
+      "event-24",
+    ]);
+    expect(queue.read()).toEqual([]);
+    expect(tx.bufferSize).toBe(0);
+  });
+
   it("retries a 429 with exponential backoff, then parks the batch", async () => {
     fetchMock.mockResolvedValue(new Response("slow down", { status: 429 }));
     const tx = createTransport({ flushThreshold: 1000, flushIntervalMs: 600_000 });
@@ -293,6 +315,22 @@ describe("Transport", () => {
     expect(tx.bufferSize).toBe(0);
   });
 
+  it("parks the buffer on shutdown while the browser is offline", async () => {
+    testNavigator.onLine = false;
+    const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+    for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+
+    await tx.shutdown();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queue.read().map((event) => event.client_event_id)).toEqual([
+      "event-0",
+      "event-1",
+      "event-2",
+    ]);
+    expect(tx.bufferSize).toBe(0);
+  });
+
   describe("flushOnUnload", () => {
     it("sends a keepalive request and parks the overflow", () => {
       const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
@@ -357,6 +395,74 @@ describe("Transport", () => {
       ]);
     });
 
+    it("re-parks the batch when the server answers with a 5xx", async () => {
+      fetchMock.mockResolvedValue(new Response(null, { status: 503 }));
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(queue.read().map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+        "event-2",
+      ]);
+    });
+
+    it("re-parks the batch when the server answers with a 429", async () => {
+      fetchMock.mockResolvedValue(new Response("slow down", { status: 429 }));
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      tx.enqueue(makeEvent(0));
+
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
+    });
+
+    it("drops the batch on a 4xx other than 429", async () => {
+      fetchMock.mockResolvedValue(new Response("bad request", { status: 400 }));
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      tx.enqueue(makeEvent(0));
+
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Permanent rejection: recycling it through the queue would retry it on
+      // every later unload.
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("re-parks the batch exactly once when the request rejects", async () => {
+      fetchMock.mockRejectedValue(new TypeError("network error"));
+      const tx = createTransport({ flushThreshold: 1000, maxBufferSize: 1000 });
+      tx.enqueue(makeEvent(0));
+
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
+    });
+
+    it("never gzips, even with compression enabled and a large body", () => {
+      const tx = createTransport({
+        compressionEnabled: true,
+        flushThreshold: 1000,
+        maxBufferSize: 1000,
+      });
+      for (let i = 0; i < 5; i += 1) tx.enqueue(makeEvent(i, "m".repeat(2000)));
+
+      tx.flushOnUnload();
+
+      // Asserted without awaiting: the unload path has to fire in this tick.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const init = fetchMock.mock.calls[0]![1] as RequestInit;
+      expect(typeof init.body).toBe("string");
+      expect(requestHeaders(fetchMock.mock.calls[0]!)["Content-Encoding"]).toBeUndefined();
+    });
+
     it("re-parks the batch when fetch throws synchronously", () => {
       fetchMock.mockImplementation(() => {
         throw new TypeError("blocked");
@@ -414,6 +520,32 @@ describe("Transport", () => {
 
       await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns immediately while the browser reports itself offline", async () => {
+      testNavigator.onLine = false;
+      const tx = createTransport();
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+      await expect(tx.setUserProperties("user-1", { plan: "pro" })).resolves.toBe(false);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("abandons the retry ladder when the connection drops mid-flight", async () => {
+      fetchMock.mockResolvedValue(new Response("", { status: 500 }));
+      const tx = createTransport();
+
+      const claimed = tx.claimIdentity("pulse_anon_1", "user-1");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      testNavigator.onLine = false;
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+
+      await expect(claimed).resolves.toBe(false);
+      // Without the guard this would burn all six attempts and 31s of backoff.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
 
     it("posts user properties without flushing first", async () => {

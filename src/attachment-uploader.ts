@@ -131,46 +131,49 @@ export class AttachmentUploader {
     if (!subtle) return;
 
     const source = item.attachment.data;
-    let bytes: Uint8Array;
+    const blob = isBlob(source) ? source : null;
     let filename = item.attachment.filename;
     let contentType = item.attachment.contentType;
 
-    if (isBlob(source)) {
-      const asFile = source as Blob & { name?: string };
+    if (blob) {
+      const asFile = blob as Blob & { name?: string };
       filename ??= typeof asFile.name === "string" && asFile.name ? asFile.name : undefined;
-      bytes = new Uint8Array(await source.arrayBuffer());
-      if (!contentType && source.type) contentType = source.type;
-    } else if (source instanceof Uint8Array) {
-      bytes = source;
-    } else {
+      if (!contentType && blob.type) contentType = blob.type;
+    } else if (!(source instanceof Uint8Array)) {
       this.onDebug?.("attachment data must be a Blob, File or Uint8Array");
       return;
     }
 
     const name = filename ?? "attachment.bin";
     const type = contentType ?? inferContentType(name);
+    // `Blob.size` is known without reading the file, so an empty or over-cap
+    // attachment is rejected before it is materialised in the heap.
+    const sizeBytes = blob ? blob.size : (source as Uint8Array).length;
 
-    if (bytes.length === 0) {
+    if (sizeBytes === 0) {
       this.onDebug?.(`skipping empty attachment "${name}"`);
       return;
     }
-    if (bytes.length > MAX_ATTACHMENT_BYTES) {
-      this.onDebug?.(`skipping attachment "${name}": ${bytes.length} bytes exceeds the SDK cap`);
+    if (sizeBytes > MAX_ATTACHMENT_BYTES) {
+      this.onDebug?.(`skipping attachment "${name}": ${sizeBytes} bytes exceeds the SDK cap`);
       return;
     }
 
+    const bytes = blob ? new Uint8Array(await blob.arrayBuffer()) : (source as Uint8Array);
     const sha256 = await sha256Hex(bytes, subtle);
     const reserved = await this.reserve({
       clientEventId: item.clientEventId,
       userId: item.userId,
       filename: name,
       contentType: type,
-      sizeBytes: bytes.length,
+      sizeBytes,
       sha256,
     });
     if (!reserved) return;
 
-    await this.putBytes(reserved.upload_url, bytes, name);
+    // The Blob itself is the body: the browser streams it instead of copying
+    // the hashed buffer into the request, which can then be collected.
+    await this.putBytes(reserved.upload_url, blob ?? bytes, sizeBytes, name);
   }
 
   private async reserve(args: {
@@ -217,7 +220,12 @@ export class AttachmentUploader {
     }
   }
 
-  private async putBytes(url: string, bytes: Uint8Array, name: string): Promise<void> {
+  private async putBytes(
+    url: string,
+    body: Blob | Uint8Array,
+    sizeBytes: number,
+    name: string,
+  ): Promise<void> {
     try {
       const response = await fetch(url, {
         method: "PUT",
@@ -225,8 +233,8 @@ export class AttachmentUploader {
           "Content-Type": "application/octet-stream",
           Authorization: `Bearer ${this.config.apiKey}`,
         },
-        body: bytes as unknown as BodyInit,
-        signal: AbortSignal.timeout(uploadTimeoutMs(bytes.length)),
+        body: body as unknown as BodyInit,
+        signal: AbortSignal.timeout(uploadTimeoutMs(sizeBytes)),
       });
       if (!response.ok) {
         this.onDebug?.(`attachment upload "${name}" failed (${response.status})`);

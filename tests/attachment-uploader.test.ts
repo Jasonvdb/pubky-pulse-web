@@ -150,6 +150,53 @@ describe("AttachmentUploader", () => {
     expect(new Uint8Array(putInit.body as Uint8Array)).toEqual(bytes);
   });
 
+  it("puts the Blob itself rather than a copy of its bytes", async () => {
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const blob = new Blob([bytes], { type: "text/plain" });
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: blob, filename: "note.txt" }]);
+    await uploader.flush();
+
+    const body = JSON.parse(callsTo("/v1/ingest/attachment")[0]![1].body as string) as {
+      size_bytes: number;
+      sha256: string;
+    };
+    expect(body.size_bytes).toBe(blob.size);
+    expect(body.sha256).toBe(sha256(bytes));
+    // The browser streams the Blob instead of copying it into the request.
+    expect(callsTo("uploads.example.com")[0]![1].body).toBe(blob);
+  });
+
+  it("rejects an over-cap Blob without reading it", async () => {
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    const blob = new Blob([new Uint8Array([1])]);
+    const read = vi.fn(() => Promise.resolve(new ArrayBuffer(1)));
+    Object.defineProperty(blob, "size", { value: MAX_ATTACHMENT_BYTES + 1 });
+    Object.defineProperty(blob, "arrayBuffer", { value: read });
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: blob, filename: "huge.bin" }]);
+    await uploader.flush();
+
+    expect(read).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("exceeds the SDK cap"));
+  });
+
+  it("skips an empty Blob without reading it", async () => {
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    const blob = new Blob([]);
+    const read = vi.fn(() => Promise.resolve(new ArrayBuffer(0)));
+    Object.defineProperty(blob, "arrayBuffer", { value: read });
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: blob, filename: "empty.bin" }]);
+    await uploader.flush();
+
+    expect(read).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("empty attachment"));
+  });
+
   it("takes the name and type from a File", async () => {
     const uploader = new AttachmentUploader(makeConfig(), debug);
     const file = new File([new Uint8Array([9, 9])], "shot.png", { type: "image/png" });

@@ -53,6 +53,18 @@ describe("validateConfiguration", () => {
     expect(() => validateConfiguration({ ...base, maxBufferSize: -1 })).toThrow(
       "Pubky Pulse: maxBufferSize must be a positive number",
     );
+    // Floors to 0, which would turn the flush interval into a hot loop and
+    // make every event trip the threshold.
+    expect(() => validateConfiguration({ ...base, flushIntervalMs: 0.5 })).toThrow(
+      "Pubky Pulse: flushIntervalMs must be a positive number",
+    );
+    expect(() => validateConfiguration({ ...base, flushThreshold: 0.9 })).toThrow(
+      "Pubky Pulse: flushThreshold must be a positive number",
+    );
+  });
+
+  it("floors a fractional value that still lands on a positive integer", () => {
+    expect(validateConfiguration({ ...base, flushIntervalMs: 5000.5 }).flushIntervalMs).toBe(5000);
   });
 
   it("rejects a flush threshold larger than the buffer", () => {

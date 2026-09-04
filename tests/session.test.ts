@@ -76,6 +76,24 @@ describe("SessionManager", () => {
     expect(storedActivity()).toBe(String(T0 + TIMEOUT_MS - 1));
   });
 
+  it("rotates a resumed session silently when it expires", () => {
+    const first = makeManager().start(T0);
+    started = [];
+
+    const resumed = makeManager();
+    expect(resumed.start(T0 + TIMEOUT_MS - 1)).toBe(first);
+    expect(resumed.isResumed).toBe(true);
+
+    const next = resumed.touch(T0 + (2 * TIMEOUT_MS));
+
+    expect(next).not.toBe(first);
+    expect(started.map((entry) => entry.id)).toEqual([next]);
+    // We never saw the inherited session start, so we do not end it either.
+    expect(ended).toEqual([]);
+    expect(resumed.id).toBe(next);
+    expect(storedId()).toBe(next);
+  });
+
   it("starts a fresh session when the stored one has gone stale", () => {
     const first = makeManager().start(T0);
     started = [];
