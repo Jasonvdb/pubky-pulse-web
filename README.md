@@ -55,8 +55,11 @@ startup can never throw.
 ```
 
 There is a runnable version of this in [`examples/vanilla/index.html`](./examples/vanilla/index.html):
-build the package with `npm run build`, open the file, fill in your key and bundle id, and watch the
-events stream.
+build the package with `npm run build`, then serve the repository over HTTP — `npx serve .` or
+`python3 -m http.server` — and open `http://localhost:3000/examples/vanilla/index.html` (port 8000
+for `http.server`). The page imports the built SDK as a module, so opening it straight from disk
+over `file://` leaves it dead. Fill in your key and bundle id there and watch the events stream;
+the origin you serve it from is the one that has to be in the server's `CORS_ORIGINS`.
 
 ### React
 

@@ -406,6 +406,33 @@ describe("Pulse", () => {
     expect(globalThis.fetch).toBe(fetchMock);
   });
 
+  it("replaces the pipeline when configure runs again without shutdown", async () => {
+    Pulse.configure({ ...config, networkTracking: true });
+    const firstSession = Pulse.sessionId;
+    Pulse.configure({ ...config, networkTracking: true });
+
+    expect(Pulse.sessionId).toBe(firstSession);
+
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error: new Error("boom") }));
+    await fetch("https://api.example.com/orders");
+    await Pulse.flush();
+
+    // A second install without the matching uninstall would double every hook.
+    expect(sentEvents().filter((e) => e.custom_attributes?._unhandled)).toHaveLength(1);
+    expect(sentEvents().filter((e) => e.message === "sdk:network_request")).toHaveLength(1);
+
+    await Pulse.shutdown();
+    expect(globalThis.fetch).toBe(fetchMock);
+  });
+
+  it("sends the configured supported languages on every event", async () => {
+    Pulse.configure({ ...config, supportedLanguages: ["fr", "de"] });
+    Pulse.info("signed_up");
+    await Pulse.flush();
+
+    expect(appEvents()[0]?.supported_languages).toEqual(["fr", "de"]);
+  });
+
   it("renews an expired session when the page comes back into view", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     Pulse.configure({ ...config, sessionTimeoutMs: 60_000 });
@@ -494,6 +521,28 @@ describe("Pulse", () => {
     expect(printed.some((line) => line.includes("metric:photo-upload:start"))).toBe(false);
     expect(printed.some((line) => line.includes("metric:photo-upload:complete"))).toBe(true);
     expect(printed.some((line) => line.includes("metric:cache-hit:record"))).toBe(true);
+  });
+
+  it("routes console output by level and renders sorted attributes", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    log.mockClear();
+    warn.mockClear();
+    error.mockClear();
+
+    Pulse.configure({ ...config, consoleLogging: true });
+    Pulse.info("signed_up", { plan: "pro", region: "eu" });
+    Pulse.warn("slow_response", { ms: "900" });
+    Pulse.error("checkout_failed", { step: "pay" });
+
+    // Padding around the level is not pinned; the parts and routing are.
+    const lines = (spy: typeof log): string[] =>
+      spy.mock.calls.map((call) => String(call[0]).replace(/\s+/g, " "));
+
+    expect(lines(log)).toEqual(["[pulse] INFO signed_up {plan=pro, region=eu}"]);
+    expect(lines(warn)).toEqual(["[pulse] WARN slow_response {ms=900}"]);
+    expect(lines(error)).toEqual(["[pulse] ERROR checkout_failed {step=pay}"]);
   });
 
   it("ignores metric calls before configure", () => {
