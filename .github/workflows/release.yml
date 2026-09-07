@@ -36,9 +36,16 @@ jobs:
     needs: wait-for-tests
     runs-on: ubuntu-latest
     permissions:
+      # The job pushes the release commit and the tag back to main.
       contents: write
-    env:
-      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+      # Lets the runner mint the short-lived OIDC token that npm trusted
+      # publishing exchanges for publish rights, once per run. There is no npm
+      # token anywhere in this workflow: authorization lives in the package's
+      # Trusted Publisher settings on npmjs.com (user `Jasonvdb`, repository
+      # `pubky-pulse-web`, workflow file `release.yml`), not in a repository
+      # secret. Renaming this file breaks publishing until that npm setting is
+      # updated to match the new filename.
+      id-token: write
     steps:
       - uses: actions/checkout@v5
         with:
@@ -46,9 +53,13 @@ jobs:
           fetch-tags: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Node 24 ships npm 11.12.1. Trusted publishing needs npm >= 11.5.1 and
+      # node >= 22.14.0, so this cannot go back down to 20 to match test.yml —
+      # node 20 bundles npm 10.x, which cannot publish this way at all. test.yml
+      # staying on 20 is deliberate: 20 is the package's supported floor.
       - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Compute next version
@@ -174,6 +185,23 @@ jobs:
           echo "Failed to create release after 3 attempts"
           exit 1
 
+      # An npm older than 11.5.1 does not speak trusted publishing and fails the
+      # publish below with an opaque authentication error instead of a version
+      # one. Check it here so the log names the real cause.
+      - name: Check npm supports trusted publishing
+        run: |
+          required="11.5.1"
+          have="$(npm -v)"
+          if [[ "$(printf '%s\n%s\n' "$required" "$have" | sort -V | head -n1)" != "$required" ]]; then
+            echo "npm $have is too old for npm trusted publishing: need >= $required (node >= 22.14.0). Raise node-version in this workflow." >&2
+            exit 1
+          fi
+          echo "npm $have is new enough for npm trusted publishing"
+
+      # No token is passed: npm mints a short-lived credential from the job's
+      # OIDC identity, which the package's Trusted Publisher settings on
+      # npmjs.com authorize. Nothing here reads a repository secret.
+      #
       # The `npm view` fast path is a cheap skip, but it reads npm's CDN-cached
       # registry front end, which was observed on 2026-09-07 returning 404 for
       # 2-5 minutes after a fully successful publish. So on a retry it can
@@ -182,11 +210,10 @@ jobs:
       # "You cannot publish over the previously published versions", which means
       # the version we wanted is on the registry — success, not a failure to
       # retry. Match that message rather than the bare E403 code, so a genuine
-      # 403 (bad or unscoped token) still fails the workflow loudly.
+      # 403 — the package's trusted publisher not configured, or configured for
+      # a different repository or workflow file — still fails the workflow
+      # loudly.
       - name: Publish to npm
-        if: ${{ env.HAS_NPM_TOKEN == 'true' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           version="${{ steps.ver.outputs.version }}"
           pkg="@synonymdev/pubky-pulse-web"
