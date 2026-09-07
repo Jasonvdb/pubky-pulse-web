@@ -61,13 +61,33 @@ jobs:
           current="$pkg"
           IFS='.' read -r MAJ MIN PAT <<< "$current"
 
-          msg=$(git log -1 --pretty=%s ${{ github.sha }})
+          # Pull requests land on main as GitHub merge commits, whose subject is
+          # always "Merge pull request #N from owner/branch" — the conventional
+          # commit title lives in the body. Reading only %s would therefore make
+          # every merge a patch bump, including a breaking "refactor!:" one, so
+          # for a merge commit the effective subject is the first non-empty body
+          # line. Squash merges and direct commits already carry the prefix in
+          # the subject and keep using it. Do not simplify this back to %s.
+          subject=$(git log -1 --pretty=%s ${{ github.sha }})
+          body=$(git log -1 --pretty=%b ${{ github.sha }})
+          full=$(git log -1 --pretty=%B ${{ github.sha }})
+
+          msg="$subject"
+          if [[ "$subject" == "Merge pull request #"* || "$subject" == "Merge branch "* ]]; then
+            body_line=$(printf '%s\n' "$body" | grep -m1 -v '^[[:space:]]*$' || true)
+            if [[ -n "$body_line" ]]; then
+              msg="$body_line"
+            fi
+          fi
+
           # feat!:/fix!:/BREAKING CHANGE → major; feat:/feat(...) → minor; else patch.
+          # BREAKING CHANGE is matched against the full commit message because
+          # Conventional Commits puts it in a footer, not in the subject.
           # Pre-1.0 semver convention: while MAJ is 0 the API is unstable, so a
           # breaking marker bumps minor instead of jumping straight to 1.0.0.
           # The first major release happens manually (tag v1.0.0 by hand) — this
           # workflow only takes over once the project is past 0.x.
-          if [[ "$msg" == *"!:"* || "$msg" == *"BREAKING CHANGE"* ]]; then
+          if [[ "$msg" == *"!:"* || "$full" == *"BREAKING CHANGE"* ]]; then
             if [[ "$MAJ" == "0" ]]; then
               MIN=$((MIN+1)); PAT=0
             else
@@ -87,9 +107,22 @@ jobs:
             exit 1
           fi
           next="v${version}"
+
+          # Rerun safety: if a previous run pushed main but then failed (tag
+          # push, release creation or npm publish), main is ahead of the event
+          # SHA while the tag may or may not exist. A rerun checks out the same
+          # SHA and computes the same version, so record whether the tag is
+          # already there — locally (the checkout fetches tags) or on the remote.
+          already_released=false
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null \
+             || [[ -n "$(git ls-remote --tags origin "refs/tags/$next")" ]]; then
+            already_released=true
+          fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "next=$next" >> "$GITHUB_OUTPUT"
-          echo "Next version: $next (from '$msg')"
+          echo "already_released=$already_released" >> "$GITHUB_OUTPUT"
+          echo "Next version: $next (from '$msg'), tag already exists: $already_released"
 
       - name: Bump package.json
         run: npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
@@ -102,7 +135,15 @@ jobs:
           npm ci
           npm run build
 
+      # Skipped when the tag already exists, which is what a rerun of a
+      # partially-failed release looks like: main already carries the bump
+      # commit, so committing and pushing again would fail non-fast-forward and
+      # strand the release. The steps below have their own skip-if-exists
+      # guards, so a rerun completes only the parts that are missing. Note that
+      # "Bump package.json" above is deliberately NOT guarded — it is what puts
+      # the released version into package.json for the publish step.
       - name: Commit, tag, push
+        if: ${{ steps.ver.outputs.already_released != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
