@@ -22,7 +22,6 @@ Configure once, as early in the page's life as you can, then log from anywhere.
 import { Pulse } from "@synonymdev/pubky-pulse-web";
 
 Pulse.configure({
-  endpoint: "https://pulse.example.com",
   apiKey: "pulse_client_…",
   bundleId: "com.example.web",
   appVersion: "1.4.0",
@@ -30,6 +29,11 @@ Pulse.configure({
 
 Pulse.info("signed_up", { plan: "pro" });
 ```
+
+Leaving `endpoint` out sends the events to Pubky's hosted instance at
+`https://ingest.pubkypulse.com`. Nothing warns you when that happens, so if you run your own Pubky
+Pulse you must pass your own ingest host or your data goes to Pubky's instance instead of yours.
+The default needs 0.2.0 or newer; on 0.1.1 and earlier `endpoint` is still required.
 
 Calls made before `configure()` are ignored (one console note, then silence), so a stray log during
 startup can never throw.
@@ -43,7 +47,7 @@ startup can never throw.
   import { Pulse } from "https://esm.sh/@synonymdev/pubky-pulse-web";
 
   Pulse.configure({
-    endpoint: "https://pulse.example.com",
+    endpoint: "https://ingest.pubkypulse.com",
     apiKey: "pulse_client_…",
     bundleId: "com.example.web",
   });
@@ -511,7 +515,7 @@ was both parked and sent is counted once.
 
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
-| `endpoint` | `string` | — | **Required.** Pulse server URL; a trailing slash is stripped. |
+| `endpoint` | `string` | `https://ingest.pubkypulse.com` | Pubky's hosted ingest host; a trailing slash is stripped. Self-hosters must set their own server URL explicitly. |
 | `apiKey` | `string` | — | **Required.** Client key, must start with `pulse_client_`. |
 | `bundleId` | `string` | — | **Required.** Bundle id of the Pulse app receiving the events. |
 | `appVersion` | `string` | — | Version reported with every event. |

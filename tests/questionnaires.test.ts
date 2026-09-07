@@ -6,6 +6,7 @@ import {
   saveQuestionnaireResponse,
   type QuestionnaireContext,
 } from "../src/questionnaires";
+import { SDK_VERSION } from "../src/types";
 import { resetTestEnvironment } from "./setup";
 
 const ctx: QuestionnaireContext = {
@@ -187,7 +188,7 @@ describe("questionnaires", () => {
         answers: { how: "great", pick: "a", score: 10 },
         is_complete: true,
         sdk_name: "pubky-pulse-web",
-        sdk_version: "0.1.0",
+        sdk_version: SDK_VERSION,
         environment: "web",
         is_dev: true,
         session_id: "11111111-1111-4111-8111-111111111111",

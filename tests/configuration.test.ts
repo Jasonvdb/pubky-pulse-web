@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { defaultIsDev, validateConfiguration } from "../src/configuration";
+import { DEFAULT_ENDPOINT, defaultIsDev, validateConfiguration } from "../src/configuration";
 import { resetTestEnvironment, testLocation } from "./setup";
 
 const base = {
@@ -8,15 +8,52 @@ const base = {
   bundleId: "com.example.web",
 };
 
+// The fallback tests need a config with no `endpoint` key at all, not a base
+// whose endpoint every other test relies on.
+const { endpoint: _configuredEndpoint, ...baseWithoutEndpoint } = base;
+
 describe("validateConfiguration", () => {
   beforeEach(() => {
     resetTestEnvironment();
   });
 
-  it("rejects a missing endpoint", () => {
+  // An explicitly supplied empty value is almost always an environment
+  // variable that failed to load; falling back to the hosted host there would
+  // quietly send a self-hoster's data to Pubky.
+  it("rejects an explicitly empty endpoint", () => {
     expect(() => validateConfiguration({ ...base, endpoint: "" })).toThrow(
       "Pubky Pulse: endpoint is required",
     );
+    expect(() => validateConfiguration({ ...base, endpoint: null as unknown as string })).toThrow(
+      "Pubky Pulse: endpoint is required",
+    );
+    expect(() => validateConfiguration({ ...base, endpoint: 1 as unknown as string })).toThrow(
+      "Pubky Pulse: endpoint is required",
+    );
+    // Whitespace only is non-empty, so it reaches the URL parse as before.
+    expect(() => validateConfiguration({ ...base, endpoint: "   " })).toThrow(
+      /invalid endpoint URL/,
+    );
+  });
+
+  it("falls back to the hosted ingest host when endpoint is omitted", () => {
+    expect(validateConfiguration(baseWithoutEndpoint).endpoint).toBe(
+      "https://ingest.pubkypulse.com",
+    );
+  });
+
+  it("falls back to the hosted ingest host for an explicit undefined endpoint", () => {
+    expect(validateConfiguration({ ...base, endpoint: undefined }).endpoint).toBe(
+      "https://ingest.pubkypulse.com",
+    );
+  });
+
+  it("prefers a supplied endpoint over the hosted default", () => {
+    expect(validateConfiguration(base).endpoint).toBe("https://pulse.example.com");
+  });
+
+  it("exposes the hosted ingest host as DEFAULT_ENDPOINT", () => {
+    expect(DEFAULT_ENDPOINT).toBe("https://ingest.pubkypulse.com");
   });
 
   it("rejects an unparsable endpoint", () => {

@@ -30,8 +30,13 @@ export interface PulseLogOptions {
 }
 
 export interface PulseConfiguration {
-  /** Pubky Pulse server endpoint URL. A trailing slash is stripped. */
-  endpoint: string;
+  /**
+   * Pubky Pulse server endpoint URL. A trailing slash is stripped. Optional:
+   * omitting it uses Pubky's hosted ingest host,
+   * `https://ingest.pubkypulse.com`. Self-hosters MUST set it — the fallback
+   * is silent, so nothing warns when traffic goes to Pubky instead.
+   */
+  endpoint?: string;
   /** Client API key. Public and write-only; must start with `pulse_client_`. */
   apiKey: string;
   /** Bundle id of the Pulse app that owns these events. */
