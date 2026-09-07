@@ -1,6 +1,6 @@
 {
   "name": "@synonymdev/pubky-pulse-web",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pubky Pulse browser SDK",
   "type": "module",
   "main": "./dist/index.cjs",
