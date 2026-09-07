@@ -38,6 +38,7 @@ import {
   type PulseLogOptions,
 } from "./types";
 
+export { DEFAULT_ENDPOINT } from "./configuration";
 export { PulseOperation } from "./operation";
 export {
   collected,
