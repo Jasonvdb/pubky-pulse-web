@@ -163,8 +163,13 @@ jobs:
           git add package.json package-lock.json
           git commit -m "chore: release ${{ steps.ver.outputs.next }} [skip ci]"
           git tag "${{ steps.ver.outputs.next }}"
-          git push origin main
-          git push origin "${{ steps.ver.outputs.next }}"
+          # --atomic is load-bearing: the branch and the tag move together or
+          # not at all. The rerun guard above keys on the tag existing, so a
+          # push that landed the bump commit on main without the tag would make
+          # that guard lie — the rerun would not skip, would build a second bump
+          # commit on the original SHA, and would die non-fast-forward with the
+          # release stranded. Do not split these back into two pushes.
+          git push --atomic origin main "${{ steps.ver.outputs.next }}"
 
       - name: Create GitHub release
         env:
