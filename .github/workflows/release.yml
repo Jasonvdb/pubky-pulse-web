@@ -1,0 +1,278 @@
+name: Auto-tag release
+
+# Triggered by pushes to main. paths-ignore skips examples/docs/gitignore-only
+# pushes — note this also skips pushes that change zero paths (empty commits).
+# The bot's bump commit uses [skip ci] so this workflow doesn't loop on itself.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'examples/**'
+      - '**.md'
+      - '.gitignore'
+
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  wait-for-tests:
+    name: Wait for Test workflow
+    runs-on: ubuntu-latest
+    steps:
+      # "Unit tests" is the display name of the job in test.yml. The two must
+      # stay in step: a regexp that matches nothing waits until the job times out.
+      - name: Wait for unit tests
+        uses: lewagon/wait-on-check-action@v1.3.4
+        with:
+          ref: ${{ github.sha }}
+          check-regexp: "Unit tests"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-interval: 20
+          allowed-conclusions: success
+
+  tag-and-publish:
+    name: Bump, tag, publish
+    needs: wait-for-tests
+    runs-on: ubuntu-latest
+    permissions:
+      # The job pushes the release commit and the tag back to main.
+      contents: write
+      # Lets the runner mint the short-lived OIDC token that npm trusted
+      # publishing exchanges for publish rights, once per run. There is no npm
+      # token anywhere in this workflow: authorization lives in the package's
+      # Trusted Publisher settings on npmjs.com (user `Jasonvdb`, repository
+      # `pubky-pulse-web`, workflow file `release.yml`), not in a repository
+      # secret. Renaming this file breaks publishing until that npm setting is
+      # updated to match the new filename.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Node 24 ships npm 11.12.1. Trusted publishing needs npm >= 11.5.1 and
+      # node >= 22.14.0, so this cannot go back down to 20 to match test.yml —
+      # node 20 bundles npm 10.x, which cannot publish this way at all. test.yml
+      # staying on 20 is deliberate: 20 is the package's supported floor.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Compute next version
+        id: ver
+        run: |
+          # package.json is the source of truth for the current version: every
+          # release commit writes the released version back into it, so it is
+          # never behind the newest tag on main.
+          pkg=$(node -p "require('./package.json').version")
+          current="$pkg"
+          IFS='.' read -r MAJ MIN PAT <<< "$current"
+
+          # Pull requests land on main as GitHub merge commits, whose subject is
+          # always "Merge pull request #N from owner/branch" — the conventional
+          # commit title lives in the body. Reading only %s would therefore make
+          # every merge a patch bump, including a breaking "refactor!:" one, so
+          # for a merge commit the effective subject is the first non-empty body
+          # line. Squash merges and direct commits already carry the prefix in
+          # the subject and keep using it. Do not simplify this back to %s.
+          subject=$(git log -1 --pretty=%s ${{ github.sha }})
+          body=$(git log -1 --pretty=%b ${{ github.sha }})
+          full=$(git log -1 --pretty=%B ${{ github.sha }})
+
+          msg="$subject"
+          if [[ "$subject" == "Merge pull request #"* || "$subject" == "Merge branch "* ]]; then
+            body_line=$(printf '%s\n' "$body" | grep -m1 -v '^[[:space:]]*$' || true)
+            if [[ -n "$body_line" ]]; then
+              msg="$body_line"
+            fi
+          fi
+
+          # feat!:/fix!:/BREAKING CHANGE → major; feat:/feat(...) → minor; else patch.
+          # BREAKING CHANGE is matched against the full commit message because
+          # Conventional Commits puts it in a footer, not in the subject.
+          # Pre-1.0 semver convention: while MAJ is 0 the API is unstable, so a
+          # breaking marker bumps minor instead of jumping straight to 1.0.0.
+          # The first major release happens manually (tag v1.0.0 by hand) — this
+          # workflow only takes over once the project is past 0.x.
+          if [[ "$msg" == *"!:"* || "$full" == *"BREAKING CHANGE"* ]]; then
+            if [[ "$MAJ" == "0" ]]; then
+              MIN=$((MIN+1)); PAT=0
+            else
+              MAJ=$((MAJ+1)); MIN=0; PAT=0
+            fi
+          elif [[ "$msg" == feat:* || "$msg" == feat\(* ]]; then
+            MIN=$((MIN+1)); PAT=0
+          else
+            PAT=$((PAT+1))
+          fi
+
+          version="${MAJ}.${MIN}.${PAT}"
+          # Never tag a version that is not strictly above package.json.
+          if [[ "$version" == "$pkg" ]] || \
+             [[ "$(printf '%s\n%s\n' "$pkg" "$version" | sort -V | tail -n1)" != "$version" ]]; then
+            echo "Computed version $version is not above package.json version $pkg" >&2
+            exit 1
+          fi
+          next="v${version}"
+
+          # Rerun safety: if a previous run pushed main but then failed (release
+          # creation or npm publish), main is ahead of the event SHA and the tag
+          # is already there. A rerun checks out the same SHA and computes the
+          # same version, so the tag is the signal that this release already
+          # happened — locally (the checkout fetches tags) or on the remote.
+          #
+          # The tag EXISTING is not enough on its own. Any tag of that name
+          # matches: one left over from earlier history, restored from a backup,
+          # or created by hand. On such a tag the workflow wedges silently and
+          # permanently: "Commit, tag, push" is skipped so the bump never lands
+          # on main, main's package.json stays at the old version, the next push
+          # recomputes the same version, finds the same tag and skips again —
+          # while the publish step's duplicate-version branch reports success,
+          # so no run ever goes red. Versions simply stop advancing and nothing
+          # says so.
+          #
+          # So only count the tag when it is THIS release's tag: the commit it
+          # points at must carry the computed version in its package.json, which
+          # is what the bump commit a genuine rerun looks at does. Any unrelated
+          # tag leaves the guard false, and the atomic push below then fails
+          # loudly because the tag already exists — a visible error a human can
+          # act on. Do not simplify this back to bare tag existence.
+          already_released=false
+          tag_ref=""
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            tag_ref="refs/tags/$next"
+          elif [[ -n "$(git ls-remote --tags origin "refs/tags/$next")" ]]; then
+            # Created after this job's checkout: fetch it so it can be inspected
+            # the same way as a tag that was already local.
+            git fetch --no-tags origin "refs/tags/$next:refs/tags/$next"
+            tag_ref="refs/tags/$next"
+          fi
+
+          if [[ -n "$tag_ref" ]]; then
+            # A tagged commit with no package.json, or an unparseable one, reads
+            # as empty here rather than failing the step.
+            tagged_pkg=$(git show "$tag_ref^{commit}:package.json" 2>/dev/null || true)
+            tagged_version=$(TAGGED_PKG="$tagged_pkg" node -p \
+              "(() => { try { return JSON.parse(process.env.TAGGED_PKG).version || '' } catch { return '' } })()")
+            if [[ "$tagged_version" == "$version" ]]; then
+              already_released=true
+            else
+              echo "::warning::Tag $next already exists but the package.json at that tag says version '${tagged_version:-<none>}', not $version, so it is not this release. Not skipping the release steps; the tag push will fail loudly if that tag is in the way."
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "already_released=$already_released" >> "$GITHUB_OUTPUT"
+          echo "Next version: $next (from '$msg'), already released: $already_released"
+
+      - name: Bump package.json
+        run: npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      # `npm run build` here is `tsc --noEmit && tsup`, so this both type-checks
+      # the bumped tree and proves dist/ can be produced before anything is
+      # tagged or pushed.
+      - name: Install and build
+        run: |
+          npm ci
+          npm run build
+
+      # Skipped when the tag already exists, which is what a rerun of a
+      # partially-failed release looks like: main already carries the bump
+      # commit, so committing and pushing again would fail non-fast-forward and
+      # strand the release. The steps below have their own skip-if-exists
+      # guards, so a rerun completes only the parts that are missing. Note that
+      # "Bump package.json" above is deliberately NOT guarded — it is what puts
+      # the released version into package.json for the publish step.
+      - name: Commit, tag, push
+        if: ${{ steps.ver.outputs.already_released != 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore: release ${{ steps.ver.outputs.next }} [skip ci]"
+          git tag "${{ steps.ver.outputs.next }}"
+          # --atomic is load-bearing: the branch and the tag move together or
+          # not at all. The rerun guard above keys on the tag existing, so a
+          # push that landed the bump commit on main without the tag would make
+          # that guard lie — the rerun would not skip, would build a second bump
+          # commit on the original SHA, and would die non-fast-forward with the
+          # release stranded. Do not split these back into two pushes.
+          git push --atomic origin main "${{ steps.ver.outputs.next }}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          next="${{ steps.ver.outputs.next }}"
+          for i in 1 2 3; do
+            if gh release view "$next" >/dev/null 2>&1; then
+              echo "Release $next already exists, skipping"
+              exit 0
+            fi
+            if gh release create "$next" --title "$next" --generate-notes; then
+              exit 0
+            fi
+            echo "gh release create attempt $i failed; sleeping 15s..."
+            sleep 15
+          done
+          echo "Failed to create release after 3 attempts"
+          exit 1
+
+      # An npm older than 11.5.1 does not speak trusted publishing and fails the
+      # publish below with an opaque authentication error instead of a version
+      # one. Check it here so the log names the real cause.
+      - name: Check npm supports trusted publishing
+        run: |
+          required="11.5.1"
+          have="$(npm -v)"
+          if [[ "$(printf '%s\n%s\n' "$required" "$have" | sort -V | head -n1)" != "$required" ]]; then
+            echo "npm $have is too old for npm trusted publishing: need >= $required (node >= 22.14.0). Raise node-version in this workflow." >&2
+            exit 1
+          fi
+          echo "npm $have is new enough for npm trusted publishing"
+
+      # No token is passed: npm mints a short-lived credential from the job's
+      # OIDC identity, which the package's Trusted Publisher settings on
+      # npmjs.com authorize. Nothing here reads a repository secret.
+      #
+      # The `npm view` fast path is a cheap skip, but it reads npm's CDN-cached
+      # registry front end, which was observed on 2026-09-07 returning 404 for
+      # 2-5 minutes after a fully successful publish. So on a retry it can
+      # wrongly report the version as missing and we republish. The publish
+      # itself is the authority: npm answers a duplicate with E403 and
+      # "You cannot publish over the previously published versions", which means
+      # the version we wanted is on the registry — success, not a failure to
+      # retry. Match that message rather than the bare E403 code, so a genuine
+      # 403 — the package's trusted publisher not configured, or configured for
+      # a different repository or workflow file — still fails the workflow
+      # loudly.
+      - name: Publish to npm
+        run: |
+          version="${{ steps.ver.outputs.version }}"
+          pkg="@synonymdev/pubky-pulse-web"
+          for i in 1 2 3; do
+            if npm view "$pkg@$version" version >/dev/null 2>&1; then
+              echo "$pkg@$version already on registry, skipping"
+              exit 0
+            fi
+            if out=$(npm publish --access public 2>&1); then
+              echo "$out"
+              exit 0
+            fi
+            echo "$out"
+            if grep -qiE 'cannot publish over|previously published version' <<< "$out"; then
+              echo "$pkg@$version is already on the registry, treating as published"
+              exit 0
+            fi
+            echo "npm publish attempt $i failed; sleeping 15s..."
+            sleep 15
+          done
+          echo "Failed to publish after 3 attempts"
+          exit 1
