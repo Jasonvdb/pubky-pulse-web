@@ -119,21 +119,53 @@ jobs:
           fi
           next="v${version}"
 
-          # Rerun safety: if a previous run pushed main but then failed (tag
-          # push, release creation or npm publish), main is ahead of the event
-          # SHA while the tag may or may not exist. A rerun checks out the same
-          # SHA and computes the same version, so record whether the tag is
-          # already there — locally (the checkout fetches tags) or on the remote.
+          # Rerun safety: if a previous run pushed main but then failed (release
+          # creation or npm publish), main is ahead of the event SHA and the tag
+          # is already there. A rerun checks out the same SHA and computes the
+          # same version, so detect that and skip the commit/tag/push.
+          #
+          # Tag existence ALONE is not evidence of that. Any tag named "$next" —
+          # left over from earlier history, restored from a backup, or created
+          # by hand — satisfies a bare existence check, and the workflow then
+          # wedges silently and permanently: "Commit, tag, push" is skipped, so
+          # the bump is never persisted to main; main's package.json stays at
+          # the old version; the next push recomputes the same version, finds
+          # the same tag and skips again; and the publish step's
+          # duplicate-version branch reports success, so no run ever goes red.
+          # Versions stop advancing forever and nothing says so.
+          #
+          # So the tag only counts as a rerun when it belongs to THIS release:
+          # on a genuine rerun it points at the bump commit, whose package.json
+          # is exactly $version. An unrelated tag fails that test, the guard
+          # stays false, and the atomic push below then fails loudly because the
+          # tag already exists — a visible error a human can act on. Do not
+          # simplify this back to a bare existence check.
           already_released=false
-          if git rev-parse -q --verify "refs/tags/$next" >/dev/null \
-             || [[ -n "$(git ls-remote --tags origin "refs/tags/$next")" ]]; then
-            already_released=true
+          # Remote tags are already local: the checkout uses fetch-depth: 0 and
+          # fetch-tags: true. The ls-remote fallback catches a tag created after
+          # checkout, which must be fetched before its commit can be inspected.
+          if ! git rev-parse -q --verify "refs/tags/$next" >/dev/null \
+             && [[ -n "$(git ls-remote --tags origin "refs/tags/$next")" ]]; then
+            git fetch --no-tags origin "refs/tags/$next:refs/tags/$next" || true
+          fi
+          if git rev-parse -q --verify "refs/tags/$next" >/dev/null; then
+            # Empty when the tagged commit has no package.json or it does not
+            # parse — treated as "not this release" rather than crashing here.
+            tagged_version=$(git show "$next^{commit}:package.json" 2>/dev/null \
+              | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version" 2>/dev/null || true)
+            if [[ "$tagged_version" == "$version" ]]; then
+              already_released=true
+            elif [[ -z "$tagged_version" ]]; then
+              echo "WARNING: tag $next exists but no readable package.json version at that commit (expected $version); treating it as an unrelated tag, not a rerun of this release" >&2
+            else
+              echo "WARNING: tag $next exists but its package.json version is $tagged_version, not $version; treating it as an unrelated tag, not a rerun of this release" >&2
+            fi
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "next=$next" >> "$GITHUB_OUTPUT"
           echo "already_released=$already_released" >> "$GITHUB_OUTPUT"
-          echo "Next version: $next (from '$msg'), tag already exists: $already_released"
+          echo "Next version: $next (from '$msg'), already released: $already_released"
 
       - name: Bump package.json
         run: npm version "${{ steps.ver.outputs.version }}" --no-git-tag-version --allow-same-version
