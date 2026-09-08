@@ -151,6 +151,18 @@ describe("validateConfiguration", () => {
     });
     expect(config.supportedLanguages).toBeUndefined();
     expect(config.screenNameForPath).toBeUndefined();
+    expect(config.beforeSend).toBeUndefined();
+  });
+
+  it("preserves beforeSend without invoking it during validation", () => {
+    const beforeSend = () => { throw new Error("capture only"); };
+    expect(validateConfiguration({ ...base, beforeSend }).beforeSend).toBe(beforeSend);
+  });
+
+  it.each([null, false, 42, "filter", {}, []])("rejects a non-function beforeSend: %j", (value) => {
+    expect(() => validateConfiguration({ ...base, beforeSend: value as never })).toThrow(
+      "Pubky Pulse: beforeSend must be a function",
+    );
   });
 });
 

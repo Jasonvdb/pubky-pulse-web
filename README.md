@@ -300,6 +300,40 @@ try {
 and unhandled promise rejections are captured automatically while `captureUnhandled` is on, tagged
 with `_unhandled`, and re-thrown as usual — the SDK never swallows an error.
 
+## Filtering and sanitizing events
+
+Configure `beforeSend` to apply your application's capture policy to manual logs and automatic
+errors, network requests, screens, sessions, and metrics in one place:
+
+```ts
+Pulse.configure({
+  apiKey: "pulse_client_…",
+  bundleId: "com.example.web",
+  beforeSend(event) {
+    if (event.message === "ResizeObserver loop limit exceeded") return null;
+    if (event.custom_attributes?._http_url) {
+      event.custom_attributes._http_url = new URL(event.custom_attributes._http_url).origin;
+    }
+    return event;
+  },
+});
+```
+
+The synchronous callback receives the fully enriched `LogEvent`. Return the mutated event or a
+replacement with valid required fields; return `null` to drop it and its attachment uploads.
+Only the returned event reaches the console, memory buffer, offline storage, and transport.
+Message and attribute length limits still apply. Hook exceptions, invalid results, and accidental
+async callbacks drop silently; recursive Pulse logging from inside the callback is ignored.
+Without the hook, capture behaves as before.
+
+The hook runs once when an event is captured, including lifecycle events emitted by `configure()`.
+Retries and previously queued events are not processed again, so installing a new hook does not
+sanitize an old offline queue. Use the returned event's IDs consistently if changing them: attachment
+reservations use its `client_event_id` and `user_id`. Attachment contents and filenames, identity and
+user-property requests, feedback bodies, and questionnaire answers do not pass through this hook.
+The feedback audit log does. Redaction rules for messages and attributes belong to the application;
+the example above only demonstrates error filtering and URL reduction.
+
 ## Metrics and operations
 
 `startOperation` measures something with a beginning and an end. It emits `metric:<slug>:start` now
@@ -558,6 +592,7 @@ was both parked and sent is counted once.
 | `captureUnhandled` | `boolean` | `true` | Capture uncaught errors and unhandled rejections. |
 | `trackPageViews` | `boolean` | `true` | Emit screen events for History API navigations. |
 | `screenNameForPath` | `(pathname: string) => string` | Raw pathname | Map automatic screen names; a thrown error or blank/non-string result ends the previous screen and clears default attribution. |
+| `beforeSend` | `(event: LogEvent) => LogEvent \| null` | Not set | Transform or drop enriched events before output, buffering, and attachment scheduling. Synchronous only; failures drop silently. |
 | `networkTracking` | `boolean` | `false` | Emit an event per `fetch` call. |
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |
