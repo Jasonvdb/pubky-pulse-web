@@ -128,6 +128,69 @@ describe("Pulse", () => {
     expect(beforeSend).toHaveBeenCalledTimes(sentEvents().length);
   });
 
+  it.each(["manual", "uncaught", "rejection"])("sanitizes complete %s error strings before length limits", async (source) => {
+    const identifier = "ufibwbmed6jeq9k4p583go95wofakh9fwpp4k734trq79pd9u1uy";
+    const input = (limit: number) => " ".repeat(limit - 20) + identifier;
+    const redact = (value: string) => value.replace(/\b[ybndrfg8ejkmcpqxot1uwisza345h769]{52}\b/gi, "[redacted]");
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const observed: LogEvent[] = [];
+    const beforeSend = vi.fn((event: LogEvent) => {
+      if (event.level === "error") {
+        observed.push({ ...event, custom_attributes: { ...event.custom_attributes } });
+      }
+      event.message = redact(event.message);
+      for (const key of Object.keys(event.custom_attributes ?? {})) {
+        event.custom_attributes![key] = redact(event.custom_attributes![key]!);
+      }
+      return event;
+    });
+    Pulse.configure({ ...config, beforeSend, consoleLogging: true });
+    const error = Object.assign(
+      new AggregateError([input(200)], input(2000), { cause: input(200) }),
+      { name: input(200), code: input(200), stack: input(16000) },
+    );
+    if (source === "manual") Pulse.error(error, undefined, { detail: input(200) });
+    else testWindow.dispatchEvent(Object.assign(new Event(source === "uncaught" ? "error" : "unhandledrejection"),
+      source === "uncaught" ? { error } : { reason: error }));
+
+    expect(observed).toHaveLength(1);
+    expect(observed[0]?.message).toBe(input(2000));
+    for (const key of ["_error_type", "_error_code", "_error_cause_1_message", "_error_aggregate_first_message"]) {
+      expect(observed[0]?.custom_attributes?.[key]).toBe(input(200));
+    }
+    expect(observed[0]?.custom_attributes?._error_stack).toBe(input(16000));
+    if (source === "manual") expect(observed[0]?.custom_attributes?.detail).toBe(input(200));
+    testNavigator.onLine = false;
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const parked = testLocalStorage.keys().filter((key) => key.includes("offline_queue"))
+      .map((key) => testLocalStorage.getItem(key)).join("");
+    expect(parked).toContain("[redacted]");
+    expect(parked).not.toContain(identifier.slice(0, 20));
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain(identifier.slice(0, 20));
+    const calls = beforeSend.mock.calls.length;
+    testNavigator.onLine = true;
+    await Pulse.flush();
+    expect(beforeSend).toHaveBeenCalledTimes(calls);
+    expect(appEvents()).toHaveLength(1);
+    expect(appEvents()[0]?.message).toBe(redact(input(2000)));
+    expect(JSON.stringify(sentEvents())).not.toContain(identifier.slice(0, 20));
+  });
+
+  it.each([false, true])("bounds captured error strings with an identity hook: %s", async (hook) => {
+    Pulse.configure({ ...config, beforeSend: hook ? (event) => event : undefined });
+    const error = Object.assign(new AggregateError([new Error("x".repeat(300))], "x".repeat(2100), {
+      cause: new Error("x".repeat(300)),
+    }), { code: "x".repeat(300), stack: "x".repeat(17000) });
+    Pulse.error(error, undefined, { detail: "x".repeat(300) });
+    await Pulse.flush();
+    const event = appEvents()[0];
+    expect(event?.message).toHaveLength(2000);
+    for (const key of ["detail", "_error_code", "_error_cause_1_message", "_error_aggregate_first_message"]) {
+      expect(event?.custom_attributes?.[key]).toHaveLength(200);
+    }
+    expect(event?.custom_attributes?._error_stack).toHaveLength(16000);
+  });
+
   it("uses transformed severity and detaches buffered data from callback references", async () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     let retained: LogEvent | undefined;
@@ -196,17 +259,23 @@ describe("Pulse", () => {
   });
 
   it("transforms automatic network URLs without changing the request or response", async () => {
+    const url = `https://api.example.com/post/${"x".repeat(200)}?token=secret`;
+    let observedUrl: string | undefined;
     Pulse.configure({
       ...config,
       networkTracking: true,
       beforeSend(event) {
-        if (event.custom_attributes?._http_url) event.custom_attributes._http_url = "/post/:id";
+        if (event.custom_attributes?._http_url) {
+          observedUrl = event.custom_attributes._http_url;
+          event.custom_attributes._http_url = "/post/:id";
+        }
         return event;
       },
     });
-    const response = await fetch("https://api.example.com/post/private?token=secret");
+    const response = await fetch(url);
     expect(response.status).toBe(200);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.example.com/post/private?token=secret");
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(url);
+    expect(observedUrl).toBe(url.split("?")[0]);
     await Pulse.flush();
     expect(sentEvents().find((event) => event.message === "sdk:network_request")
       ?.custom_attributes?._http_url).toBe("/post/:id");

@@ -159,6 +159,19 @@ describe("buildEvent", () => {
     expect(event.message).toHaveLength(MAX_EVENT_MESSAGE_LENGTH);
   });
 
+  it("preserves full strings in detached attributes when a capture hook is configured", () => {
+    const ctx = context();
+    ctx.config.beforeSend = (event) => event;
+    const attributes = { detail: "x".repeat(300), count: 42, ["__proto__"]: "own" };
+    const message = "x".repeat(2100);
+    const event = buildEvent(ctx, "info", message, attributes);
+    expect(event.message).toBe(message);
+    expect(event.custom_attributes).toEqual({ ...attributes, count: "42" });
+    expect(Object.getPrototypeOf(event.custom_attributes)).toBeNull();
+    attributes.detail = "later";
+    expect(event.custom_attributes?.detail).toHaveLength(300);
+  });
+
   it("prefers an explicit screen name over the context default", () => {
     const ctx = context({ screenName: "Home" });
     expect(buildEvent(ctx, "info", "tap").screen_name).toBe("Home");
