@@ -66,6 +66,13 @@ export interface PulseConfiguration {
    * screen is entered, without falling back to the raw pathname.
    */
   screenNameForPath?: (pathname: string) => string;
+  /**
+   * Transform a fully enriched event before console output, buffering, or
+   * attachment scheduling. Return the event (with valid required fields) or
+   * null to drop it. Synchronous only: throws and invalid results drop silently.
+   * Does not process previously queued events or attachment contents.
+   */
+  beforeSend?: (event: LogEvent) => LogEvent | null;
   /** Emit `sdk:network_request` events for `fetch` calls. Default: false. */
   networkTracking?: boolean;
   /**

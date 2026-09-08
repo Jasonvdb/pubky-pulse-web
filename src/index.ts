@@ -2,7 +2,7 @@ import { AttachmentUploader } from "./attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "./configuration";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
-import { buildEvent, type EventContext } from "./event-builder";
+import { buildEvent, MAX_EVENT_MESSAGE_LENGTH, normalizeAttributes, type EventContext } from "./event-builder";
 import { IdentityManager } from "./identity";
 import { installLifecycle } from "./lifecycle";
 import { metricMessage, stepMessage } from "./metrics";
@@ -30,6 +30,7 @@ import {
   SDK_NAME,
   SDK_VERSION,
   type FeedbackSubmission,
+  type LogEvent,
   type PulseAttributes,
   type PulseConfiguration,
   type PulseFeedbackOptions,
@@ -89,6 +90,7 @@ let identity: IdentityManager | null = null;
 let unconfiguredWarningShown = false;
 let pageTracker: PageTracker | null = null;
 let attachments: AttachmentUploader | null = null;
+let processingEvent = false;
 /** Uninstallers for everything `configure()` hooked into the page. */
 const uninstallers: Array<() => void> = [];
 
@@ -132,6 +134,68 @@ function printToConsole(
   }
 }
 
+/** A hook owns its result; keep a detached, valid wire snapshot for delivery. */
+function processEvent(event: LogEvent): LogEvent | null {
+  if (!config?.beforeSend) return event;
+  if (processingEvent) return null;
+  processingEvent = true;
+  try {
+    // The builder shares this array with device metadata, not with the hook.
+    if (event.supported_languages) event.supported_languages = [...event.supported_languages];
+    const result = config.beforeSend(event);
+    if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+    if ("then" in result) {
+      // Accidental async callbacks must not create recursive rejection events.
+      void Promise.resolve(result).catch(() => undefined);
+      return null;
+    }
+    for (const key of ["client_event_id", "session_id", "message", "sdk_name", "sdk_version", "timestamp"] as const) {
+      if (typeof result[key] !== "string") return null;
+    }
+    // One malformed required field would reject the entire ingest batch.
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuid.test(result.client_event_id) || !uuid.test(result.session_id) ||
+        !result.message.length || !Number.isFinite(Date.parse(result.timestamp))) return null;
+    if (!["info", "debug", "warn", "error"].includes(result.level) ||
+        result.environment !== ENVIRONMENT || typeof result.is_dev !== "boolean") return null;
+
+    const snapshot: LogEvent = {
+      client_event_id: result.client_event_id,
+      session_id: result.session_id,
+      message: result.message.slice(0, MAX_EVENT_MESSAGE_LENGTH),
+      level: result.level,
+      environment: result.environment,
+      sdk_name: result.sdk_name,
+      sdk_version: result.sdk_version,
+      is_dev: result.is_dev,
+      timestamp: result.timestamp,
+    };
+    for (const key of ["user_id", "source_module", "screen_name", "os_version", "app_version", "device_model", "locale", "preferred_language"] as const) {
+      const value = result[key];
+      if (value === undefined) continue;
+      if (typeof value !== "string") return null;
+      snapshot[key] = value;
+    }
+    if (result.custom_attributes !== undefined) {
+      const attributes = result.custom_attributes;
+      if (!attributes || typeof attributes !== "object" || Array.isArray(attributes) ||
+          Object.values(attributes).some((value) => typeof value !== "string")) return null;
+      snapshot.custom_attributes = normalizeAttributes(attributes);
+    }
+    if (result.supported_languages !== undefined) {
+      if (!Array.isArray(result.supported_languages) ||
+          result.supported_languages.some((value) => typeof value !== "string")) return null;
+      snapshot.supported_languages = [...result.supported_languages];
+    }
+    return snapshot;
+  } catch {
+    // Neither the original event nor the hook's error may escape to output.
+    return null;
+  } finally {
+    processingEvent = false;
+  }
+}
+
 /**
  * Build and buffer one event. `sessionIdOverride` exists for `sdk:session_ended`,
  * which belongs to the session that just expired rather than the new one.
@@ -155,11 +219,12 @@ function recordEvent(
   };
 
   try {
-    const event = buildEvent(ctx, level, message, attributes, options?.screenName);
-    printToConsole(level, event.message, event.custom_attributes);
+    const event = processEvent(buildEvent(ctx, level, message, attributes, options?.screenName));
+    if (!event) return;
+    printToConsole(event.level, event.message, event.custom_attributes);
     transport.enqueue(event);
     if (options?.attachments?.length) {
-      attachments?.enqueue(event.client_event_id, identity.currentId, options.attachments);
+      attachments?.enqueue(event.client_event_id, event.user_id, options.attachments);
     }
   } catch (err) {
     debugLog("failed to record event", err);
@@ -172,6 +237,7 @@ function log(
   attributes?: PulseAttributes,
   options?: PulseLogOptions,
 ): void {
+  if (processingEvent) return;
   if (!config || !session || !transport) {
     if (!unconfiguredWarningShown) {
       unconfiguredWarningShown = true;

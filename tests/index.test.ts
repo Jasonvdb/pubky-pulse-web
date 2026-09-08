@@ -9,6 +9,7 @@ import {
   testDocument,
   testLocalStorage,
   testLocation,
+  testNavigator,
   testWindow,
 } from "./setup";
 
@@ -86,6 +87,154 @@ describe("Pulse", () => {
     expect(events[0]?.custom_attributes).toEqual({ plan: "pro" });
     expect(events[1]?.level).toBe("warn");
     expect(fetchMock.mock.calls[0]![0]).toBe("https://pulse.example.com/v1/ingest");
+  });
+
+  it("sanitizes enriched manual and automatic errors before console and delivery", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const beforeSend = vi.fn((event: LogEvent) => {
+      expect(event.session_id).toBe(Pulse.sessionId);
+      expect(event.user_id).toBe(Pulse.currentUserId);
+      event.message = event.message.replaceAll("private@example.com", "[redacted]");
+      for (const key of Object.keys(event.custom_attributes ?? {})) {
+        event.custom_attributes![key] = event.custom_attributes![key]!.replaceAll(
+          "private@example.com", "[redacted]",
+        );
+      }
+      return event;
+    });
+    Pulse.configure({ ...config, beforeSend, consoleLogging: true });
+    const error = new Error("private@example.com", { cause: new Error("private@example.com") });
+    Pulse.error(error);
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error }));
+    testWindow.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason: error }));
+    await Pulse.flush();
+    expect(appEvents()).toHaveLength(3);
+    expect(JSON.stringify(sentEvents())).not.toContain("private@example.com");
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("private@example.com");
+    expect(appEvents()[1]?.custom_attributes?._error_stack).toContain("[redacted]");
+    expect(beforeSend).toHaveBeenCalledTimes(sentEvents().length);
+  });
+
+  it("uses transformed severity and detaches buffered data from callback references", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    let retained: LogEvent | undefined;
+    Pulse.configure({
+      ...config,
+      consoleLogging: true,
+      supportedLanguages: ["en"],
+      beforeSend(event) {
+        if (event.message === "original") {
+          event.message = "clean";
+          event.level = "warn";
+          event.custom_attributes = { detail: "safe" };
+          retained = event;
+        }
+        return event;
+      },
+    });
+    Pulse.info("original");
+    expect(console.warn).toHaveBeenCalledWith("[pulse] WARN  clean {detail=safe}");
+    retained!.message = "late-private";
+    retained!.custom_attributes!.detail = "late-private";
+    retained!.supported_languages![0] = "late-private";
+    Pulse.info("next");
+    await Pulse.flush();
+    expect(JSON.stringify(sentEvents())).not.toContain("late-private");
+    expect(appEvents()[0]).toMatchObject({ message: "clean", level: "warn" });
+    expect(appEvents()[1]?.supported_languages).toEqual(["en"]);
+  });
+
+  it.each([
+    ["null", () => null],
+    ["throw", () => { throw new Error("private-hook-error"); }],
+    ["undefined", () => undefined],
+    ["invalid object", () => ({ message: "private" })],
+    ["wrong attributes", (event: LogEvent) => ({ ...event, custom_attributes: { bad: {} } })],
+    ["empty message", (event: LogEvent) => ({ ...event, message: "" })],
+    ["invalid timestamp", (event: LogEvent) => ({ ...event, timestamp: "invalid-date" })],
+    ["async", async () => { throw new Error("private-hook-error"); }],
+  ])("silently drops a %s hook result and allows later events", async (_label, invalid) => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    Pulse.configure({
+      ...config,
+      debug: true,
+      consoleLogging: true,
+      beforeSend: (event) => event.message === "private" ? invalid(event) as LogEvent | null : event,
+    });
+    expect(() => Pulse.info("private")).not.toThrow();
+    Pulse.info("healthy");
+    await Pulse.flush();
+    expect(appEvents().map((event) => event.message)).toEqual(["healthy"]);
+    expect(consoleError).not.toHaveBeenCalled();
+    expect(JSON.stringify(consoleLog.mock.calls)).not.toContain("private");
+  });
+
+  it("ignores recursive logging from the hook", async () => {
+    const beforeSend = vi.fn((event: LogEvent) => {
+      Pulse.error("recursive");
+      return event;
+    });
+    Pulse.configure({ ...config, beforeSend });
+    Pulse.info("healthy");
+    await Pulse.flush();
+    expect(appEvents().map((event) => event.message)).toEqual(["healthy"]);
+    expect(beforeSend).toHaveBeenCalledTimes(sentEvents().length);
+  });
+
+  it("transforms automatic network URLs without changing the request or response", async () => {
+    Pulse.configure({
+      ...config,
+      networkTracking: true,
+      beforeSend(event) {
+        if (event.custom_attributes?._http_url) event.custom_attributes._http_url = "/post/:id";
+        return event;
+      },
+    });
+    const response = await fetch("https://api.example.com/post/private?token=secret");
+    expect(response.status).toBe(200);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("https://api.example.com/post/private?token=secret");
+    await Pulse.flush();
+    expect(sentEvents().find((event) => event.message === "sdk:network_request")
+      ?.custom_attributes?._http_url).toBe("/post/:id");
+  });
+
+  it("persists and unloads only processed events, without processing retries again", async () => {
+    vi.useFakeTimers();
+    const beforeSend = vi.fn((event: LogEvent) => ({ ...event, message: "sanitized" }));
+    Pulse.configure({ ...config, beforeSend });
+    Pulse.info("private");
+    testNavigator.onLine = false;
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const parked = testLocalStorage.keys().filter((key) => key.includes("offline_queue"))
+      .map((key) => testLocalStorage.getItem(key)).join("");
+    expect(parked).toContain("sanitized");
+    expect(parked).not.toContain("private");
+    const calls = beforeSend.mock.calls.length;
+    testNavigator.onLine = true;
+    await Pulse.flush();
+    expect(beforeSend).toHaveBeenCalledTimes(calls);
+    Pulse.info("private");
+    vi.advanceTimersByTime(1001);
+    testWindow.dispatchEvent(new Event("pagehide"));
+    expect(JSON.stringify(sentEvents())).not.toContain("private");
+    expect(fetchMock.mock.calls.some((call) => (call[1] as RequestInit).keepalive)).toBe(true);
+  });
+
+  it("reapplies message and attribute caps to transformed events", async () => {
+    Pulse.configure({
+      ...config,
+      beforeSend: (event) => ({
+        ...event,
+        message: "x".repeat(2100),
+        custom_attributes: { detail: "x".repeat(300), _error_stack: "x".repeat(17000) },
+      }),
+    });
+    Pulse.info("original");
+    await Pulse.flush();
+    expect(sentEvents()[0]?.message).toHaveLength(2000);
+    expect(sentEvents()[0]?.custom_attributes?.detail).toHaveLength(200);
+    expect(sentEvents()[0]?.custom_attributes?._error_stack).toHaveLength(16000);
   });
 
   it("stamps a session id and an anonymous user id on every event", async () => {
@@ -923,4 +1072,61 @@ describe("Pulse feedback, questionnaires and attachments", () => {
       fetchMock.mock.calls.some((c) => (c[0] as string).startsWith("https://uploads.example.com/")),
     ).toBe(true);
   });
+
+  it("does not schedule attachments when beforeSend drops their event", async () => {
+    Pulse.configure({ ...config, beforeSend: () => null });
+    Pulse.error("expected", undefined, {
+      attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "private.log" }],
+    });
+    await Pulse.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses processed event and user identifiers when reserving attachments", async () => {
+    // UUIDs may use uppercase hex and a version other than the builder's v4.
+    const eventId = "1A680A20-A00B-701F-8121-46168056EF01";
+    Pulse.configure({
+      ...config,
+      beforeSend: (event) => ({ ...event, client_event_id: eventId, user_id: undefined }),
+    });
+    Pulse.error("handled", undefined, {
+      attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+    });
+    await Pulse.flush();
+    const reserve = fetchMock.mock.calls.find((call) =>
+      (call[0] as string).endsWith("/v1/ingest/attachment"),
+    )!;
+    const body = JSON.parse((reserve[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.client_event_id).toBe(eventId);
+    expect(body.user_id).toBeUndefined();
+    expect(appEvents()[0]?.user_id).toBeUndefined();
+  });
+
+  it.each(["client_event_id", "session_id"] as const)(
+    "drops a malformed transformed %s and its attachments without poisoning later events",
+    async (field) => {
+      Pulse.configure({
+        ...config,
+        beforeSend: (event) => event.message === "invalid"
+          ? { ...event, [field]: "redacted" }
+          : event,
+      });
+      Pulse.error("invalid", undefined, {
+        attachments: [{ data: new Uint8Array([1]), filename: "private.log" }],
+      });
+      Pulse.error("healthy", undefined, {
+        attachments: [{ data: new Uint8Array([2]), filename: "healthy.log" }],
+      });
+      await Pulse.flush();
+      expect(appEvents().map((event) => event.message)).toEqual(["healthy"]);
+      const reserves = fetchMock.mock.calls.filter((call) =>
+        (call[0] as string).endsWith("/v1/ingest/attachment"),
+      );
+      expect(reserves).toHaveLength(1);
+      expect(JSON.parse((reserves[0]![1] as RequestInit).body as string)).toMatchObject({
+        client_event_id: appEvents()[0]!.client_event_id,
+        original_filename: "healthy.log",
+      });
+    },
+  );
 });

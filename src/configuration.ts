@@ -22,6 +22,7 @@ export interface ValidatedConfig {
   captureUnhandled: boolean;
   trackPageViews: boolean;
   screenNameForPath?: (pathname: string) => string;
+  beforeSend?: PulseConfiguration["beforeSend"];
   networkTracking: boolean;
   propagateSessionTo: string[];
   flushIntervalMs: number;
@@ -102,6 +103,9 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
   if (config.screenNameForPath !== undefined && typeof config.screenNameForPath !== "function") {
     throw new Error("Pubky Pulse: screenNameForPath must be a function");
   }
+  if (config.beforeSend !== undefined && typeof config.beforeSend !== "function") {
+    throw new Error("Pubky Pulse: beforeSend must be a function");
+  }
 
   const flushThreshold = positiveInteger(config.flushThreshold, "flushThreshold", 20);
   const maxBufferSize = positiveInteger(config.maxBufferSize, "maxBufferSize", 10000);
@@ -121,6 +125,7 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     captureUnhandled: config.captureUnhandled ?? true,
     trackPageViews: config.trackPageViews ?? true,
     screenNameForPath: config.screenNameForPath,
+    beforeSend: config.beforeSend,
     networkTracking: config.networkTracking ?? false,
     propagateSessionTo: stringArray(config.propagateSessionTo, "propagateSessionTo") ?? [],
     flushIntervalMs: positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000),
