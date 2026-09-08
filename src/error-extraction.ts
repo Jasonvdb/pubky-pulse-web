@@ -1,20 +1,15 @@
 /**
  * Turn a value passed to `Pulse.error(value)` into the reserved `_error_*`
  * attributes the server uses for issue fingerprinting. `unknown` is the right
- * input type because JavaScript allows `throw <anything>`.
+ * input type because JavaScript allows `throw <anything>`. Keep complete strings
+ * for capture-time sanitization; the event pipeline applies wire limits afterward.
  */
-
-import { MAX_ATTRIBUTE_VALUE_LENGTH, MAX_ERROR_STACK_LENGTH } from "./event-builder";
 
 const MAX_CAUSE_DEPTH = 5;
 
 export interface ExtractionResult {
   message: string;
   attributes: Record<string, string>;
-}
-
-function clip(value: string, max = MAX_ATTRIBUTE_VALUE_LENGTH): string {
-  return value.length > max ? value.slice(0, max) : value;
 }
 
 function typeOf(error: Error): string {
@@ -31,11 +26,11 @@ function extractAggregateErrors(error: Error, attrs: Record<string, string>): vo
   attrs._error_aggregate_count = String(aggregate.errors.length);
   const first: unknown = aggregate.errors[0];
   if (first instanceof Error) {
-    attrs._error_aggregate_first_type = clip(typeOf(first));
-    attrs._error_aggregate_first_message = clip(first.message || String(first));
+    attrs._error_aggregate_first_type = typeOf(first);
+    attrs._error_aggregate_first_message = first.message || String(first);
   } else if (first !== undefined) {
-    attrs._error_aggregate_first_type = clip(first === null ? "null" : typeof first);
-    attrs._error_aggregate_first_message = clip(safeString(first));
+    attrs._error_aggregate_first_type = first === null ? "null" : typeof first;
+    attrs._error_aggregate_first_message = safeString(first);
   }
 }
 
@@ -50,12 +45,12 @@ function walkCauseChain(error: Error, attrs: Record<string, string>): void {
     seen.add(current);
 
     if (current instanceof Error) {
-      attrs[`_error_cause_${depth}_type`] = clip(typeOf(current));
-      attrs[`_error_cause_${depth}_message`] = clip(current.message || String(current));
+      attrs[`_error_cause_${depth}_type`] = typeOf(current);
+      attrs[`_error_cause_${depth}_message`] = current.message || String(current);
       current = (current as Error & { cause?: unknown }).cause;
     } else {
-      attrs[`_error_cause_${depth}_type`] = clip(typeof current);
-      attrs[`_error_cause_${depth}_message`] = clip(safeString(current));
+      attrs[`_error_cause_${depth}_type`] = typeof current;
+      attrs[`_error_cause_${depth}_message`] = safeString(current);
       break;
     }
     depth += 1;
@@ -88,11 +83,11 @@ export function extractErrorAttributes(error: unknown, userMessage?: string): Ex
   if (error instanceof Error) {
     attrs._error_type = typeOf(error);
     if (typeof error.stack === "string" && error.stack.length > 0) {
-      attrs._error_stack = clip(error.stack, MAX_ERROR_STACK_LENGTH);
+      attrs._error_stack = error.stack;
     }
     const code = (error as Error & { code?: unknown }).code;
     if (typeof code === "string" && code.length > 0) {
-      attrs._error_code = clip(code);
+      attrs._error_code = code;
     } else if (typeof code === "number") {
       attrs._error_code = String(code);
     }

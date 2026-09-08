@@ -70,6 +70,7 @@ export interface PulseConfiguration {
    * Transform a fully enriched event before console output, buffering, or
    * attachment scheduling. Return the event (with valid required fields) or
    * null to drop it. Synchronous only: throws and invalid results drop silently.
+   * Message and attribute strings are complete; length limits apply afterward.
    * Does not process previously queued events or attachment contents.
    */
   beforeSend?: (event: LogEvent) => LogEvent | null;

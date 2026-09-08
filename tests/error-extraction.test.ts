@@ -19,10 +19,22 @@ describe("extractErrorAttributes", () => {
     expect(extractErrorAttributes(new Error("raw"), "   ").message).toBe("raw");
   });
 
-  it("clips a huge stack to the reserved limit", () => {
+  it("preserves a huge stack for capture-time sanitization", () => {
     const error = new Error("boom");
     error.stack = "x".repeat(20000);
-    expect(extractErrorAttributes(error).attributes._error_stack).toHaveLength(16000);
+    expect(extractErrorAttributes(error).attributes._error_stack).toBe(error.stack);
+  });
+
+  it("preserves long error, cause and aggregate metadata for sanitization", () => {
+    const value = "x".repeat(300);
+    const nested = Object.assign(new Error(value), { name: value });
+    const error = Object.assign(new AggregateError([nested], value, { cause: nested }), { code: value });
+    const { message, attributes } = extractErrorAttributes(error);
+    expect(message).toBe(value);
+    for (const key of ["_error_code", "_error_cause_1_type", "_error_cause_1_message",
+      "_error_aggregate_first_type", "_error_aggregate_first_message"]) {
+      expect(attributes[key]).toBe(value);
+    }
   });
 
   it("walks the cause chain", () => {

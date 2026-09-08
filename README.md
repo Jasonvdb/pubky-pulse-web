@@ -314,7 +314,8 @@ Pulse.configure({
 The synchronous callback receives the fully enriched `LogEvent`. Return the mutated event or a
 replacement with valid required fields; return `null` to drop it and its attachment uploads.
 Only the returned event reaches the console, memory buffer, offline storage, and transport.
-Message and attribute length limits still apply. Hook exceptions, invalid results, and accidental
+The hook receives complete message and attribute strings, including extracted error metadata;
+message and attribute length limits apply only after it returns. Hook exceptions, invalid results, and accidental
 async callbacks drop silently; recursive Pulse logging from inside the callback is ignored.
 Without the hook, capture behaves as before.
 

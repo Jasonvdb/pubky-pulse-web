@@ -51,11 +51,12 @@ export function randomUuid(): string {
 }
 
 /**
- * Coerce attribute values to strings and trim them to the server's limits.
+ * Coerce attribute values to detached strings, optionally applying server limits.
  * `undefined` and `null` values are dropped rather than stringified.
  */
 export function normalizeAttributes(
   attrs?: PulseAttributes,
+  truncate = true,
 ): Record<string, string> | undefined {
   if (!attrs) return undefined;
 
@@ -69,7 +70,7 @@ export function normalizeAttributes(
       ? RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES[key]!
       : MAX_ATTRIBUTE_VALUE_LENGTH;
     const str = typeof value === "string" ? value : String(value);
-    result[key] = str.length > cap ? str.slice(0, cap) : str;
+    result[key] = truncate && str.length > cap ? str.slice(0, cap) : str;
   }
   return Object.keys(result).length > 0 ? result : undefined;
 }
@@ -84,8 +85,8 @@ export interface EventContext {
 }
 
 /**
- * Build the wire representation of one event. Undefined fields are omitted so
- * the JSON body stays small and the server's optional-field checks pass.
+ * Build an enriched event. A capture hook needs complete strings for sanitization;
+ * its result is bounded before delivery. Otherwise apply the wire limits here.
  */
 export function buildEvent(
   ctx: EventContext,
@@ -94,13 +95,13 @@ export function buildEvent(
   attributes?: PulseAttributes,
   screenNameOverride?: string,
 ): LogEvent {
+  const { config, deviceInfo } = ctx;
   const trimmed =
-    message.length > MAX_EVENT_MESSAGE_LENGTH
+    !config.beforeSend && message.length > MAX_EVENT_MESSAGE_LENGTH
       ? message.slice(0, MAX_EVENT_MESSAGE_LENGTH)
       : message;
   const screenName = screenNameOverride ?? ctx.screenName;
-  const custom = normalizeAttributes(attributes);
-  const { config, deviceInfo } = ctx;
+  const custom = normalizeAttributes(attributes, !config.beforeSend);
 
   const event: LogEvent = {
     client_event_id: randomUuid(),
