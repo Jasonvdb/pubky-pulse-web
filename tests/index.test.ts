@@ -150,6 +150,8 @@ describe("Pulse", () => {
     ["undefined", () => undefined],
     ["invalid object", () => ({ message: "private" })],
     ["wrong attributes", (event: LogEvent) => ({ ...event, custom_attributes: { bad: {} } })],
+    ["empty message", (event: LogEvent) => ({ ...event, message: "" })],
+    ["invalid timestamp", (event: LogEvent) => ({ ...event, timestamp: "invalid-date" })],
     ["async", async () => { throw new Error("private-hook-error"); }],
   ])("silently drops a %s hook result and allows later events", async (_label, invalid) => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -1081,7 +1083,8 @@ describe("Pulse feedback, questionnaires and attachments", () => {
   });
 
   it("uses processed event and user identifiers when reserving attachments", async () => {
-    const eventId = "1a680a20-a00b-401f-8121-46168056ef01";
+    // UUIDs may use uppercase hex and a version other than the builder's v4.
+    const eventId = "1A680A20-A00B-701F-8121-46168056EF01";
     Pulse.configure({
       ...config,
       beforeSend: (event) => ({ ...event, client_event_id: eventId, user_id: undefined }),
@@ -1098,4 +1101,32 @@ describe("Pulse feedback, questionnaires and attachments", () => {
     expect(body.user_id).toBeUndefined();
     expect(appEvents()[0]?.user_id).toBeUndefined();
   });
+
+  it.each(["client_event_id", "session_id"] as const)(
+    "drops a malformed transformed %s and its attachments without poisoning later events",
+    async (field) => {
+      Pulse.configure({
+        ...config,
+        beforeSend: (event) => event.message === "invalid"
+          ? { ...event, [field]: "redacted" }
+          : event,
+      });
+      Pulse.error("invalid", undefined, {
+        attachments: [{ data: new Uint8Array([1]), filename: "private.log" }],
+      });
+      Pulse.error("healthy", undefined, {
+        attachments: [{ data: new Uint8Array([2]), filename: "healthy.log" }],
+      });
+      await Pulse.flush();
+      expect(appEvents().map((event) => event.message)).toEqual(["healthy"]);
+      const reserves = fetchMock.mock.calls.filter((call) =>
+        (call[0] as string).endsWith("/v1/ingest/attachment"),
+      );
+      expect(reserves).toHaveLength(1);
+      expect(JSON.parse((reserves[0]![1] as RequestInit).body as string)).toMatchObject({
+        client_event_id: appEvents()[0]!.client_event_id,
+        original_filename: "healthy.log",
+      });
+    },
+  );
 });

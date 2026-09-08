@@ -152,6 +152,10 @@ function processEvent(event: LogEvent): LogEvent | null {
     for (const key of ["client_event_id", "session_id", "message", "sdk_name", "sdk_version", "timestamp"] as const) {
       if (typeof result[key] !== "string") return null;
     }
+    // One malformed required field would reject the entire ingest batch.
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuid.test(result.client_event_id) || !uuid.test(result.session_id) ||
+        !result.message.length || !Number.isFinite(Date.parse(result.timestamp))) return null;
     if (!["info", "debug", "warn", "error"].includes(result.level) ||
         result.environment !== ENVIRONMENT || typeof result.is_dev !== "boolean") return null;
 
