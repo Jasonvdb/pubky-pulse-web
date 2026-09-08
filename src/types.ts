@@ -39,8 +39,8 @@ export interface PulseConfiguration {
   endpoint?: string;
   /** Client API key. Public and write-only; must start with `pulse_client_`. */
   apiKey: string;
-  /** Bundle id of the Pulse app that owns these events. */
-  bundleId: string;
+  /** Optional legacy identifier. The client key alone identifies the Pulse app. */
+  bundleId?: string;
   /** Application version reported with every event. */
   appVersion?: string;
   /**
@@ -119,7 +119,7 @@ export interface LogEvent {
 }
 
 export interface IngestRequest {
-  bundle_id: string;
+  bundle_id?: string;
   events: LogEvent[];
 }
 
@@ -134,7 +134,7 @@ export interface PulseFeedbackOptions {
 
 /** Body accepted by `POST /v1/feedback`. */
 export interface FeedbackSubmission {
-  bundle_id: string;
+  bundle_id?: string;
   message: string;
   session_id?: string;
   user_id?: string;

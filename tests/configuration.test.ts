@@ -77,10 +77,24 @@ describe("validateConfiguration", () => {
     );
   });
 
-  it("rejects a missing bundle id", () => {
-    expect(() => validateConfiguration({ ...base, bundleId: "" })).toThrow(
-      "Pubky Pulse: bundleId is required",
-    );
+  it("requires only the client key and does not invent a bundle id", () => {
+    const config = validateConfiguration({ apiKey: base.apiKey });
+    expect(config.endpoint).toBe(DEFAULT_ENDPOINT);
+    expect(config.bundleId).toBeUndefined();
+  });
+
+  it("accepts an explicitly undefined bundle id", () => {
+    expect(validateConfiguration({ ...base, bundleId: undefined }).bundleId).toBeUndefined();
+  });
+
+  it("preserves a supplied legacy bundle id", () => {
+    expect(validateConfiguration(base).bundleId).toBe(base.bundleId);
+  });
+
+  it.each(["", null, 42])("rejects an invalid supplied bundle id: %s", (bundleId) => {
+    expect(() =>
+      validateConfiguration({ ...base, bundleId: bundleId as unknown as string }),
+    ).toThrow("Pubky Pulse: bundleId must be a non-empty string when supplied");
   });
 
   it("rejects non-positive numeric options", () => {

@@ -135,7 +135,7 @@ export class PulseQuestionnaireError extends Error {
 export interface QuestionnaireContext {
   endpoint: string;
   apiKey: string;
-  bundleId: string;
+  bundleId?: string;
   userId?: string;
   sessionId?: string;
   appVersion?: string;
@@ -379,7 +379,7 @@ export async function fetchQuestionnaire(
   options?: { force?: boolean },
 ): Promise<PulseQuestionnaireFetchResult> {
   const url = new URL(`${ctx.endpoint}/v1/questionnaires/${encodeURIComponent(slug)}`);
-  url.searchParams.set("bundle_id", ctx.bundleId);
+  if (ctx.bundleId !== undefined) url.searchParams.set("bundle_id", ctx.bundleId);
   if (ctx.userId) url.searchParams.set("user_id", ctx.userId);
   if (options?.force) url.searchParams.set("force", "true");
 

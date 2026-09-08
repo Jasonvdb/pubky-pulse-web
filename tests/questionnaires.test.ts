@@ -62,6 +62,16 @@ describe("questionnaires", () => {
   });
 
   describe("fetchQuestionnaire", () => {
+    it("omits bundle_id from the query when not configured", async () => {
+      respond({ eligible: false, reason: "inactive" });
+      const { bundleId: _bundleId, ...keyOnly } = ctx;
+      await fetchQuestionnaire(keyOnly, "nps-2026");
+      expect(new URL(lastCall()[0]).searchParams.has("bundle_id")).toBe(false);
+      expect((lastCall()[1].headers as Record<string, string>).Authorization).toBe(
+        "Bearer pulse_client_abc",
+      );
+    });
+
     it("parses an eligible questionnaire and its in-progress draft", async () => {
       respond({
         eligible: true,
@@ -163,6 +173,16 @@ describe("questionnaires", () => {
   });
 
   describe("saveQuestionnaireResponse", () => {
+    it("omits bundle_id from responses when not configured", async () => {
+      respond({ id: "r1", created_at: "2026-09-04T10:00:00.000Z", was_submitted: true });
+      const { bundleId: _bundleId, ...keyOnly } = ctx;
+      await saveQuestionnaireResponse(keyOnly, "nps-2026", { how: "great" }, true);
+      expect(JSON.parse(lastCall()[1].body as string)).not.toHaveProperty("bundle_id");
+      expect((lastCall()[1].headers as Record<string, string>).Authorization).toBe(
+        "Bearer pulse_client_abc",
+      );
+    });
+
     it("posts the full answer set and parses the receipt", async () => {
       respond(
         { id: "r1", created_at: "2026-09-04T10:00:00.000Z", was_submitted: true },
@@ -243,6 +263,16 @@ describe("questionnaires", () => {
   });
 
   describe("dismissQuestionnaires", () => {
+    it("omits bundle_id from dismissals when not configured", async () => {
+      respond({ dismissed_at: "2026-09-04T11:00:00.000Z" });
+      const { bundleId: _bundleId, ...keyOnly } = ctx;
+      await dismissQuestionnaires(keyOnly);
+      expect(JSON.parse(lastCall()[1].body as string)).toEqual({ user_id: "user-1" });
+      expect((lastCall()[1].headers as Record<string, string>).Authorization).toBe(
+        "Bearer pulse_client_abc",
+      );
+    });
+
     it("posts the bundle and user and returns the dismissal date", async () => {
       respond({ dismissed_at: "2026-09-04T11:00:00.000Z" });
 

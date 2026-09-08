@@ -13,7 +13,7 @@ export const DEFAULT_ENDPOINT = "https://ingest.pubkypulse.com";
 export interface ValidatedConfig {
   endpoint: string;
   apiKey: string;
-  bundleId: string;
+  bundleId?: string;
   appVersion?: string;
   isDev: boolean;
   debug: boolean;
@@ -96,8 +96,8 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     throw new Error(`Pubky Pulse: apiKey must start with "${CLIENT_KEY_PREFIX}"`);
   }
 
-  if (!config.bundleId || typeof config.bundleId !== "string") {
-    throw new Error("Pubky Pulse: bundleId is required");
+  if (config.bundleId !== undefined && (!config.bundleId || typeof config.bundleId !== "string")) {
+    throw new Error("Pubky Pulse: bundleId must be a non-empty string when supplied");
   }
 
   if (config.screenNameForPath !== undefined && typeof config.screenNameForPath !== "function") {

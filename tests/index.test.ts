@@ -89,6 +89,19 @@ describe("Pulse", () => {
     expect(fetchMock.mock.calls[0]![0]).toBe("https://pulse.example.com/v1/ingest");
   });
 
+  it("configures with only a client key without a bootstrap request", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    Pulse.configure({ apiKey: "pulse_client_abc" });
+    expect(fetchMock).not.toHaveBeenCalled();
+    Pulse.info("key_only");
+    // Unload uses plain JSON even with default compression enabled.
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const call = fetchMock.mock.calls[0]!;
+    expect(call[0]).toBe("https://ingest.pubkypulse.com/v1/ingest");
+    expect(JSON.parse((call[1] as RequestInit).body as string)).not.toHaveProperty("bundle_id");
+    expect(appEvents().some((event) => event.message === "key_only")).toBe(true);
+  });
+
   it("sanitizes enriched manual and automatic errors before console and delivery", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const beforeSend = vi.fn((event: LogEvent) => {
@@ -1003,6 +1016,29 @@ describe("Pulse feedback, questionnaires and attachments", () => {
 
     const audit = sentEvents().find((event) => event.message === "sdk:feedback_submitted");
     expect(audit?.custom_attributes).toEqual({ has_email: "true", has_name: "false" });
+  });
+
+  it("submits feedback and questionnaires without a bundle id", async () => {
+    const { bundleId: _bundleId, ...keyOnly } = config;
+    Pulse.configure(keyOnly);
+    await Pulse.sendFeedback("key-only feedback");
+    await Pulse.fetchQuestionnaire("nps-2026");
+    await Pulse.saveQuestionnaireResponse("nps-2026", { score: 9 }, true);
+    await Pulse.dismissQuestionnaires();
+    await Pulse.flush();
+
+    expect(requestPaths()).toEqual([
+      "/v1/feedback",
+      "/v1/questionnaires/nps-2026",
+      "/v1/questionnaires/nps-2026/responses",
+      "/v1/questionnaires/dismiss",
+      "/v1/ingest",
+    ]);
+    for (const [url, init] of fetchMock.mock.calls as [string, RequestInit][]) {
+      expect(new URL(url).searchParams.has("bundle_id")).toBe(false);
+      if (init.body) expect(JSON.parse(init.body as string)).not.toHaveProperty("bundle_id");
+      expect((init.headers as Record<string, string>).Authorization).toBe("Bearer pulse_client_abc");
+    }
   });
 
   it("rejects an empty or oversized feedback message without calling the server", async () => {
