@@ -34,9 +34,11 @@ The default needs 0.2.0 or newer; on 0.1.1 and earlier `endpoint` is still requi
 The client key identifies exactly one Pulse app; web apps do not need a bundle identifier.
 Client-key-only setup requires a server that accepts requests without `bundle_id`. Self-hosters
 must deploy that server update before upgrading clients to omit the identifier. Until then, keep
-passing the existing `bundleId` for compatibility with older servers. Updated servers accept this
-legacy field but ignore it for app selection and authorization, even when it differs from the
-app's identifier. There is no identifier lookup request during configuration.
+passing the existing `bundleId` for compatibility with older servers. Updated servers skip
+identifier validation for keys belonging to web or backend apps, even when the supplied value
+differs from the app's identifier. For Apple or Android app keys, a supplied identifier must match
+the registered one; an absent identifier is accepted. There is no identifier lookup request during
+configuration.
 
 Calls made before `configure()` are ignored (one console note, then silence), so a stray log during
 startup can never throw.
