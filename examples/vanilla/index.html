@@ -246,8 +246,8 @@
             <input id="api-key" type="text" placeholder="pulse_client_…" autocomplete="off" />
           </label>
           <label>
-            Bundle id
-            <input id="bundle-id" type="text" placeholder="com.example.web" autocomplete="off" />
+            Bundle id (optional, for older servers)
+            <input id="bundle-id" type="text" placeholder="Leave blank for client-key-only setup" autocomplete="off" />
           </label>
           <div class="actions">
             <button id="configure" class="primary" type="button">Configure</button>
@@ -326,7 +326,7 @@
           Pulse.configure({
             endpoint: document.getElementById("endpoint").value.trim(),
             apiKey: document.getElementById("api-key").value.trim(),
-            bundleId: document.getElementById("bundle-id").value.trim(),
+            bundleId: document.getElementById("bundle-id").value.trim() || undefined,
             appVersion: "0.0.0-playground",
             debug: true,
           });

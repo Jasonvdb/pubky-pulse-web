@@ -21,11 +21,7 @@ Configure once, as early in the page's life as you can, then log from anywhere.
 ```ts
 import { Pulse } from "@synonymdev/pubky-pulse-web";
 
-Pulse.configure({
-  apiKey: "pulse_client_…",
-  bundleId: "com.example.web",
-  appVersion: "1.4.0",
-});
+Pulse.configure({ apiKey: "pulse_client_…" });
 
 Pulse.info("signed_up", { plan: "pro" });
 ```
@@ -34,6 +30,13 @@ Leaving `endpoint` out sends the events to Pubky's hosted instance at
 `https://ingest.pubkypulse.com`. Nothing warns you when that happens, so if you run your own Pubky
 Pulse you must pass your own ingest host or your data goes to Pubky's instance instead of yours.
 The default needs 0.2.0 or newer; on 0.1.1 and earlier `endpoint` is still required.
+
+The client key identifies exactly one Pulse app; web apps do not need a bundle identifier.
+Client-key-only setup requires a server that accepts requests without `bundle_id`. Self-hosters
+must deploy that server update before upgrading clients to omit the identifier. Until then, keep
+passing the existing `bundleId` for compatibility with older servers. Updated servers accept this
+legacy field but ignore it for app selection and authorization, even when it differs from the
+app's identifier. There is no identifier lookup request during configuration.
 
 Calls made before `configure()` are ignored (one console note, then silence), so a stray log during
 startup can never throw.
@@ -46,11 +49,7 @@ startup can never throw.
 <script type="module">
   import { Pulse } from "https://esm.sh/@synonymdev/pubky-pulse-web";
 
-  Pulse.configure({
-    endpoint: "https://ingest.pubkypulse.com",
-    apiKey: "pulse_client_…",
-    bundleId: "com.example.web",
-  });
+  Pulse.configure({ apiKey: "pulse_client_…" });
 
   document.querySelector("#buy").addEventListener("click", () => {
     Pulse.info("buy_clicked");
@@ -62,7 +61,8 @@ There is a runnable version of this in [`examples/vanilla/index.html`](./example
 build the package with `npm run build`, then serve the repository over HTTP — `npx serve .` or
 `python3 -m http.server` — and open `http://localhost:3000/examples/vanilla/index.html` (port 8000
 for `http.server`). The page imports the built SDK as a module, so opening it straight from disk
-over `file://` leaves it dead. Fill in your key and bundle id there and watch the events stream;
+over `file://` leaves it dead. Fill in your key and endpoint there and watch the events stream;
+the optional bundle id field is only needed when connecting to an older server, and
 the origin you serve it from is the one that has to be in the server's `CORS_ORIGINS`.
 
 ### React
@@ -76,9 +76,7 @@ import { Pulse } from "@synonymdev/pubky-pulse-web";
 export function App() {
   useEffect(() => {
     Pulse.configure({
-      endpoint: import.meta.env.VITE_PULSE_ENDPOINT,
       apiKey: import.meta.env.VITE_PULSE_KEY,
-      bundleId: "com.example.web",
       appVersion: __APP_VERSION__,
     });
   }, []);
@@ -105,9 +103,7 @@ import { Pulse } from "@synonymdev/pubky-pulse-web";
 export function PulseProvider({ userId }: { userId?: string }) {
   useEffect(() => {
     Pulse.configure({
-      endpoint: process.env.NEXT_PUBLIC_PULSE_ENDPOINT!,
       apiKey: process.env.NEXT_PUBLIC_PULSE_KEY!,
-      bundleId: "com.example.web",
       propagateSessionTo: ["/api"],
     });
   }, []);
@@ -166,13 +162,11 @@ export async function POST(req: Request) {
 <script lang="ts">
   import { onMount } from "svelte";
   import { Pulse } from "@synonymdev/pubky-pulse-web";
-  import { PUBLIC_PULSE_ENDPOINT, PUBLIC_PULSE_KEY } from "$env/static/public";
+  import { PUBLIC_PULSE_KEY } from "$env/static/public";
 
   onMount(() => {
     Pulse.configure({
-      endpoint: PUBLIC_PULSE_ENDPOINT,
       apiKey: PUBLIC_PULSE_KEY,
-      bundleId: "com.example.web",
     });
 
     return () => void Pulse.shutdown();
@@ -197,9 +191,7 @@ export const appConfig: ApplicationConfig = {
       multi: true,
       useFactory: () => () => {
         Pulse.configure({
-          endpoint: environment.pulseEndpoint,
           apiKey: environment.pulseKey,
-          bundleId: "com.example.web",
           appVersion: environment.version,
         });
       },
@@ -249,7 +241,6 @@ needed:
 ```ts
 Pulse.configure({
   apiKey: "pulse_client_YOUR_KEY",
-  bundleId: "com.example.web",
   screenNameForPath(pathname) {
     if (pathname.startsWith("/profile/")) return "profile";
     if (pathname.startsWith("/post/")) return "post";
@@ -308,7 +299,6 @@ errors, network requests, screens, sessions, and metrics in one place:
 ```ts
 Pulse.configure({
   apiKey: "pulse_client_…",
-  bundleId: "com.example.web",
   beforeSend(event) {
     if (event.message === "ResizeObserver loop limit exceeded") return null;
     if (event.custom_attributes?._http_url) {
@@ -583,7 +573,7 @@ was both parked and sent is counted once.
 | --- | --- | --- | --- |
 | `endpoint` | `string` | `https://ingest.pubkypulse.com` | Pubky's hosted ingest host; a trailing slash is stripped. Self-hosters must set their own server URL explicitly. |
 | `apiKey` | `string` | — | **Required.** Client key, must start with `pulse_client_`. |
-| `bundleId` | `string` | — | **Required.** Bundle id of the Pulse app receiving the events. |
+| `bundleId` | `string` | Not sent | Optional legacy identifier for older servers. Updated servers identify the app from the client key alone. |
 | `appVersion` | `string` | — | Version reported with every event. |
 | `isDev` | `boolean` | `true` on `localhost`, `127.0.0.1` or `file:` | Marks events as development traffic. |
 | `debug` | `boolean` | `false` | Print the SDK's own diagnostics to the console. |
@@ -606,8 +596,8 @@ the first page load rather than silently dropping your data.
 
 ## Server setup
 
-1. In your Pulse dashboard, create an app with platform `web` and give it a bundle id — the same
-   string you pass as `bundleId`.
+1. In your Pulse dashboard, create an app with platform `web`. Its client key identifies the app;
+   you do not need to copy an app identifier into the SDK configuration.
 2. Add the site's origin to the server's `CORS_ORIGINS`, including the port you use in development
    (`http://localhost:5173`, say). Without it the browser blocks every request.
 3. Copy the app's client key. It starts with `pulse_client_`, is meant to ship in your bundle and is

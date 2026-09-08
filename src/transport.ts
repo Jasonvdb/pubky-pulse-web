@@ -65,7 +65,7 @@ type BatchOutcome = "sent" | "dropped" | "park";
  */
 export function sliceForKeepalive(
   events: LogEvent[],
-  bundleId: string,
+  bundleId?: string,
 ): { batch: LogEvent[]; rest: LogEvent[] } {
   const overhead = byteLength(JSON.stringify({ bundle_id: bundleId, events: [] }));
   let size = overhead;

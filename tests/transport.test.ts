@@ -106,6 +106,17 @@ describe("retryDelayMs", () => {
 });
 
 describe("sliceForKeepalive", () => {
+  it("keeps a bundle-free request under the keepalive budget", () => {
+    const events = Array.from({ length: 60 }, (_, i) => makeEvent(i, "m".repeat(2000)));
+    const { batch, rest } = sliceForKeepalive(events);
+    expect(batch.length).toBeGreaterThan(0);
+    expect(rest.length).toBeGreaterThan(0);
+    expect(batch.length + rest.length).toBe(events.length);
+    expect(JSON.stringify({ events: batch }).length).toBeLessThanOrEqual(
+      KEEPALIVE_BODY_LIMIT_BYTES,
+    );
+  });
+
   it("takes everything when it fits", () => {
     const events = [makeEvent(0), makeEvent(1)];
     expect(sliceForKeepalive(events, BUNDLE_ID)).toEqual({ batch: events, rest: [] });
@@ -195,6 +206,31 @@ describe("Transport", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(requestBody(fetchMock.mock.calls[0]!).events).toHaveLength(3);
+  });
+
+  it("omits bundle_id from normal, keepalive and replay requests", async () => {
+    const tx = createTransport({ bundleId: undefined });
+    tx.enqueue(makeEvent(0));
+    await tx.flush();
+    tx.enqueue(makeEvent(1));
+    tx.flushOnUnload();
+    testNavigator.onLine = false;
+    tx.enqueue(makeEvent(2));
+    await tx.shutdown();
+    expect(queue.read()).toHaveLength(1);
+    testNavigator.onLine = true;
+    await createTransport({ bundleId: undefined }).flush();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect((fetchMock.mock.calls[1]![1] as RequestInit).keepalive).toBe(true);
+    expect(fetchMock.mock.calls.map((call) => requestBody(call).events[0]?.client_event_id)).toEqual([
+      "event-0", "event-1", "event-2",
+    ]);
+    for (const call of fetchMock.mock.calls) {
+      expect(requestBody(call)).not.toHaveProperty("bundle_id");
+      expect(requestHeaders(call).Authorization).toBe("Bearer pulse_client_abc");
+    }
+    expect(queue.read()).toEqual([]);
   });
 
   it("flushes on the configured interval", async () => {
