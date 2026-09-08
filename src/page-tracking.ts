@@ -146,7 +146,12 @@ export class PageTracker {
     let name: string | null = null;
     try {
       const mapped = this.screenNameForPath(pathname);
-      if (typeof mapped === "string" && mapped.trim().length > 0) name = mapped;
+      if (typeof mapped === "string" && mapped.trim().length > 0) {
+        name = mapped;
+      } else {
+        // Invalid async results must not leak mapper errors through unhandled capture.
+        void Promise.resolve(mapped).catch(() => undefined);
+      }
     } catch {
       // Mapping must not break navigation or expose a raw path on failure.
     }

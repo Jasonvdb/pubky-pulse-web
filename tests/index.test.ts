@@ -384,6 +384,59 @@ describe("Pulse", () => {
     expect(JSON.stringify(sentEvents())).not.toContain("private-code");
   });
 
+  const invalidAsyncMappers: [string, (pathname: string) => unknown][] = [
+    ["async throw", async (pathname) => { throw new Error(pathname); }],
+    ["rejected promise", (pathname) => Promise.reject(new Error(pathname))],
+    ["rejecting thenable", (pathname) => ({
+      then(_resolve: unknown, reject: (reason: unknown) => void) {
+        reject(new Error(pathname));
+      },
+    })],
+    ["throwing then getter", (pathname) => ({
+      get then() { throw new Error(pathname); },
+    })],
+    ["resolved promise", () => Promise.resolve("invalid_async_name")],
+  ];
+
+  it.each(invalidAsyncMappers)("contains invalid mapper results without error telemetry: %s", async (_label, invalidMapper) => {
+    // These tests use a fake window; bridge Node's rejection event to browser capture.
+    const onUnhandled = vi.fn((reason: unknown) => {
+      testWindow.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason }));
+    });
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      testLocation.pathname = "/profile/public-key";
+      Pulse.configure({
+        ...config,
+        screenNameForPath: ((pathname: string) => pathname.startsWith("/invite/")
+          ? invalidMapper(pathname)
+          : "profile") as (pathname: string) => string,
+      });
+      expect(() => history.pushState(null, "", "/invite/private-code")).not.toThrow();
+      Pulse.info("unmapped_page");
+      // Allow promise assimilation and the unhandled-rejection checkpoint to finish.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      Pulse.info("still_unmapped");
+      await Pulse.flush();
+
+      expect(onUnhandled).not.toHaveBeenCalled();
+      expect(appEvents().map((e) => [e.message, e.screen_name])).toEqual([
+        ["unmapped_page", undefined],
+        ["still_unmapped", undefined],
+      ]);
+      const screens = sentEvents().filter((e) => e.message.startsWith("sdk:screen_"));
+      expect(screens.map((e) => [e.message, e.screen_name])).toEqual([
+        ["sdk:screen_appeared", "profile"],
+        ["sdk:screen_disappeared", "profile"],
+      ]);
+      expect(sentEvents().some((e) => e.custom_attributes?._unhandled)).toBe(false);
+      expect(JSON.stringify(sentEvents())).not.toContain("private-code");
+      expect(JSON.stringify(sentEvents())).not.toContain("invalid_async_name");
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("preserves explicit event and manual screen names with automatic mapping enabled", async () => {
     const mapper = vi.fn(() => "profile");
     Pulse.configure({ ...config, screenNameForPath: mapper });
