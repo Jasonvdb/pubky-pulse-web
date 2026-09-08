@@ -239,8 +239,39 @@ While `consoleLogging` is on, every event is mirrored to the console as
 ## Screens and route tracking
 
 With `trackPageViews` on (the default), the SDK patches `pushState`/`replaceState` and listens for
-`popstate`, emitting a screen event whenever `location.pathname` changes. Hash-only changes are
-ignored.
+`popstate`, using `location.pathname` as the screen name by default. Hash-only and query-only
+History API changes are ignored.
+
+For routes containing identifiers, supply a synchronous `screenNameForPath` callback during
+initialization. The SDK still observes navigation, so no framework-specific route observer is
+needed:
+
+```ts
+Pulse.configure({
+  apiKey: "pulse_client_YOUR_KEY",
+  bundleId: "com.example.web",
+  screenNameForPath(pathname) {
+    if (pathname.startsWith("/profile/")) return "profile";
+    if (pathname.startsWith("/post/")) return "post";
+    if (pathname.startsWith("/collections/")) return "collections";
+    if (pathname.startsWith("/invite/")) return "invite";
+    return "other";
+  },
+});
+```
+
+The callback receives only the pathname, without a query string or hash, on initial load and
+`pushState`, `replaceState`, and `popstate` navigation. Its returned name is used for automatic
+screen events, duration attribution, and the default `screen_name` on subsequent events. Moving
+between two paths mapped to the same name keeps the current screen and its duration running.
+
+Return a nonblank string. If the callback throws or returns a blank or non-string value, the
+previous screen ends and default screen attribution is cleared until a valid automatic or
+manual screen is entered. The SDK does not fall back to the raw pathname or report the callback's
+error. Nonblank names are preserved as returned. Omitting the callback preserves raw-path
+tracking; setting `trackPageViews: false` disables the callback along with automatic tracking.
+This callback only controls automatic screen naming; it does not sanitize network URLs or
+arbitrary event attributes.
 
 For anything the URL does not describe — a modal, a wizard step, a tab — name it yourself:
 
@@ -249,7 +280,8 @@ Pulse.trackScreen("Checkout / Payment");
 ```
 
 `trackScreen` also sets the default `screen_name` for the events that follow, until the next screen
-change.
+change. Manual names and per-event `screenName` overrides are used directly, without calling
+`screenNameForPath`.
 
 ## Errors
 
@@ -525,6 +557,7 @@ was both parked and sent is counted once.
 | `compressionEnabled` | `boolean` | `true` | gzip request bodies where the browser supports it. |
 | `captureUnhandled` | `boolean` | `true` | Capture uncaught errors and unhandled rejections. |
 | `trackPageViews` | `boolean` | `true` | Emit screen events for History API navigations. |
+| `screenNameForPath` | `(pathname: string) => string` | Raw pathname | Map automatic screen names; a thrown error or blank/non-string result ends the previous screen and clears default attribution. |
 | `networkTracking` | `boolean` | `false` | Emit an event per `fetch` call. |
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |

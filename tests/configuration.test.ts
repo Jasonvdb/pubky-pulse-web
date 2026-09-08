@@ -116,6 +116,24 @@ describe("validateConfiguration", () => {
     ).toThrow("Pubky Pulse: propagateSessionTo must be an array of strings");
   });
 
+  it("preserves a screen mapper without calling it during validation", () => {
+    const screenNameForPath = () => {
+      throw new Error("must only run during automatic tracking");
+    };
+    expect(validateConfiguration({ ...base, screenNameForPath }).screenNameForPath).toBe(
+      screenNameForPath,
+    );
+  });
+
+  it.each([null, false, 42, "profile", {}, []])("rejects a non-function screen mapper: %j", (value) => {
+    expect(() =>
+      validateConfiguration({
+        ...base,
+        screenNameForPath: value as unknown as (pathname: string) => string,
+      }),
+    ).toThrow("Pubky Pulse: screenNameForPath must be a function");
+  });
+
   it("applies the documented defaults", () => {
     const config = validateConfiguration(base);
     expect(config).toMatchObject({
@@ -132,6 +150,7 @@ describe("validateConfiguration", () => {
       sessionTimeoutMs: 1_800_000,
     });
     expect(config.supportedLanguages).toBeUndefined();
+    expect(config.screenNameForPath).toBeUndefined();
   });
 });
 

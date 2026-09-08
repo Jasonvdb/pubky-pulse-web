@@ -74,13 +74,15 @@ function restoreHistory(): void {
  */
 export class PageTracker {
   private readonly callbacks: ScreenCallbacks;
+  private readonly screenNameForPath?: (pathname: string) => string;
   private current: string | null = null;
   private enteredAt = 0;
   private popstateHandler: (() => void) | null = null;
   private installed = false;
 
-  constructor(callbacks: ScreenCallbacks) {
+  constructor(callbacks: ScreenCallbacks, screenNameForPath?: (pathname: string) => string) {
     this.callbacks = callbacks;
+    this.screenNameForPath = screenNameForPath;
   }
 
   /** Screen stamped on events that do not name one themselves. */
@@ -98,18 +100,18 @@ export class PageTracker {
 
     patchHistory();
     navigationListener = () => {
-      this.enter(currentPath());
+      this.enterCurrentPath();
     };
 
     const win = (globalThis as { window?: Window }).window;
     if (win) {
       this.popstateHandler = () => {
-        this.enter(currentPath());
+        this.enterCurrentPath();
       };
       win.addEventListener("popstate", this.popstateHandler);
     }
 
-    this.enter(currentPath());
+    this.enterCurrentPath();
   }
 
   /** Report a screen change the SDK cannot see, e.g. a modal or a tab. */
@@ -134,7 +136,24 @@ export class PageTracker {
     this.enteredAt = 0;
   }
 
-  private enter(name: string): void {
+  private enterCurrentPath(): void {
+    const pathname = currentPath();
+    if (!this.screenNameForPath) {
+      this.enter(pathname);
+      return;
+    }
+
+    let name: string | null = null;
+    try {
+      const mapped = this.screenNameForPath(pathname);
+      if (typeof mapped === "string" && mapped.trim().length > 0) name = mapped;
+    } catch {
+      // Mapping must not break navigation or expose a raw path on failure.
+    }
+    this.enter(name);
+  }
+
+  private enter(name: string | null): void {
     if (this.current === name) return;
 
     const at = nowMs();
@@ -143,6 +162,6 @@ export class PageTracker {
     }
     this.current = name;
     this.enteredAt = at;
-    this.callbacks.onAppeared(name);
+    if (name !== null) this.callbacks.onAppeared(name);
   }
 }

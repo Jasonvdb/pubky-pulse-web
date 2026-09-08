@@ -322,6 +322,125 @@ describe("Pulse", () => {
     expect(appEvents()[0]?.screen_name).toBe("/checkout");
   });
 
+  it("uses mapped names in automatic events, durations, and subsequent logs", async () => {
+    testLocation.pathname = "/profile/public-key";
+    Pulse.configure({ ...config, screenNameForPath: (pathname) => pathname.split("/")[1]! });
+    Pulse.info("viewed_profile");
+    history.pushState(null, "", "/post/user-id/post-id");
+    Pulse.info("viewed_post");
+    history.replaceState(null, "", "/collections/user-id/post-id");
+    Pulse.info("viewed_collection");
+    testLocation.pathname = "/invite/private-code";
+    testWindow.dispatchEvent(new Event("popstate"));
+    Pulse.info("viewed_invite");
+    await Pulse.flush();
+
+    const screens = sentEvents().filter((e) => e.message.startsWith("sdk:screen_"));
+    expect(screens.map((e) => [e.message, e.screen_name])).toEqual([
+      ["sdk:screen_appeared", "profile"],
+      ["sdk:screen_disappeared", "profile"],
+      ["sdk:screen_appeared", "post"],
+      ["sdk:screen_disappeared", "post"],
+      ["sdk:screen_appeared", "collections"],
+      ["sdk:screen_disappeared", "collections"],
+      ["sdk:screen_appeared", "invite"],
+    ]);
+    for (const event of screens.filter((e) => e.message === "sdk:screen_disappeared")) {
+      expect(event.custom_attributes?._duration_ms).toMatch(/^\d+$/);
+    }
+    expect(appEvents().map((e) => e.screen_name)).toEqual(["profile", "post", "collections", "invite"]);
+    for (const event of sentEvents()) {
+      if (event.screen_name) {
+        expect(["profile", "post", "collections", "invite"]).toContain(event.screen_name);
+      }
+    }
+  });
+
+  it("clears event attribution after a mapper throws and recovers on the next valid route", async () => {
+    testLocation.pathname = "/profile/public-key";
+    Pulse.configure({
+      ...config,
+      screenNameForPath: (pathname) => {
+        if (pathname.startsWith("/invite/")) throw new Error("cannot map private-code");
+        return "profile";
+      },
+    });
+    expect(() => history.pushState(null, "", "/invite/private-code")).not.toThrow();
+    Pulse.info("unmapped_page");
+    history.pushState(null, "", "/profile/another-key");
+    Pulse.info("mapped_again");
+    await Pulse.flush();
+
+    expect(appEvents().map((e) => [e.message, e.screen_name])).toEqual([
+      ["unmapped_page", undefined],
+      ["mapped_again", "profile"],
+    ]);
+    const screens = sentEvents().filter((e) => e.message.startsWith("sdk:screen_"));
+    expect(screens.map((e) => [e.message, e.screen_name])).toEqual([
+      ["sdk:screen_appeared", "profile"],
+      ["sdk:screen_disappeared", "profile"],
+      ["sdk:screen_appeared", "profile"],
+    ]);
+    expect(JSON.stringify(sentEvents())).not.toContain("private-code");
+  });
+
+  it("preserves explicit event and manual screen names with automatic mapping enabled", async () => {
+    const mapper = vi.fn(() => "profile");
+    Pulse.configure({ ...config, screenNameForPath: mapper });
+    Pulse.info("explicit", undefined, { screenName: "Checkout" });
+    Pulse.trackScreen("Checkout modal");
+    Pulse.info("manual");
+    await Pulse.flush();
+
+    expect(mapper).toHaveBeenCalledTimes(1);
+    expect(appEvents().map((e) => e.screen_name)).toEqual(["Checkout", "Checkout modal"]);
+    const screens = sentEvents().filter((e) => e.message.startsWith("sdk:screen_"));
+    expect(screens.map((e) => [e.message, e.screen_name])).toEqual([
+      ["sdk:screen_appeared", "profile"],
+      ["sdk:screen_disappeared", "profile"],
+      ["sdk:screen_appeared", "Checkout modal"],
+    ]);
+  });
+
+  it("does not call the mapper when automatic tracking is disabled", async () => {
+    const mapper = vi.fn(() => {
+      throw new Error("must not run");
+    });
+    Pulse.configure({ ...config, trackPageViews: false, screenNameForPath: mapper });
+    history.pushState(null, "", "/invite/private-code");
+    Pulse.info("before_manual_screen");
+    Pulse.trackScreen("Checkout modal");
+    Pulse.info("manual");
+    await Pulse.flush();
+
+    expect(mapper).not.toHaveBeenCalled();
+    expect(appEvents().map((e) => e.screen_name)).toEqual([undefined, "Checkout modal"]);
+  });
+
+  it("replaces the mapper on reconfigure and removes it on shutdown", async () => {
+    const oldMapper = vi.fn(() => "old");
+    const newMapper = vi.fn(() => "new");
+    Pulse.configure({ ...config, screenNameForPath: oldMapper });
+    Pulse.configure({ ...config, screenNameForPath: newMapper });
+    history.pushState(null, "", "/profile/public-key");
+    Pulse.info("reconfigured");
+    await Pulse.flush();
+    expect(oldMapper).toHaveBeenCalledTimes(1);
+    expect(newMapper).toHaveBeenCalledTimes(2);
+    expect(appEvents().find((e) => e.message === "reconfigured")?.screen_name).toBe("new");
+
+    await Pulse.shutdown();
+    history.pushState(null, "", "/post/user-id/post-id");
+    testWindow.dispatchEvent(new Event("popstate"));
+    expect(newMapper).toHaveBeenCalledTimes(2);
+    Pulse.configure(config);
+    Pulse.info("without_mapper");
+    await Pulse.flush();
+    expect(appEvents().find((e) => e.message === "without_mapper")?.screen_name).toBe(
+      "/post/user-id/post-id",
+    );
+  });
+
   it("leaves the history api alone when page tracking is off", async () => {
     Pulse.configure({ ...config, trackPageViews: false });
     history.pushState(null, "", "/checkout");
