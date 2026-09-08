@@ -227,7 +227,7 @@ function installObservers(validated: ValidatedConfig): void {
 
   // The tracker owns the default screen name, so it exists even when
   // automatic page views are off; then only `trackScreen()` moves it.
-  pageTracker = new PageTracker(screenCallbacks);
+  pageTracker = new PageTracker(screenCallbacks, validated.screenNameForPath);
   if (validated.trackPageViews) pageTracker.install();
 
   if (validated.captureUnhandled) {

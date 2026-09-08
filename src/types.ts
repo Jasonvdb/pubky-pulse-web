@@ -58,6 +58,14 @@ export interface PulseConfiguration {
   captureUnhandled?: boolean;
   /** Emit screen events for History API navigations. Default: true. */
   trackPageViews?: boolean;
+  /**
+   * Map automatic page-view pathnames to stable screen names. Defaults to the
+   * raw pathname. Called synchronously on initial load and navigation; manual
+   * screen names are unchanged. A thrown error or a blank/non-string result
+   * ends the previous screen and clears default attribution until a valid
+   * screen is entered, without falling back to the raw pathname.
+   */
+  screenNameForPath?: (pathname: string) => string;
   /** Emit `sdk:network_request` events for `fetch` calls. Default: false. */
   networkTracking?: boolean;
   /**

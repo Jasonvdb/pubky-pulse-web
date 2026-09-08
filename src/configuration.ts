@@ -21,6 +21,7 @@ export interface ValidatedConfig {
   compressionEnabled: boolean;
   captureUnhandled: boolean;
   trackPageViews: boolean;
+  screenNameForPath?: (pathname: string) => string;
   networkTracking: boolean;
   propagateSessionTo: string[];
   flushIntervalMs: number;
@@ -98,6 +99,10 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     throw new Error("Pubky Pulse: bundleId is required");
   }
 
+  if (config.screenNameForPath !== undefined && typeof config.screenNameForPath !== "function") {
+    throw new Error("Pubky Pulse: screenNameForPath must be a function");
+  }
+
   const flushThreshold = positiveInteger(config.flushThreshold, "flushThreshold", 20);
   const maxBufferSize = positiveInteger(config.maxBufferSize, "maxBufferSize", 10000);
   if (flushThreshold > maxBufferSize) {
@@ -115,6 +120,7 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     compressionEnabled: config.compressionEnabled ?? true,
     captureUnhandled: config.captureUnhandled ?? true,
     trackPageViews: config.trackPageViews ?? true,
+    screenNameForPath: config.screenNameForPath,
     networkTracking: config.networkTracking ?? false,
     propagateSessionTo: stringArray(config.propagateSessionTo, "propagateSessionTo") ?? [],
     flushIntervalMs: positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000),
