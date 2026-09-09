@@ -92,6 +92,10 @@ export class Transport {
   private flushing: Promise<void> | null = null;
   private lastUnloadFlushAt = 0;
   private stopped = false;
+  private readonly requests = new Map<AbortController, ReturnType<typeof setTimeout>>();
+  private readonly delays = new Map<ReturnType<typeof setTimeout>, () => void>();
+  /** Persisted events removed for replay, retained until delivery is confirmed. */
+  private readonly replayed = new Set<LogEvent>();
   /**
    * The batch `sendBatch` is currently working through, including the seconds
    * it spends asleep in the retry ladder. It lives here so the unload flush can
@@ -118,6 +122,73 @@ export class Transport {
     this.timer = setInterval(() => {
       void this.flush();
     }, config.flushIntervalMs);
+  }
+
+  /** Stop immediately without flushing, replaying, or deleting persisted data. */
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.timer !== null) clearInterval(this.timer);
+    this.timer = null;
+    this.buffer = [];
+    this.inFlight = null;
+    for (const [controller, timer] of this.requests) {
+      clearTimeout(timer);
+      controller.abort();
+    }
+    this.requests.clear();
+    for (const [timer, resolve] of this.delays) {
+      clearTimeout(timer);
+      resolve();
+    }
+    this.delays.clear();
+    // Restoring a replay already removed from storage preserves consent-era data.
+    // Fresh in-memory telemetry is deliberately discarded.
+    this.restoreReplay();
+  }
+
+  private restoreReplay(): void {
+    if (this.replayed.size === 0) return;
+    const events = [...this.replayed];
+    this.replayed.clear();
+    void this.queue.append(events).catch(() => undefined);
+  }
+
+  private forgetReplay(events: LogEvent[]): void {
+    for (const event of events) this.replayed.delete(event);
+  }
+
+  private request(url: string, init: RequestInit): Promise<Response>;
+  private request<T>(url: string, init: RequestInit, consume: (response: Response) => Promise<T>): Promise<T>;
+  private request<T>(url: string, init: RequestInit, consume?: (response: Response) => Promise<T>): Promise<Response | T> {
+    const controller = new AbortController();
+    if (this.stopped) controller.abort();
+    if (controller.signal.aborted) throw new Error("Pubky Pulse: transport stopped");
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    this.requests.set(controller, timer);
+    try {
+      return fetch(url, { ...init, signal: controller.signal }).then<Response | T>((response) =>
+        consume ? consume(response) : response,
+      ).finally(() => {
+        clearTimeout(timer);
+        this.requests.delete(controller);
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      this.requests.delete(controller);
+      throw error;
+    }
+  }
+
+  private sleep(ms: number): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.delays.delete(timer);
+        resolve();
+      }, ms);
+      this.delays.set(timer, resolve);
+    });
   }
 
   get bufferSize(): number {
@@ -150,6 +221,7 @@ export class Transport {
    * the in-flight pass instead of interleaving batches.
    */
   flush(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
     if (this.flushing) return this.flushing;
     const run = this.runFlush().finally(() => {
       this.flushing = null;
@@ -167,7 +239,7 @@ export class Transport {
     // The flush is a no-op while offline, and the caller drops this instance
     // straight afterwards, so park whatever it could not send.
     const left = this.buffer.splice(0);
-    if (left.length > 0) await this.queue.append(left);
+    if (!this.stopped && left.length > 0) await this.queue.append(left, () => !this.stopped);
     this.stopped = true;
   }
 
@@ -178,6 +250,7 @@ export class Transport {
    * await the cross-tab lock in — so it neither drains it nor rewrites it.
    */
   flushOnUnload(): void {
+    if (this.stopped) return;
     const now = Date.now();
     if (now - this.lastUnloadFlushAt < UNLOAD_DEBOUNCE_MS) return;
     this.lastUnloadFlushAt = now;
@@ -189,6 +262,7 @@ export class Transport {
       // `visibilitychange` reaches this path on a page that stays alive, so
       // park everything rather than firing a request that cannot succeed.
       this.queue.spill(pending);
+      this.forgetReplay(pending);
       this.onDebug?.("offline, skipping keepalive flush");
       return;
     }
@@ -197,17 +271,21 @@ export class Transport {
       // The server asked for a delay and a hidden page is no reason to ignore
       // it. Park everything instead; it goes out on the next flush or load.
       this.queue.spill(pending);
+      this.forgetReplay(pending);
       this.onDebug?.("waiting out Retry-After, skipping keepalive flush");
       return;
     }
 
     const { batch, rest } = sliceForKeepalive(pending, this.config.bundleId);
-    if (rest.length > 0) this.queue.spill(rest);
+    if (rest.length > 0) {
+      this.queue.spill(rest);
+      this.forgetReplay(rest);
+    }
     if (batch.length === 0) return;
 
     const body: IngestRequest = { bundle_id: this.config.bundleId, events: batch };
     try {
-      void fetch(`${this.config.endpoint}/v1/ingest`, {
+      void this.request(`${this.config.endpoint}/v1/ingest`, {
         method: "POST",
         headers: this.jsonHeaders(),
         body: JSON.stringify(body),
@@ -219,19 +297,24 @@ export class Transport {
           // `client_event_id`, and the append lands after `rest` because the
           // events carry a timestamp. A 4xx other than 429 is permanent, so it
           // drops here exactly as it does in `post()`.
-          if (!response.ok && (response.status >= 500 || response.status === 429)) {
+          if (!this.stopped && !response.ok && (response.status >= 500 || response.status === 429)) {
             this.onDebug?.(`keepalive flush failed with ${response.status}`);
-            void this.queue.append(batch);
+            void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch));
+          } else if (!this.stopped) {
+            this.forgetReplay(batch);
           }
         },
         () => {
-          void this.queue.append(batch);
+          if (!this.stopped) void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch));
         },
       );
     } catch (err) {
       // Still inside the unload turn, so this one has to be the sync path.
       this.onDebug?.("keepalive flush failed", err);
-      this.queue.spill(batch);
+      if (!this.stopped) {
+        this.queue.spill(batch);
+        this.forgetReplay(batch);
+      }
     }
   }
 
@@ -280,13 +363,18 @@ export class Transport {
    */
   async submitFeedback(body: FeedbackSubmission): Promise<PulseFeedbackReceipt> {
     let response: Response;
+    let responseBody: unknown;
     try {
-      response = await fetch(`${this.config.endpoint}/v1/feedback`, {
+      ({ response, responseBody } = await this.request(`${this.config.endpoint}/v1/feedback`, {
         method: "POST",
         headers: this.jsonHeaders(),
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      }, async (response) => ({
+        response,
+        responseBody: response.ok
+          ? await response.json().catch(() => undefined)
+          : await response.text().catch(() => ""),
+      })));
     } catch (err) {
       this.onDebug?.("network error during sendFeedback", err);
       const detail = err instanceof Error ? err.message : String(err);
@@ -294,14 +382,14 @@ export class Transport {
     }
 
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
+      const text = responseBody;
       this.onDebug?.(`sendFeedback rejected with ${response.status}`);
       throw new Error(
         `Pubky Pulse: sendFeedback rejected (${response.status})${text ? `: ${text}` : ""}`,
       );
     }
 
-    const payload = (await response.json().catch(() => undefined)) as
+    const payload = responseBody as
       | { id?: unknown; created_at?: unknown }
       | undefined;
     if (!payload || typeof payload.id !== "string") {
@@ -322,18 +410,26 @@ export class Transport {
       return;
     }
 
-    const parked = await this.queue.drain();
+    const parked = await this.queue.drain(() => !this.stopped);
+    for (const event of parked) this.replayed.add(event);
+    if (this.stopped) {
+      this.restoreReplay();
+      return;
+    }
     if (parked.length > 0) this.buffer.unshift(...parked);
 
-    while (this.buffer.length > 0) {
+    while (!this.stopped && this.buffer.length > 0) {
       const batch = this.buffer.splice(0, MAX_BATCH_SIZE);
       const outcome = await this.sendBatch(batch);
+      if (this.stopped) return;
       if (outcome === "park") {
         // The endpoint is unreachable: park this batch and everything behind
         // it rather than burning retries on each remaining batch. An unload
         // flush that already took the batch has parked or sent it itself.
         const rest = this.buffer.splice(0);
-        await this.queue.append(this.inFlightTaken ? rest : [...batch, ...rest]);
+        const toPark = this.inFlightTaken ? rest : [...batch, ...rest];
+        await this.queue.append(toPark, () => !this.stopped);
+        if (!this.stopped) this.forgetReplay(toPark);
         return;
       }
     }
@@ -349,6 +445,9 @@ export class Transport {
     } finally {
       this.inFlight = null;
     }
+    if (outcome !== "park" && !this.stopped) {
+      this.forgetReplay(events);
+    }
     if (outcome === "dropped") {
       this.onDebug?.(`dropping ${events.length} events`);
     }
@@ -361,6 +460,7 @@ export class Transport {
    * with exponential backoff before the caller decides what to do.
    */
   private async post(path: string, payload: unknown, label: string): Promise<BatchOutcome> {
+    if (this.stopped) return "dropped";
     if (!isOnline()) {
       // No attempt can succeed, and the retry ladder would stall the caller
       // for ~31s of backoff; park immediately as the flush paths do.
@@ -380,13 +480,13 @@ export class Transport {
     if (encoded.contentEncoding) headers["Content-Encoding"] = encoded.contentEncoding;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
+      if (this.stopped) return "dropped";
       let retryAfterMs: number | null = null;
       try {
-        const response = await fetch(`${this.config.endpoint}${path}`, {
+        const response = await this.request(`${this.config.endpoint}${path}`, {
           method: "POST",
           headers,
           body: encoded.body as BodyInit,
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
 
         if (response.ok) return "sent";
@@ -407,6 +507,7 @@ export class Transport {
         this.onDebug?.(`network error during ${path}`, err);
       }
 
+      if (this.stopped) return "dropped";
       if (attempt < MAX_RETRIES) {
         // The connection may have dropped mid-ladder: abandon the backoff
         // rather than sleeping through attempts that cannot succeed.
@@ -420,7 +521,7 @@ export class Transport {
         // Cleared on the way out, so the next attempt — and the request
         // succeeding or the ladder ending — leaves nothing behind.
         if (retryAfterMs !== null) this.backoffUntil = Date.now() + delay;
-        await sleep(delay);
+        await this.sleep(delay);
         this.backoffUntil = 0;
       }
     }
@@ -428,10 +529,4 @@ export class Transport {
     this.onDebug?.(`giving up on ${label} after ${MAX_RETRIES + 1} attempts`);
     return "park";
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }

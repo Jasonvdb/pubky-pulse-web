@@ -2,6 +2,7 @@ import { AttachmentUploader } from "./attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "./configuration";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
+import { isIgnoredError } from "./error-filter";
 import { buildEvent, MAX_EVENT_MESSAGE_LENGTH, normalizeAttributes, type EventContext } from "./event-builder";
 import { IdentityManager } from "./identity";
 import { installLifecycle } from "./lifecycle";
@@ -33,13 +34,19 @@ import {
   type LogEvent,
   type PulseAttributes,
   type PulseConfiguration,
+  type PulseCaptureExceptionOptions,
+  type PulseEventHint,
   type PulseFeedbackOptions,
   type PulseFeedbackReceipt,
   type PulseLogLevel,
   type PulseLogOptions,
+  type PulseInitOptions,
+  type PulseInitResult,
 } from "./types";
 
 export { DEFAULT_ENDPOINT } from "./configuration";
+export { createScreenNameMapper } from "./screen-name";
+export type { ScreenNameMapperOptions } from "./screen-name";
 export { PulseOperation } from "./operation";
 export {
   collected,
@@ -75,10 +82,14 @@ export type {
   PulseAttachment,
   PulseAttributes,
   PulseConfiguration,
+  PulseCaptureExceptionOptions,
+  PulseEventHint,
   PulseFeedbackOptions,
   PulseFeedbackReceipt,
   PulseLogLevel,
   PulseLogOptions,
+  PulseInitOptions,
+  PulseInitResult,
 } from "./types";
 
 let config: ValidatedConfig | null = null;
@@ -91,6 +102,13 @@ let unconfiguredWarningShown = false;
 let pageTracker: PageTracker | null = null;
 let attachments: AttachmentUploader | null = null;
 let processingEvent = false;
+let capturingException = false;
+/** Weak references retain no errors; each initialized client has its own lifetime. */
+let capturedErrors = new WeakSet<Error>();
+let initializing = false;
+let quietDisabled = false;
+const retiringTransports = new Set<Transport>();
+const retiringAttachments = new Set<AttachmentUploader>();
 /** Uninstallers for everything `configure()` hooked into the page. */
 const uninstallers: Array<() => void> = [];
 
@@ -135,14 +153,14 @@ function printToConsole(
 }
 
 /** A hook owns its result; keep a detached, valid wire snapshot for delivery. */
-function processEvent(event: LogEvent): LogEvent | null {
+function processEvent(event: LogEvent, hint: PulseEventHint): LogEvent | null {
   if (!config?.beforeSend) return event;
   if (processingEvent) return null;
   processingEvent = true;
   try {
     // The builder shares this array with device metadata, not with the hook.
     if (event.supported_languages) event.supported_languages = [...event.supported_languages];
-    const result = config.beforeSend(event);
+    const result = config.beforeSend(event, hint);
     if (!result || typeof result !== "object" || Array.isArray(result)) return null;
     if ("then" in result) {
       // Accidental async callbacks must not create recursive rejection events.
@@ -206,9 +224,12 @@ function recordEvent(
   attributes?: PulseAttributes,
   options?: PulseLogOptions,
   sessionIdOverride?: string,
+  hint: PulseEventHint = {},
 ): void {
   const sessionId = sessionIdOverride ?? session?.id;
-  if (!config || !identity || !sessionId || !transport) return;
+  if (initializing || !config || !identity || !sessionId || !transport) return;
+
+  if (level === "error" && isIgnoredError(config.ignoreErrors, message, attributes)) return;
 
   const ctx: EventContext = {
     config,
@@ -219,7 +240,7 @@ function recordEvent(
   };
 
   try {
-    const event = processEvent(buildEvent(ctx, level, message, attributes, options?.screenName));
+    const event = processEvent(buildEvent(ctx, level, message, attributes, options?.screenName), hint);
     if (!event) return;
     printToConsole(event.level, event.message, event.custom_attributes);
     transport.enqueue(event);
@@ -227,7 +248,7 @@ function recordEvent(
       attachments?.enqueue(event.client_event_id, event.user_id, options.attachments);
     }
   } catch (err) {
-    debugLog("failed to record event", err);
+    if (!Object.hasOwn(hint, "originalException")) debugLog("failed to record event", err);
   }
 }
 
@@ -236,8 +257,9 @@ function log(
   message: string,
   attributes?: PulseAttributes,
   options?: PulseLogOptions,
+  hint: PulseEventHint = {},
 ): void {
-  if (processingEvent) return;
+  if (processingEvent || initializing || quietDisabled) return;
   if (!config || !session || !transport) {
     if (!unconfiguredWarningShown) {
       unconfiguredWarningShown = true;
@@ -248,7 +270,7 @@ function log(
 
   // Every call counts as activity, and may roll the session over first.
   session.touch();
-  recordEvent(level, message, attributes, options);
+  recordEvent(level, message, attributes, options, undefined, hint);
 }
 
 /** Emits the session lifecycle events as the session manager rolls over. */
@@ -274,8 +296,35 @@ const screenCallbacks: ScreenCallbacks = {
 
 /** Errors nobody caught, tagged with the hook that saw them. */
 function recordUnhandled(value: unknown, kind: UnhandledKind): void {
-  const { message, attributes } = extractErrorAttributes(value);
-  log("error", message, { ...attributes, _unhandled: kind });
+  captureException(value, undefined, undefined, undefined, kind);
+}
+
+/** Shared manual/global capture funnel; policy failures cannot replace the app error. */
+function captureException(
+  value: unknown,
+  userMessage?: string,
+  userAttributes?: PulseAttributes,
+  options?: PulseLogOptions,
+  kind?: UnhandledKind,
+): void {
+  if (capturingException || processingEvent || initializing || quietDisabled || !config || !session || !transport) return;
+  try {
+    if (typeof (globalThis as { window?: unknown }).window === "undefined") return;
+    capturingException = true;
+    if (value instanceof Error) {
+      if (capturedErrors.has(value)) return;
+      // Also remember intentionally ignored errors and failed hooks across paths.
+      capturedErrors.add(value);
+    }
+    const { message, attributes } = extractErrorAttributes(value, userMessage);
+    const merged: PulseAttributes = { ...userAttributes, ...attributes };
+    if (kind) merged._unhandled = kind;
+    log("error", message, merged, options, { originalException: value });
+  } catch {
+    // No diagnostic may expose an exception that capture policy could not sanitize.
+  } finally {
+    capturingException = false;
+  }
 }
 
 function installObservers(validated: ValidatedConfig): void {
@@ -307,6 +356,7 @@ function installObservers(validated: ValidatedConfig): void {
         endpoint: validated.endpoint,
         propagateSessionTo: validated.propagateSessionTo,
         trackRequests: validated.networkTracking,
+        urlMode: validated.networkUrlMode,
         sessionId: () => session?.id ?? undefined,
         onRequest(level, attributes): void {
           log(level, "sdk:network_request", attributes);
@@ -324,8 +374,94 @@ function uninstallObservers(): void {
       debugLog("failed to uninstall a page hook", err);
     }
   }
-  pageTracker?.restore();
+  try {
+    pageTracker?.restore();
+  } catch {
+    // Cleanup is best effort even when a host API has been replaced.
+  }
   pageTracker = null;
+}
+
+/** Drop this pipeline without flushing or clearing any persisted browser data. */
+function disableClient(): void {
+  capturedErrors = new WeakSet<Error>();
+  quietDisabled = true;
+  initializing = false;
+  const previousTransport = transport;
+  const previousAttachments = attachments;
+  config = null;
+  transport = null;
+  attachments = null;
+  identity = null;
+  session = null;
+  offlineQueue = null;
+  deviceInfo = {};
+  previousTransport?.stop();
+  previousAttachments?.stop();
+  for (const previous of retiringTransports) previous.stop();
+  for (const previous of retiringAttachments) previous.stop();
+  uninstallObservers();
+}
+
+async function drainClient(previousTransport: Transport | null, previousAttachments: AttachmentUploader | null): Promise<void> {
+  if (previousTransport) retiringTransports.add(previousTransport);
+  if (previousAttachments) retiringAttachments.add(previousAttachments);
+  try {
+    await previousTransport?.shutdown();
+    await previousAttachments?.flush();
+  } finally {
+    if (previousTransport) retiringTransports.delete(previousTransport);
+    if (previousAttachments) retiringAttachments.delete(previousAttachments);
+  }
+}
+
+function equivalentConfiguration(left: ValidatedConfig, right: ValidatedConfig): boolean {
+  return (Object.keys(left) as Array<keyof ValidatedConfig>).every((key) => {
+    const a = left[key];
+    const b = right[key];
+    return Array.isArray(a) && Array.isArray(b)
+      ? a.length === b.length && a.every((entry, index) => {
+        const other = b[index];
+        return entry instanceof RegExp && other instanceof RegExp
+          ? entry.source === other.source && entry.flags === other.flags
+          : entry === other;
+      })
+      : a === b;
+  });
+}
+
+function initializeClient(validated: ValidatedConfig): void {
+  capturedErrors = new WeakSet<Error>();
+  initializing = true;
+  quietDisabled = false;
+  config = validated;
+  try {
+    deviceInfo = collectDeviceInfo(validated.supportedLanguages);
+    offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message));
+    transport = new Transport(validated, offlineQueue, debugLog);
+    attachments = new AttachmentUploader(validated, debugLog);
+    const clientTransport = transport;
+    identity = new IdentityManager({
+      claim: async (anonymousId, userId) => {
+        await clientTransport.claimIdentity(anonymousId, userId);
+      },
+      onDebug: debugLog,
+    });
+    session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks);
+    // Install reversible collectors before creating identity/session data.
+    installObservers(validated);
+    identity.load();
+    initializing = false;
+    session.start();
+    const screenName = pageTracker?.screenName;
+    if (screenName !== undefined) screenCallbacks.onAppeared(screenName);
+    unconfiguredWarningShown = false;
+  } catch (error) {
+    disableClient();
+    throw error;
+  } finally {
+    initializing = false;
+  }
 }
 
 /**
@@ -353,6 +489,10 @@ function questionnaireContext(): QuestionnaireContext {
 
 export interface PulseApi {
   configure(configuration: PulseConfiguration): void;
+  /** Safe opt-in, first successful configuration wins until disabled or shut down. */
+  init(configuration: PulseInitOptions): PulseInitResult;
+  /** Quiet, browser-only capture accepting every JavaScript thrown value. */
+  captureException(error: unknown, options?: PulseCaptureExceptionOptions): void;
   info(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void;
   debug(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void;
   warn(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void;
@@ -423,45 +563,58 @@ export interface PulseApi {
 }
 
 export const Pulse: PulseApi = {
+  init(configuration: PulseInitOptions): PulseInitResult {
+    const result = (status: PulseInitResult["status"], reason: PulseInitResult["reason"]): PulseInitResult =>
+      Object.freeze({ status, reason });
+    try {
+      if (configuration?.enabled === false) {
+        disableClient();
+        return result("disabled", "disabled");
+      }
+      const apiKey = configuration?.apiKey;
+      if (apiKey === undefined || apiKey === null || (typeof apiKey === "string" && !apiKey.trim())) {
+        disableClient();
+        return result("disabled", "missing-key");
+      }
+      if (typeof (globalThis as { window?: unknown }).window === "undefined") {
+        return result("disabled", "ssr");
+      }
+      let validated: ValidatedConfig;
+      try {
+        if (configuration.enabled !== undefined && typeof configuration.enabled !== "boolean") {
+          return result("error", "invalid-configuration");
+        }
+        validated = validateConfiguration({ ...configuration, apiKey });
+      } catch {
+        return result("error", "invalid-configuration");
+      }
+      if (config) {
+        return result("enabled", equivalentConfiguration(config, validated) ? "unchanged" : "configuration-ignored");
+      }
+      try {
+        initializeClient(validated);
+        return result("enabled", "initialized");
+      } catch {
+        return result("error", "initialization-failed");
+      }
+    } catch {
+      // Even hostile option getters must not break application startup.
+      return result("error", "invalid-configuration");
+    }
+  },
+
   configure(configuration: PulseConfiguration): void {
     const validated = validateConfiguration(configuration);
-
     if (typeof (globalThis as { window?: unknown }).window === "undefined") {
-      if (validated.debug) {
-        console.error("Pubky Pulse: no window available (SSR); configure() did nothing.");
-      }
+      if (validated.debug) console.error("Pubky Pulse: no window available (SSR); configure() did nothing.");
       return;
     }
-
     if (transport) {
-      // Re-configuring replaces the pipeline; drain the old one first.
-      void transport.shutdown();
+      // Legacy configure explicitly replaces and drains the previous pipeline.
+      void drainClient(transport, attachments).catch(() => undefined);
       uninstallObservers();
     }
-
-    config = validated;
-    deviceInfo = collectDeviceInfo(validated.supportedLanguages);
-    offlineQueue = new OfflineQueue(localStore, (message) => {
-      debugLog(message);
-    });
-    transport = new Transport(validated, offlineQueue, debugLog);
-    attachments = new AttachmentUploader(validated, debugLog);
-    unconfiguredWarningShown = false;
-
-    // Identity first: the session events below must carry the right user id.
-    // Its background re-claim needs the transport, which now exists.
-    identity = new IdentityManager({
-      claim: async (anonymousId, userId) => {
-        await transport?.claimIdentity(anonymousId, userId);
-      },
-      onDebug: debugLog,
-    });
-    identity.load();
-
-    session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks);
-    session.start();
-
-    installObservers(validated);
+    initializeClient(validated);
   },
 
   info(message: string, attributes?: PulseAttributes, options?: PulseLogOptions): void {
@@ -482,11 +635,17 @@ export const Pulse: PulseApi = {
       return;
     }
 
-    const userMessage = typeof second === "string" ? second : undefined;
-    const { message, attributes } = extractErrorAttributes(first, userMessage);
-    // SDK-reserved keys win over caller keys so fingerprinting stays stable.
-    const merged: PulseAttributes = { ...(third as PulseAttributes | undefined), ...attributes };
-    log("error", message, merged, fourth as PulseLogOptions | undefined);
+    captureException(first, typeof second === "string" ? second : undefined,
+      third as PulseAttributes | undefined, fourth as PulseLogOptions | undefined);
+  },
+
+  captureException(error: unknown, options?: PulseCaptureExceptionOptions): void {
+    if (capturingException || processingEvent || initializing || quietDisabled || !config || !session || !transport) return;
+    try {
+      captureException(error, options?.message, options?.attributes);
+    } catch {
+      // Caller-owned option getters are untrusted too.
+    }
   },
 
   trackScreen(name: string): void {
@@ -547,9 +706,10 @@ export const Pulse: PulseApi = {
   },
 
   async shutdown(): Promise<void> {
+    capturedErrors = new WeakSet<Error>();
     uninstallObservers();
-    await transport?.shutdown();
-    await attachments?.flush();
+    const previousTransport = transport;
+    const previousAttachments = attachments;
     attachments = null;
     transport = null;
     offlineQueue = null;
@@ -557,6 +717,8 @@ export const Pulse: PulseApi = {
     session = null;
     identity = null;
     deviceInfo = {};
+    quietDisabled = false;
+    await drainClient(previousTransport, previousAttachments);
   },
 
   async sendFeedback(

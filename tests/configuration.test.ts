@@ -208,3 +208,26 @@ describe("isDev default", () => {
     expect(validateConfiguration({ ...base, isDev: false }).isDev).toBe(false);
   });
 });
+
+
+describe("ignoreErrors configuration", () => {
+  it.each([null, "AbortError", {}, [42], [null], Array(1)])("rejects invalid rules %j", (ignoreErrors) => {
+    expect(() => validateConfiguration({ ...base, ignoreErrors: ignoreErrors as Array<string | RegExp> }))
+      .toThrow(/ignoreErrors/);
+  });
+
+  it("detaches the array and regex state from the caller", () => {
+    const regex = /expected/gy;
+    regex.lastIndex = 7;
+    const ignoreErrors = ["AbortError", regex];
+    const validated = validateConfiguration({ ...base, ignoreErrors });
+    ignoreErrors.length = 0;
+    expect(validated.ignoreErrors).toHaveLength(2);
+    const snapshot = validated.ignoreErrors?.[1] as RegExp;
+    expect(snapshot).not.toBe(regex);
+    expect(snapshot.source).toBe(regex.source);
+    expect(snapshot.flags).toBe(regex.flags);
+    expect(snapshot.lastIndex).toBe(0);
+    expect(regex.lastIndex).toBe(7);
+  });
+});

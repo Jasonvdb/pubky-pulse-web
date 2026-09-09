@@ -272,7 +272,7 @@
       <section>
         <h2>Live stream</h2>
         <div class="stream" id="stream" role="log" aria-live="polite">
-          <p>Fill in a key and bundle id, then configure. Events show up here as they are logged.</p>
+          <p>Fill in a key and endpoint, then initialize. Events show up here as they are logged.</p>
         </div>
       </section>
     </main>
@@ -322,18 +322,15 @@
       }
 
       document.getElementById("configure").addEventListener("click", () => {
-        try {
-          Pulse.configure({
-            endpoint: document.getElementById("endpoint").value.trim(),
-            apiKey: document.getElementById("api-key").value.trim(),
-            bundleId: document.getElementById("bundle-id").value.trim() || undefined,
-            appVersion: "0.0.0-playground",
-            debug: true,
-          });
-        } catch (err) {
-          append("error", err instanceof Error ? err.message : String(err));
-          return;
-        }
+        const result = Pulse.init({
+          endpoint: document.getElementById("endpoint").value.trim(),
+          apiKey: document.getElementById("api-key").value.trim(),
+          bundleId: document.getElementById("bundle-id").value.trim() || undefined,
+          appVersion: "0.0.0-playground",
+          debug: true,
+        });
+        append("note", `${result.status}: ${result.reason}`);
+        if (result.status !== "enabled") return;
         started = performance.now();
         for (const button of gated) button.disabled = false;
         append("note", "configured");
@@ -348,7 +345,7 @@
         try {
           throw new Error("Playground failure");
         } catch (err) {
-          Pulse.error(err, "checkout failed", { cart_size: "3" });
+          Pulse.captureException(err);
         }
       });
 

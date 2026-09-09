@@ -14,7 +14,7 @@ import {
   Transport,
 } from "../src/transport";
 import type { IngestRequest, LogEvent, PulseConfiguration } from "../src/types";
-import { resetTestEnvironment, testNavigator } from "./setup";
+import { resetTestEnvironment, testNavigator, TestLockManager } from "./setup";
 
 const BUNDLE_ID = "com.example.web";
 
@@ -179,6 +179,134 @@ describe("Transport", () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it("stops without flushing fresh events or draining existing offline data", async () => {
+    await queue.append([makeEvent(0)]);
+    const tx = createTransport();
+    tx.enqueue(makeEvent(1));
+    tx.stop();
+    await tx.flush();
+    await tx.shutdown();
+    tx.flushOnUnload();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
+    expect(tx.bufferSize).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not mutate a queued replay after stop while waiting for a storage lock", async () => {
+    await queue.append([makeEvent(0)]);
+    testNavigator.locks = new TestLockManager();
+    let release!: () => void;
+    const blocker = testNavigator.locks.request("pulse_offline_queue", () =>
+      new Promise<void>((resolve) => { release = resolve; }));
+    await Promise.resolve();
+    const tx = createTransport();
+    const flushing = tx.flush();
+    tx.stop();
+    release();
+    await blocker;
+    await flushing;
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
+  });
+
+  it("restores unsent replay data while aborting a request and discarding fresh events", async () => {
+    await queue.append([makeEvent(0)]);
+    let signal: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const tx = createTransport();
+    tx.enqueue(makeEvent(1));
+    const flushing = tx.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    tx.stop();
+    await flushing;
+    expect(signal?.aborted).toBe(true);
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a retry delay and does not park fresh telemetry on stop", async () => {
+    fetchMock.mockResolvedValue(new Response("", { status: 503 }));
+    const tx = createTransport();
+    tx.enqueue(makeEvent(0));
+    const flushing = tx.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    tx.stop();
+    await flushing;
+    expect(vi.getTimerCount()).toBe(0);
+    expect(queue.read()).toEqual([]);
+    await tx.claimIdentity("anonymous", "user");
+    await tx.setUserProperties("user", { plan: "pro" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["spill", "keepalive"])("does not restore replay already handed off by unload %s", async (delivery) => {
+    await queue.append([makeEvent(0)]);
+    fetchMock.mockResolvedValueOnce(new Response("", { status: 503 }));
+    const tx = createTransport();
+    const flushing = tx.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    if (delivery === "spill") testNavigator.onLine = false;
+    tx.flushOnUnload();
+    await vi.advanceTimersByTimeAsync(0);
+    tx.stop();
+    await flushing;
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(delivery === "spill" ? ["event-0"] : []);
+  });
+
+  it.each(["timeout", "stop"])("keeps feedback response-body reads abortable until %s", async (ending) => {
+    let signal: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      const response = new Response("", { status: 201 });
+      response.json = () => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("body aborted")));
+      });
+      return Promise.resolve(response);
+    });
+    const tx = createTransport();
+    const submission = tx.submitFeedback({ message: "feedback", sdk_name: "pubky-pulse-web", sdk_version: "test", environment: "web", is_dev: true });
+    const rejected = expect(submission).rejects.toThrow(/malformed response/);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signal?.aborted).toBe(false);
+    if (ending === "stop") tx.stop();
+    else await vi.advanceTimersByTimeAsync(10_000);
+    await rejected;
+    expect(signal?.aborted).toBe(true);
+    tx.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not restore successfully delivered replay events when later disabled", async () => {
+    await queue.append([makeEvent(0)]);
+    const tx = createTransport();
+    await tx.flush();
+    tx.stop();
+    expect(queue.read()).toEqual([]);
+  });
+
+  it("never persists a late keepalive failure after opt-out", async () => {
+    let fail!: (reason: Error) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
+    const tx = createTransport();
+    tx.enqueue(makeEvent(0));
+    tx.flushOnUnload();
+    tx.stop();
+    fail(new Error("late rejection"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.read()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("sends buffered events in batches of twenty", async () => {

@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Pulse } from "../src/index";
-import type { IngestRequest, LogEvent } from "../src/types";
+import type { IngestRequest, LogEvent, PulseEventHint } from "../src/types";
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
 import { STORAGE_PREFIX } from "../src/storage";
 import {
   resetTestEnvironment,
   testDocument,
+  testHistory,
+  testSessionStorage,
   testLocalStorage,
   testLocation,
   testNavigator,
@@ -67,6 +69,325 @@ describe("Pulse", () => {
     vi.restoreAllMocks();
   });
 
+  it.each([{}, { apiKey: "" }, { apiKey: "  \t " }, { ...config, enabled: false }])(
+    "does no tracking or storage work for disabled init %j", async (options) => {
+      vi.useFakeTimers();
+      const localRead = vi.spyOn(testLocalStorage, "getItem");
+      const localWrite = vi.spyOn(testLocalStorage, "setItem");
+      const sessionRead = vi.spyOn(testSessionStorage, "getItem");
+      const sessionWrite = vi.spyOn(testSessionStorage, "setItem");
+      const listener = vi.spyOn(testWindow, "addEventListener");
+      const timer = vi.spyOn(globalThis, "setInterval");
+      const output = vi.spyOn(console, "debug");
+      expect(Pulse.init(options).status).toBe("disabled");
+      Pulse.info("disabled");
+      await Pulse.flush();
+      expect(Pulse.sessionId).toBeUndefined();
+      expect(Pulse.currentUserId).toBeUndefined();
+      for (const spy of [localRead, localWrite, sessionRead, sessionWrite, listener, timer, output, fetchMock]) {
+        expect(spy).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("initializes once, compares normalized arrays, and reports ignored configuration changes", async () => {
+    const hook = (event: LogEvent): LogEvent => event;
+    const options = { ...config, beforeSend: hook, supportedLanguages: ["en"] };
+    expect(Pulse.init(options)).toEqual({ status: "enabled", reason: "initialized" });
+    const sessionId = Pulse.sessionId;
+    const listener = vi.spyOn(testWindow, "addEventListener");
+    const write = vi.spyOn(testSessionStorage, "setItem");
+    expect(Pulse.init({ ...options, supportedLanguages: ["en"] }).reason).toBe("unchanged");
+    expect(Pulse.init({ ...options, appVersion: "next" })).toEqual({ status: "enabled", reason: "configuration-ignored" });
+    expect(listener).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(Pulse.sessionId).toBe(sessionId);
+    Pulse.info("first-config");
+    await Pulse.flush();
+    expect(appEvents()[0]?.app_version).toBeUndefined();
+  });
+
+  it("leaves SSR inert and permits later browser initialization", () => {
+    vi.stubGlobal("window", undefined);
+    expect(Pulse.init(config)).toEqual({ status: "disabled", reason: "ssr" });
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(testLocalStorage.length).toBe(0);
+    vi.stubGlobal("window", testWindow);
+    expect(Pulse.init(config).reason).toBe("initialized");
+  });
+
+  it("reports invalid init options without exposing values or replacing strict configure", () => {
+    expect(Pulse.init({ ...config, endpoint: "private invalid endpoint" })).toEqual({
+      status: "error", reason: "invalid-configuration",
+    });
+    expect(Pulse.init({ ...config, get endpoint(): string { throw new Error("private"); } }).reason)
+      .toBe("invalid-configuration");
+    expect(() => Pulse.configure({ ...config, endpoint: "private invalid endpoint" })).toThrow();
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(testLocalStorage.length).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["visibilitychange", "unhandledrejection"])("rolls back partial %s registration without identity or replay", (failedEvent) => {
+    vi.useFakeTimers();
+    const originalFetch = globalThis.fetch;
+    const originalPush = testHistory.pushState;
+    const target = failedEvent === "visibilitychange" ? testDocument : testWindow;
+    const add = target.addEventListener.bind(target);
+    vi.spyOn(target, "addEventListener").mockImplementation((type, callback, options) => {
+      if (type === failedEvent) throw new Error("blocked listener");
+      add(type, callback, options);
+    });
+    expect(Pulse.init({ ...config, networkTracking: true })).toEqual({ status: "error", reason: "initialization-failed" });
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
+    expect(testLocalStorage.length).toBe(0);
+    expect(testSessionStorage.length).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(globalThis.fetch).toBe(originalFetch);
+    expect(testHistory.pushState).toBe(originalPush);
+    testWindow.dispatchEvent(new Event("pagehide"));
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+    expect(Pulse.init(config).reason).toBe("initialized");
+  });
+
+  it("disables an active client without flushing or deleting browser data and can enable again", async () => {
+    vi.useFakeTimers();
+    Pulse.init({ ...config, networkTracking: true });
+    Pulse.info("discard-me");
+    const saved = testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)]);
+    const sessionId = Pulse.sessionId;
+    const originalPush = testHistory.pushState;
+    expect(Pulse.init({ enabled: false })).toEqual({ status: "disabled", reason: "disabled" });
+    expect(testHistory.pushState).not.toBe(originalPush);
+    expect(globalThis.fetch).toBe(fetchMock);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)])).toEqual(saved);
+    testWindow.dispatchEvent(new Event("pagehide"));
+    await Pulse.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.sessionId).toBe(sessionId);
+    await Pulse.flush();
+    expect(appEvents()).toEqual([]);
+  });
+
+  it("does not let a pending shutdown clear a newly initialized client", async () => {
+    Pulse.init(config);
+    const shuttingDown = Pulse.shutdown();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    await shuttingDown;
+    expect(Pulse.sessionId).toBeDefined();
+    Pulse.info("new-client");
+    await Pulse.flush();
+    expect(appEvents().some((event) => event.message === "new-client")).toBe(true);
+  });
+
+  it("captures nothing and stays quiet before initialization, disabled, and during SSR", async () => {
+    const debug = vi.spyOn(console, "debug").mockImplementation(() => undefined);
+    const errorOutput = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const readStorage = vi.spyOn(testLocalStorage, "getItem");
+    const listen = vi.spyOn(testWindow, "addEventListener");
+    const error = new Error("private");
+    const options = { get message(): string { throw new Error("do not inspect"); } };
+    expect(() => Pulse.captureException(error, options)).not.toThrow();
+    Pulse.init({ enabled: false });
+    Pulse.captureException(error);
+    vi.stubGlobal("window", undefined);
+    Pulse.captureException(error);
+    await Pulse.flush();
+    expect(readStorage).not.toHaveBeenCalled();
+    expect(listen).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(debug).not.toHaveBeenCalled();
+    expect(errorOutput).not.toHaveBeenCalled();
+    vi.stubGlobal("window", testWindow);
+    Pulse.init(config);
+    Pulse.captureException(error);
+    await Pulse.flush();
+    expect(appEvents()).toHaveLength(1);
+  });
+
+  it.each(["error", "unhandledrejection"])("deduplicates factory/boundary capture followed by %s and preserves hints", async (path) => {
+    const seen: Array<[string, PulseEventHint]> = [];
+    Pulse.configure({ ...config, beforeSend(event, hint) { seen.push([event.message, hint]); return event; } });
+    const error = new TypeError("factory failure");
+    Pulse.captureException(error, { attributes: { operation: "load", _error_type: "Spoofed" } });
+    Pulse.captureException(error); // e.g. a React boundary receives the same failure.
+    testWindow.dispatchEvent(Object.assign(new Event(path), path === "error" ? { error } : { reason: error }));
+    Pulse.error(error);
+    Pulse.captureException(new TypeError("factory failure"));
+    await Pulse.flush();
+    expect(appEvents()).toHaveLength(2);
+    expect(appEvents()[0]?.custom_attributes).toMatchObject({ _error_type: "TypeError", operation: "load" });
+    expect(seen.filter(([message]) => message === "factory failure")).toHaveLength(2);
+    expect(seen.find(([message]) => message === "factory failure")?.[1].originalException).toBe(error);
+    expect(seen.filter(([message]) => message.startsWith("sdk:")).every(([, hint]) => Object.keys(hint).length === 0)).toBe(true);
+  });
+
+  it("passes original values on all exception paths and empty hints for plain logs", async () => {
+    const seen: Array<[string, PulseEventHint]> = [];
+    Pulse.configure({ ...config, beforeSend(event, hint) { seen.push([event.message, hint]); return event; } });
+    const manual = new Error("manual");
+    const automatic = new Error("automatic");
+    Pulse.error(manual);
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error: automatic }));
+    Pulse.captureException(undefined);
+    Pulse.captureException("primitive");
+    Pulse.captureException("primitive");
+    Pulse.captureException(42, { message: "number context", attributes: { step: "pay" } });
+    Pulse.error("plain");
+    Pulse.info("info");
+    await Pulse.flush();
+    expect(seen.find(([message]) => message === "manual")?.[1].originalException).toBe(manual);
+    expect(seen.find(([message]) => message === "automatic")?.[1].originalException).toBe(automatic);
+    expect(seen.find(([message]) => message === "undefined")?.[1]).toEqual({ originalException: undefined });
+    expect(seen.filter(([message]) => message === "primitive")).toHaveLength(2);
+    expect(seen.find(([message]) => message === "number context")?.[1].originalException).toBe(42);
+    expect(seen.find(([message]) => message === "plain")?.[1]).toEqual({});
+    expect(seen.find(([message]) => message === "info")?.[1]).toEqual({});
+    expect(appEvents().find((event) => event.message === "number context")?.custom_attributes)
+      .toMatchObject({ _error_type: "number", step: "pay" });
+  });
+
+  it.each(["null", "throw", "invalid", "recursive"])("keeps %s hook-filtered errors suppressed across capture paths", async (mode) => {
+    let calls = 0;
+    Pulse.configure({ ...config, beforeSend(event) {
+      if (event.level !== "error") return event;
+      calls += 1;
+      if (mode === "throw") throw new Error("private hook failure");
+      if (mode === "invalid") return { ...event, message: 42 } as unknown as LogEvent;
+      if (mode === "recursive") Pulse.captureException(new Error("recursive"));
+      return null;
+    } });
+    const error = new Error("filtered");
+    Pulse.captureException(error);
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error }));
+    testWindow.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason: error }));
+    await Pulse.flush();
+    expect(calls).toBe(1);
+    expect(appEvents()).toEqual([]);
+  });
+
+  it("does not retain hints in wire snapshots or offline replay", async () => {
+    const beforeSend = vi.fn((event: LogEvent, hint: PulseEventHint) => {
+      if (hint.originalException) return { ...event, message: "sanitized", hint };
+      return event;
+    });
+    Pulse.configure({ ...config, beforeSend });
+    testNavigator.onLine = false;
+    const error = new Error("private original");
+    Object.assign(error, { context: { private: "never serialize me" } });
+    Pulse.captureException(error);
+    await Pulse.flush();
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const queued = testLocalStorage.keys().filter((key) => key.includes("offline_queue"))
+      .map((key) => testLocalStorage.getItem(key)).join("");
+    expect(queued).toContain("sanitized");
+    // Stacks remain app-redacted as before; hints/unknown fields cannot enter wire data.
+    expect(queued).not.toContain('"hint"');
+    expect(queued).not.toContain("never serialize me");
+    const count = beforeSend.mock.calls.length;
+    testNavigator.onLine = true;
+    await Pulse.flush();
+    expect(beforeSend).toHaveBeenCalledTimes(count);
+    expect(appEvents()[0]).not.toHaveProperty("hint");
+  });
+
+  it("isolates hostile thrown values and metadata without recursive diagnostics", async () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    Pulse.configure({ ...config, debug: true });
+    const error = new Error("private");
+    Object.defineProperty(error, "name", { get() { Pulse.captureException(error); throw new Error("private getter"); } });
+    expect(() => Pulse.captureException(error)).not.toThrow();
+    expect(() => Pulse.error(error)).not.toThrow();
+    expect(() => Pulse.captureException(new Error("metadata"), { attributes: { bad: { toString() { throw new Error("private metadata"); } } } })).not.toThrow();
+    expect(() => Pulse.captureException(new Proxy({}, { getPrototypeOf() { throw new Error("private proxy"); } }))).not.toThrow();
+    Pulse.captureException(new Error("healthy"));
+    await Pulse.flush();
+    expect(appEvents().map((event) => event.message)).toEqual(["healthy"]);
+    expect(output).not.toHaveBeenCalled();
+  });
+
+  it("retains dedupe through repeated init but resets it for a new client lifetime", async () => {
+    const options = { ...config, ignoreErrors: [/ignored/gy] };
+    expect(Pulse.init(options).reason).toBe("initialized");
+    const error = new Error("once per client");
+    Pulse.captureException(error);
+    expect(Pulse.init(options).reason).toBe("unchanged");
+    Pulse.captureException(error);
+    await Pulse.shutdown();
+    Pulse.init(options);
+    Pulse.captureException(error);
+    await Pulse.flush();
+    expect(appEvents()).toHaveLength(2);
+  });
+
+  it.each([false, true])("filters all error paths before loss, hook, console, attachments and offline queue (hook %s)", async (hook) => {
+    const beforeSend = vi.fn((event: LogEvent) => event);
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    Pulse.configure({ ...config, consoleLogging: true, debug: true,
+      ignoreErrors: ["AbortError", "secret-suffix", /Loading chunk \d+ failed/g],
+      beforeSend: hook ? beforeSend : undefined,
+    });
+    const error = new Error("name-only");
+    error.name = "AbortError";
+    Pulse.captureException(error);
+    // A later path stays suppressed even if a caller changes matching fields.
+    error.name = "Error";
+    error.message = "no longer matches";
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error }));
+    testWindow.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason: new Error("Loading chunk 12 failed") }));
+    Pulse.error(new Error("Loading chunk 12 failed"));
+    Pulse.error("Loading chunk 12 failed", undefined, { attachments: [{ data: new Uint8Array([1]) }] });
+    Pulse.captureException(new Error("x".repeat(2500) + "secret-suffix"));
+    Pulse.error("x".repeat(2500) + "secret-suffix");
+    expect(output).not.toHaveBeenCalled();
+    Pulse.info("AbortError");
+    testNavigator.onLine = false;
+    await Pulse.flush();
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const queued = testLocalStorage.keys().filter((key) => key.includes("offline_queue"))
+      .map((key) => testLocalStorage.getItem(key)).join("");
+    expect(queued).not.toContain("Loading chunk");
+    expect(queued).not.toContain("secret-suffix");
+    expect(queued).not.toContain("name-only");
+    expect(beforeSend.mock.calls.every(([event]) => event.level !== "error")).toBe(true);
+    expect(JSON.stringify(output.mock.calls)).not.toMatch(/Loading chunk|secret-suffix|name-only|no longer matches/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    testNavigator.onLine = true;
+    await Pulse.flush();
+    expect(appEvents().map((event) => [event.level, event.message])).toEqual([["info", "AbortError"]]);
+    expect(requestPaths()).toEqual(["/v1/ingest"]);
+  });
+
+  it("keeps capture inert if a configured client is used outside the browser", async () => {
+    Pulse.configure(config);
+    await Pulse.flush();
+    fetchMock.mockClear();
+    vi.stubGlobal("window", undefined);
+    Pulse.captureException(new Error("SSR failure"));
+    await Pulse.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.stubGlobal("window", testWindow);
+  });
+
+  it("returns a safe init diagnostic for invalid ignoreErrors", () => {
+    expect(Pulse.init({ ...config, ignoreErrors: [42] as unknown as string[] }))
+      .toEqual({ status: "error", reason: "invalid-configuration" });
+    expect(testLocalStorage.length).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not apply ignoreErrors to lower-level network events", async () => {
+    Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["sdk:network_request"] });
+    await fetch("https://api.example.com/profile");
+    await Pulse.flush();
+    expect(sentEvents().filter((event) => event.message === "sdk:network_request")).toHaveLength(1);
+  });
+
   it("ignores log calls made before configure", async () => {
     vi.spyOn(console, "debug").mockImplementation(() => undefined);
     Pulse.info("too early");
@@ -116,10 +437,11 @@ describe("Pulse", () => {
       return event;
     });
     Pulse.configure({ ...config, beforeSend, consoleLogging: true });
-    const error = new Error("private@example.com", { cause: new Error("private@example.com") });
-    Pulse.error(error);
-    testWindow.dispatchEvent(Object.assign(new Event("error"), { error }));
-    testWindow.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason: error }));
+    // Independent failures exercise sanitization on each path; same objects dedupe.
+    const error = () => new Error("private@example.com", { cause: new Error("private@example.com") });
+    Pulse.error(error());
+    testWindow.dispatchEvent(Object.assign(new Event("error"), { error: error() }));
+    testWindow.dispatchEvent(Object.assign(new Event("unhandledrejection"), { reason: error() }));
     await Pulse.flush();
     expect(appEvents()).toHaveLength(3);
     expect(JSON.stringify(sentEvents())).not.toContain("private@example.com");

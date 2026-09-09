@@ -29,6 +29,17 @@ export interface PulseLogOptions {
   attachments?: PulseAttachment[];
 }
 
+/** Explicit capture metadata; arbitrary exception properties are never serialized. */
+export interface PulseCaptureExceptionOptions {
+  message?: string;
+  attributes?: PulseAttributes;
+}
+
+/** Capture-only context. Never buffered, persisted, uploaded, or replayed. */
+export interface PulseEventHint {
+  readonly originalException?: unknown;
+}
+
 export interface PulseConfiguration {
   /**
    * Pubky Pulse server endpoint URL. A trailing slash is stripped. Optional:
@@ -73,9 +84,14 @@ export interface PulseConfiguration {
    * Message and attribute strings are complete; length limits apply afterward.
    * Does not process previously queued events or attachment contents.
    */
-  beforeSend?: (event: LogEvent) => LogEvent | null;
+  beforeSend?: (event: LogEvent, hint: PulseEventHint) => LogEvent | null;
+  /**
+   * Drop error-level events matching the complete message or `Type: message`
+   * before beforeSend. Strings match substrings; RegExp state is isolated.
+   */
+  ignoreErrors?: Array<string | RegExp>;
   /** Emit `sdk:network_request` events for `fetch` calls. Default: false. */
-  networkTracking?: boolean;
+  networkTracking?: boolean | { urlMode?: "path" | "origin" };
   /**
    * URL prefixes that receive the `X-Pulse-Session-Id` header. Matching works
    * even when `networkTracking` is false.
@@ -95,6 +111,19 @@ export interface PulseConfiguration {
    * explicitly if you want it reported.
    */
   supportedLanguages?: string[];
+}
+
+/** Safe opt-in initialization; app-owned deployment/test decisions belong in enabled. */
+export interface PulseInitOptions extends Omit<PulseConfiguration, "apiKey"> {
+  apiKey?: string | null;
+  enabled?: boolean;
+}
+
+/** No user values or caught exceptions are exposed in initialization diagnostics. */
+export interface PulseInitResult {
+  readonly status: "enabled" | "disabled" | "error";
+  readonly reason: "initialized" | "unchanged" | "configuration-ignored" | "disabled" |
+    "missing-key" | "ssr" | "invalid-configuration" | "initialization-failed";
 }
 
 export interface LogEvent {

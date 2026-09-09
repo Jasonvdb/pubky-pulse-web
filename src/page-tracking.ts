@@ -59,8 +59,12 @@ function patchHistory(): void {
 function restoreHistory(): void {
   const history = (globalThis as { history?: History }).history;
   if (history && originalPushState && originalReplaceState) {
-    history.pushState = originalPushState;
-    history.replaceState = originalReplaceState;
+    try {
+      if (history.pushState !== originalPushState) history.pushState = originalPushState;
+    } catch { /* A host may have made the method read-only. */ }
+    try {
+      if (history.replaceState !== originalReplaceState) history.replaceState = originalReplaceState;
+    } catch { /* Still release our references to the tracker. */ }
   }
   originalPushState = null;
   originalReplaceState = null;
@@ -123,7 +127,7 @@ export class PageTracker {
   restore(): void {
     const win = (globalThis as { window?: Window }).window;
     if (win && this.popstateHandler) {
-      win.removeEventListener("popstate", this.popstateHandler);
+      try { win.removeEventListener("popstate", this.popstateHandler); } catch { /* Continue restoring history. */ }
     }
     this.popstateHandler = null;
 

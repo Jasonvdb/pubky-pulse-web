@@ -1,3 +1,4 @@
+import { snapshotIgnoreErrors } from "./error-filter";
 import type { PulseConfiguration } from "./types";
 
 const CLIENT_KEY_PREFIX = "pulse_client_";
@@ -23,7 +24,9 @@ export interface ValidatedConfig {
   trackPageViews: boolean;
   screenNameForPath?: (pathname: string) => string;
   beforeSend?: PulseConfiguration["beforeSend"];
+  ignoreErrors?: Array<string | RegExp>;
   networkTracking: boolean;
+  networkUrlMode?: "path" | "origin";
   propagateSessionTo: string[];
   flushIntervalMs: number;
   flushThreshold: number;
@@ -59,7 +62,7 @@ function stringArray(value: unknown, name: string): string[] | undefined {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
     throw new Error(`Pubky Pulse: ${name} must be an array of strings`);
   }
-  return value as string[];
+  return [...value] as string[];
 }
 
 export function validateConfiguration(config: PulseConfiguration): ValidatedConfig {
@@ -107,6 +110,16 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     throw new Error("Pubky Pulse: beforeSend must be a function");
   }
 
+  const network = config.networkTracking;
+  if (network !== undefined && typeof network !== "boolean" &&
+      (!network || typeof network !== "object" || Array.isArray(network))) {
+    throw new Error("Pubky Pulse: networkTracking must be a boolean or options object");
+  }
+  const networkUrlMode = typeof network === "object" ? network.urlMode ?? "path" : "path";
+  if (networkUrlMode !== "path" && networkUrlMode !== "origin") {
+    throw new Error("Pubky Pulse: networkTracking.urlMode must be path or origin");
+  }
+
   const flushThreshold = positiveInteger(config.flushThreshold, "flushThreshold", 20);
   const maxBufferSize = positiveInteger(config.maxBufferSize, "maxBufferSize", 10000);
   if (flushThreshold > maxBufferSize) {
@@ -126,7 +139,9 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     trackPageViews: config.trackPageViews ?? true,
     screenNameForPath: config.screenNameForPath,
     beforeSend: config.beforeSend,
-    networkTracking: config.networkTracking ?? false,
+    ignoreErrors: snapshotIgnoreErrors(config.ignoreErrors),
+    networkTracking: typeof network === "object" ? true : network ?? false,
+    networkUrlMode,
     propagateSessionTo: stringArray(config.propagateSessionTo, "propagateSessionTo") ?? [],
     flushIntervalMs: positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000),
     flushThreshold,

@@ -16,12 +16,14 @@ npm install @synonymdev/pubky-pulse-web
 
 ## Quick start
 
-Configure once, as early in the page's life as you can, then log from anywhere.
+Initialize early, then log from anywhere. `init`, `captureException`, `ignoreErrors`, origin URL
+mode and the route helper are included in this source version; use a package release containing
+these APIs before adopting the examples (they are not in 0.5.1).
 
 ```ts
 import { Pulse } from "@synonymdev/pubky-pulse-web";
 
-Pulse.configure({ apiKey: "pulse_client_…" });
+Pulse.init({ apiKey: "pulse_client_…" });
 
 Pulse.info("signed_up", { plan: "pro" });
 ```
@@ -40,8 +42,37 @@ differs from the app's identifier. For Apple or Android app keys, a supplied ide
 the registered one; an absent identifier is accepted. There is no identifier lookup request during
 configuration.
 
-Calls made before `configure()` are ignored (one console note, then silence), so a stray log during
-startup can never throw.
+### Safe optional initialization
+
+```ts
+const result = Pulse.init({
+  apiKey: import.meta.env.VITE_PULSE_KEY,
+  enabled: import.meta.env.MODE !== "test", // Your deployment/test policy.
+});
+// result.status: "enabled", "disabled", or "error"; result.reason is a safe diagnostic code.
+```
+
+An absent, null, empty or whitespace key, or `enabled: false`, disables tracking. No browser/SSR
+is a safe no-op. Disabled initialization creates no identity/session, reads or writes no storage,
+installs no listeners/timers/fetch wrapper, and neither replays nor sends events. A later valid
+browser `init` still works. `captureException` is a quiet no-op before initialization and while disabled.
+
+The first successful initialization wins. Equivalent normalized options return `unchanged` without
+restarting a session; callback identity matters. Changed valid options return `configuration-ignored`
+and keep the running client. To change options, use `await Pulse.shutdown()` (which drains), then
+`init` again, or disable first when queued events must be discarded.
+
+`Pulse.init({ enabled: false })` stops an active client and discards its pending in-memory telemetry
+without flushing or parking it. It leaves pre-existing browser storage intact; a later enabled
+initialization can replay that old queue. Already transmitted requests cannot be recalled.
+Initialization failures roll back installed collectors and return `error`. Invalid configuration
+returns `invalid-configuration`; a supplied invalid endpoint never falls back to the hosted service.
+An invalid reinitialization preserves an already-running valid client. Diagnostics contain no keys,
+endpoint values or caught exceptions. Inspect the returned status instead of adding try/catch.
+
+Existing `Pulse.configure()` remains the strict API: configuration errors throw, including during
+SSR, and valid repeated calls explicitly replace the configuration. Existing logger calls before
+configuration retain their one-time console note; `captureException` never emits that note.
 
 ## Use it in your environment
 
@@ -51,7 +82,7 @@ startup can never throw.
 <script type="module">
   import { Pulse } from "https://esm.sh/@synonymdev/pubky-pulse-web";
 
-  Pulse.configure({ apiKey: "pulse_client_…" });
+  Pulse.init({ apiKey: "pulse_client_…" });
 
   document.querySelector("#buy").addEventListener("click", () => {
     Pulse.info("buy_clicked");
@@ -65,11 +96,12 @@ build the package with `npm run build`, then serve the repository over HTTP — 
 for `http.server`). The page imports the built SDK as a module, so opening it straight from disk
 over `file://` leaves it dead. Fill in your key and endpoint there and watch the events stream;
 the optional bundle id field is only needed when connecting to an older server, and
-the origin you serve it from is the one that has to be in the server's `CORS_ORIGINS`.
+the origin you serve it from must be in the app's allowed origins.
 
 ### React
 
-No provider and no context — `Pulse` is a module singleton. Configure once in your root component.
+No provider and no context — `Pulse` is a module singleton. Initialize in your root component;
+repeated effects with equivalent options retain the same session.
 
 ```tsx
 import { useEffect } from "react";
@@ -77,7 +109,7 @@ import { Pulse } from "@synonymdev/pubky-pulse-web";
 
 export function App() {
   useEffect(() => {
-    Pulse.configure({
+    Pulse.init({
       apiKey: import.meta.env.VITE_PULSE_KEY,
       appVersion: __APP_VERSION__,
     });
@@ -92,8 +124,8 @@ and call `Pulse.trackScreen(name)` from your route change handler instead.
 
 ### Next.js App Router
 
-`configure()` needs `window`, so it lives in a client component. On the server it is a no-op, which
-means an accidental import from a server component will not crash the render.
+`init()` is safe during SSR and with an absent key. Initialize in a client effect to start
+browser capture; no browser, missing-key or session guard is needed.
 
 ```tsx
 // app/pulse-provider.tsx
@@ -104,8 +136,9 @@ import { Pulse } from "@synonymdev/pubky-pulse-web";
 
 export function PulseProvider({ userId }: { userId?: string }) {
   useEffect(() => {
-    Pulse.configure({
-      apiKey: process.env.NEXT_PUBLIC_PULSE_KEY!,
+    Pulse.init({
+      apiKey: process.env.NEXT_PUBLIC_PULSE_KEY,
+      enabled: process.env.NODE_ENV !== "test",
       propagateSessionTo: ["/api"],
     });
   }, []);
@@ -167,7 +200,7 @@ export async function POST(req: Request) {
   import { PUBLIC_PULSE_KEY } from "$env/static/public";
 
   onMount(() => {
-    Pulse.configure({
+    Pulse.init({
       apiKey: PUBLIC_PULSE_KEY,
     });
 
@@ -192,7 +225,7 @@ export const appConfig: ApplicationConfig = {
       provide: APP_INITIALIZER,
       multi: true,
       useFactory: () => () => {
-        Pulse.configure({
+        Pulse.init({
           apiKey: environment.pulseKey,
           appVersion: environment.version,
         });
@@ -204,8 +237,8 @@ export const appConfig: ApplicationConfig = {
 
 ### Any other framework
 
-There is nothing framework-specific in the package: import `Pulse`, call `configure()` once after
-the page has a `window`, and log from anywhere. That is the whole integration.
+There is nothing framework-specific in the package: import `Pulse`, call `init()` early,
+and log from anywhere. That is the whole integration.
 
 ## Events and levels
 
@@ -236,23 +269,33 @@ With `trackPageViews` on (the default), the SDK patches `pushState`/`replaceStat
 `popstate`, using `location.pathname` as the screen name by default. Hash-only and query-only
 History API changes are ignored.
 
-For routes containing identifiers, supply a synchronous `screenNameForPath` callback during
-initialization. The SDK still observes navigation, so no framework-specific route observer is
-needed:
+For routes containing identifiers, compile explicit app-owned templates into the existing
+`screenNameForPath` hook. Reuse your routing constants for safe static routes:
 
 ```ts
-Pulse.configure({
-  apiKey: "pulse_client_YOUR_KEY",
-  screenNameForPath(pathname) {
-    if (pathname.startsWith("/profile/")) return "profile";
-    if (pathname.startsWith("/post/")) return "post";
-    if (pathname.startsWith("/collections/")) return "collections";
-    if (pathname.startsWith("/invite/")) return "invite";
-    return "other";
-  },
-});
+import { createScreenNameMapper, Pulse } from "@synonymdev/pubky-pulse-web";
+
+const screenNameForPath = createScreenNameMapper([
+  "/", "/home", "/profile/followers", "/profile/[pubky]", "/invite/[inviteCode]",
+], { fallback: "/unknown" });
+
+Pulse.init({ apiKey: "pulse_client_YOUR_KEY", screenNameForPath });
 ```
 
+The helper returns only a literal template or the fallback (default `/unknown`). `/profile/followers`
+beats `/profile/[pubky]`, regardless of list order. Whole-segment `[name]` matches exactly one
+nonempty segment; catch-all, optional and partial-segment syntax are unsupported. More static
+segments win; equally specific overlapping templates throw during helper creation. Duplicate
+identical constants are accepted. Templates and fallback must be safe app-owned labels.
+
+Trailing slashes and query/fragment are excluded. Segments are decoded once for matching, so
+`/profile/%66ollowers` matches the static route. Invalid escapes, encoded separators, dot segments,
+whitespace/control characters, repeated interior slashes, and absolute URLs return the fallback.
+Only configured template text is emitted, never decoded parameter values. Invalid template
+configuration throws. See the [Pubky App migration example](./examples/pubky-app.md) for reuse of
+real route constants and the before/after reduction in integration code.
+
+A custom synchronous `screenNameForPath` callback remains supported without the helper.
 The callback receives only the pathname, without a query string or hash, on initial load and
 `pushState`, `replaceState`, and `popstate` navigation. Its returned name is used for automatic
 screen events, duration attribution, and the default `screen_name` on subsequent events. Moving
@@ -278,15 +321,25 @@ change. Manual names and per-event `screenName` overrides are used directly, wit
 
 ## Errors
 
-Pass the error itself, not just a message, and the SDK extracts the type, the stack and up to five
-levels of `cause` for you:
+`Pulse.captureException(error)` accepts any thrown value and extracts the type, stack and up to
+five levels of `cause`. It is a quiet no-op before initialization, while disabled and during SSR:
 
 ```ts
 try {
   await pay(order);
 } catch (err) {
-  Pulse.error(err, "checkout failed", { order_id: order.id });
+  Pulse.captureException(err);
 }
+```
+
+The optional `PulseCaptureExceptionOptions` argument accepts an explicit replacement message and
+attributes, without automatically serializing arbitrary error properties:
+
+```ts
+Pulse.captureException(err, {
+  message: "checkout failed",
+  attributes: { checkout_stage: "payment" },
+});
 ```
 
 `Pulse.error(message, attributes?)` still works when you have no error object. Uncaught exceptions
@@ -295,21 +348,50 @@ with `_unhandled`, and re-thrown as usual — the SDK never swallows an error.
 
 ## Filtering and sanitizing events
 
-Configure `beforeSend` to apply your application's capture policy to manual logs and automatic
-errors, network requests, screens, sessions, and metrics in one place:
+Configure `ignoreErrors` for shared error patterns and `beforeSend(event, hint)` for your
+application's redaction and metadata policy:
 
 ```ts
-Pulse.configure({
+import { IGNORED_BROWSER_ERRORS } from "./observability-policy";
+
+Pulse.init({
   apiKey: "pulse_client_…",
-  beforeSend(event) {
-    if (event.message === "ResizeObserver loop limit exceeded") return null;
-    if (event.custom_attributes?._http_url) {
-      event.custom_attributes._http_url = new URL(event.custom_attributes._http_url).origin;
+  ignoreErrors: IGNORED_BROWSER_ERRORS, // The same app-owned list can be passed to Sentry.
+  networkTracking: { urlMode: "origin" },
+  beforeSend(event, hint) {
+    const original = hint.originalException;
+    if (original instanceof AppError) {
+      if (shouldDropAppError(original)) return null;
+      event.custom_attributes = {
+        ...event.custom_attributes,
+        app_error_code: original.code, // Explicit allowlist; never spread the Error/context.
+      };
     }
+    event.message = redact(event.message);
+    event.custom_attributes = redactAttributes(event.custom_attributes);
     return event;
   },
 });
 ```
+
+`AppError`, the drop policy, redaction functions and the ignore list are app-owned; the SDK
+contains no Pubky App-specific exclusions. String rules use substring matching against the complete
+message and `Type: message`; regular expressions test both. Global/sticky expressions are reset
+for each match without changing the caller's `lastIndex`. This documents matching semantics only,
+not full Sentry compatibility. Invalid rules fail configuration validation.
+
+Ignored error captures and error-level logger calls are filtered before the hook, truncation,
+console, buffering, persistence and attachment scheduling. Lower-level events remain unaffected;
+error-level network and metric events are also filtered when their messages match. For Error
+instances, duplicate suppression runs before filtering: the same
+Error object is attempted at most once per configured client lifetime, even when a hook drops it
+or throws. A WeakSet does not retain objects; a new configuration clears it. Distinct Error objects
+with the same message and repeated primitive throws remain reportable.
+
+Hints provide the original thrown value for exception capture and automatic error paths. Plain
+logger and SDK events receive an empty hint. The SDK uses hints only during the synchronous hook:
+they are not part of the event, persisted, uploaded, buffered or retained for replay. Do not copy
+`hint.originalException` into the event. One-argument hooks remain compatible.
 
 The synchronous callback receives the fully enriched `LogEvent`. Return the mutated event or a
 replacement with valid required fields; return `null` to drop it and its attachment uploads.
@@ -319,13 +401,13 @@ message and attribute length limits apply only after it returns. Hook exceptions
 async callbacks drop silently; recursive Pulse logging from inside the callback is ignored.
 Without the hook, capture behaves as before.
 
-The hook runs once when an event is captured, including lifecycle events emitted by `configure()`.
+The hook runs once when an event is captured, including lifecycle events emitted during initialization.
 Retries and previously queued events are not processed again, so installing a new hook does not
 sanitize an old offline queue. Use the returned event's IDs consistently if changing them: attachment
 reservations use its `client_event_id` and `user_id`. Attachment contents and filenames, identity and
 user-property requests, feedback bodies, and questionnaire answers do not pass through this hook.
 The feedback audit log does. Redaction rules for messages and attributes belong to the application;
-the example above only demonstrates error filtering and URL reduction.
+the example above demonstrates explicit error policy and metadata selection.
 
 ## Metrics and operations
 
@@ -524,16 +606,25 @@ are skipped with a debug note; the event still goes out. `Pulse.flush()` waits f
 ## Network tracking
 
 ```ts
-Pulse.configure({
+Pulse.init({
   // …
-  networkTracking: true,
+  networkTracking: { urlMode: "origin" },
   propagateSessionTo: ["https://api.example.com"],
 });
 ```
 
-`networkTracking` wraps the global `fetch` and logs an `sdk:network_request` event per call with the
-method, the URL (query string stripped), the status and the duration — debug for 2xx/3xx, warn for
-anything else, error when the request throws. Requests to your Pulse endpoint are skipped.
+`networkTracking` defaults to `false`. `true` or `{ urlMode: "path" }` retains the existing
+behavior: credentials, query and fragment are stripped but paths remain. `{ urlMode: "origin" }`
+keeps only protocol, hostname and port for HTTP(S), resolving relative URLs against the page.
+Malformed or non-HTTP(S) URLs omit `_http_url`; the raw value is never used as an origin fallback.
+The mode applies before `beforeSend`, buffering, console or offline persistence, including failures.
+
+The `sdk:network_request` event retains method, status and duration: debug for 2xx/3xx, warn for
+other responses and error with status `0` on rejection. SDK endpoint requests remain excluded.
+The application's request URL, body and headers are unchanged except for explicitly requested
+session propagation; response and rejection values retain their identity and normal fetch behavior.
+Origin hostnames may themselves contain identifiers. This is not a general PII guarantee: app
+redaction may still be needed. Removing paths also groups network issues more broadly by host/method.
 
 Only requests made through the global `fetch` are wrapped. `XMLHttpRequest`, `navigator.sendBeacon`
 and libraries that use their own XHR adapter (axios in its default browser build, say) are invisible
@@ -575,7 +666,8 @@ was both parked and sent is counted once.
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `endpoint` | `string` | `https://ingest.pubkypulse.com` | Pubky's hosted ingest host; a trailing slash is stripped. Self-hosters must set their own server URL explicitly. |
-| `apiKey` | `string` | — | **Required.** Client key, must start with `pulse_client_`. |
+| `apiKey` | `string` | — | Client key with `pulse_client_` prefix. Required by `configure`; absent/null/blank disables `init`. |
+| `enabled` | `boolean` | `true` | `init` only: false stops tracking without flushing new telemetry. |
 | `bundleId` | `string` | Not sent | Optional legacy identifier for older servers. Updated servers identify the app from the client key alone. |
 | `appVersion` | `string` | — | Version reported with every event. |
 | `isDev` | `boolean` | `true` on `localhost`, `127.0.0.1` or `file:` | Marks events as development traffic. |
@@ -585,8 +677,9 @@ was both parked and sent is counted once.
 | `captureUnhandled` | `boolean` | `true` | Capture uncaught errors and unhandled rejections. |
 | `trackPageViews` | `boolean` | `true` | Emit screen events for History API navigations. |
 | `screenNameForPath` | `(pathname: string) => string` | Raw pathname | Map automatic screen names; a thrown error or blank/non-string result ends the previous screen and clears default attribution. |
-| `beforeSend` | `(event: LogEvent) => LogEvent \| null` | Not set | Transform or drop enriched events before output, buffering, and attachment scheduling. Synchronous only; failures drop silently. |
-| `networkTracking` | `boolean` | `false` | Emit an event per `fetch` call. |
+| `ignoreErrors` | `(string \| RegExp)[]` | `[]` | Filter exception/error logger messages before hooks and output. |
+| `beforeSend` | `(event: LogEvent, hint: PulseEventHint) => LogEvent \| null` | Not set | Transform or drop enriched events before output, buffering, and attachment scheduling. Synchronous only; failures drop silently. |
+| `networkTracking` | `boolean \| { urlMode?: "path" \| "origin" }` | `false` | Emit an event per `fetch`; true and an empty object preserve sanitized paths. |
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |
 | `flushThreshold` | `number` | `20` | Buffered events that trigger an immediate flush. |
@@ -595,14 +688,14 @@ was both parked and sent is counted once.
 | `supportedLanguages` | `string[]` | not sent | The locales your app ships. Written through to the app record on the server and used for localization-gap analysis. Set it explicitly; the SDK never derives it from the browser. |
 
 Invalid values throw at `configure()` time with a `Pubky Pulse: …` message, so a typo surfaces on
-the first page load rather than silently dropping your data.
+the first page load. `init()` catches these failures and returns a diagnostic status instead.
 
 ## Server setup
 
 1. In your Pulse dashboard, create an app with platform `web`. Its client key identifies the app;
    you do not need to copy an app identifier into the SDK configuration.
-2. Add the site's origin to the server's `CORS_ORIGINS`, including the port you use in development
-   (`http://localhost:5173`, say). Without it the browser blocks every request.
+2. Add the site's origin to the app's allowed origins in the dashboard, including the development
+   port (`http://localhost:5173`, say). `CORS_ORIGINS` configures the dashboard itself.
 3. Copy the app's client key. It starts with `pulse_client_`, is meant to ship in your bundle and is
    public: it is ingest-scoped, so it can write events, feedback and user data for this one app and
    read that app's questionnaire specs, and it cannot read back events, metrics or project data.
@@ -621,7 +714,8 @@ Three features degrade rather than break:
   unlocked, which is what every earlier version did: correct in one tab, and able to lose parked
   events only when two tabs happen to flush at the same instant.
 
-The package is safe to import on the server. `configure()` validates its configuration first, then
+The package is safe to import on the server. `init()` returns a disabled SSR result before
+validation or side effects; `captureException()` is quiet there. `configure()` validates its configuration first, then
 checks for `window` and, when there is none, returns without installing anything — so a Next.js or
 SvelteKit server render with a valid configuration does no work. An invalid configuration still
 throws during a server render, exactly as it would in the browser. Log calls made before a successful

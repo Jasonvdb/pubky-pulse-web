@@ -82,15 +82,44 @@ export class AttachmentUploader {
   private readonly onDebug: ((message: string, detail?: unknown) => void) | undefined;
   private pending: PendingUpload[] = [];
   private draining: Promise<void> | null = null;
+  private stopped = false;
+  private readonly requests = new Map<AbortController, ReturnType<typeof setTimeout>>();
 
   constructor(config: ValidatedConfig, onDebug?: (message: string, detail?: unknown) => void) {
     this.config = config;
     this.onDebug = onDebug;
   }
 
+  /** Discard pending uploads and abort active requests when consent is withdrawn. */
+  stop(): void {
+    this.stopped = true;
+    this.pending = [];
+    for (const [controller, timer] of this.requests) {
+      clearTimeout(timer);
+      controller.abort();
+    }
+    this.requests.clear();
+  }
+
+  private request(url: string, init: RequestInit, timeoutMs: number): Promise<Response>;
+  private request<T>(url: string, init: RequestInit, timeoutMs: number, consume: (response: Response) => Promise<T>): Promise<T>;
+  private async request<T>(url: string, init: RequestInit, timeoutMs: number, consume?: (response: Response) => Promise<T>): Promise<Response | T> {
+    if (this.stopped) throw new Error("Pubky Pulse: attachment uploader stopped");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    this.requests.set(controller, timer);
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      return consume ? await consume(response) : response;
+    } finally {
+      clearTimeout(timer);
+      this.requests.delete(controller);
+    }
+  }
+
   /** Queue every attachment of one event. Returns immediately. */
   enqueue(clientEventId: string, userId: string | undefined, attachments: PulseAttachment[]): void {
-    if (attachments.length === 0) return;
+    if (this.stopped || attachments.length === 0) return;
 
     if (!subtleCrypto()) {
       this.onDebug?.("crypto.subtle is unavailable (insecure context); skipping attachments");
@@ -113,7 +142,7 @@ export class AttachmentUploader {
   private async drain(): Promise<void> {
     try {
       let next = this.pending.shift();
-      while (next) {
+      while (!this.stopped && next) {
         try {
           await this.uploadOne(next);
         } catch (err) {
@@ -160,7 +189,9 @@ export class AttachmentUploader {
     }
 
     const bytes = blob ? new Uint8Array(await blob.arrayBuffer()) : (source as Uint8Array);
+    if (this.stopped) return;
     const sha256 = await sha256Hex(bytes, subtle);
+    if (this.stopped) return;
     const reserved = await this.reserve({
       clientEventId: item.clientEventId,
       userId: item.userId,
@@ -169,7 +200,7 @@ export class AttachmentUploader {
       sizeBytes,
       sha256,
     });
-    if (!reserved) return;
+    if (this.stopped || !reserved) return;
 
     // The Blob itself is the body: the browser streams it instead of copying
     // the hashed buffer into the request, which can then be collected.
@@ -195,20 +226,21 @@ export class AttachmentUploader {
     if (args.userId) payload.user_id = args.userId;
 
     try {
-      const response = await fetch(`${this.config.endpoint}/v1/ingest/attachment`, {
+      const { response, body } = await this.request(`${this.config.endpoint}/v1/ingest/attachment`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      }, REQUEST_TIMEOUT_MS, async (response) => ({
+        response,
+        body: response.ok ? await response.json() as ReserveResponse : null,
+      }));
       if (!response.ok) {
         this.onDebug?.(`attachment reserve for "${args.filename}" failed (${response.status})`);
         return null;
       }
-      const body = (await response.json()) as ReserveResponse;
       if (!body || typeof body.upload_url !== "string") {
         this.onDebug?.(`attachment reserve for "${args.filename}" returned no upload url`);
         return null;
@@ -227,15 +259,14 @@ export class AttachmentUploader {
     name: string,
   ): Promise<void> {
     try {
-      const response = await fetch(url, {
+      const response = await this.request(url, {
         method: "PUT",
         headers: {
           "Content-Type": "application/octet-stream",
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: body as unknown as BodyInit,
-        signal: AbortSignal.timeout(uploadTimeoutMs(sizeBytes)),
-      });
+      }, uploadTimeoutMs(sizeBytes));
       if (!response.ok) {
         this.onDebug?.(`attachment upload "${name}" failed (${response.status})`);
       }
