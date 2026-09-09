@@ -48,11 +48,17 @@ export function installLifecycle(callbacks: LifecycleCallbacks): () => void {
     callbacks.onVisible();
   };
 
-  win.addEventListener("pagehide", onPageHide);
-  doc?.addEventListener("visibilitychange", onVisibilityChange);
-
-  return () => {
-    win.removeEventListener("pagehide", onPageHide);
-    doc?.removeEventListener("visibilitychange", onVisibilityChange);
+  const uninstall = (): void => {
+    try { win.removeEventListener("pagehide", onPageHide); } finally {
+      doc?.removeEventListener("visibilitychange", onVisibilityChange);
+    }
   };
+  try {
+    win.addEventListener("pagehide", onPageHide);
+    doc?.addEventListener("visibilitychange", onVisibilityChange);
+  } catch (error) {
+    try { uninstall(); } catch { /* Preserve the setup failure. */ }
+    throw error;
+  }
+  return uninstall;
 }

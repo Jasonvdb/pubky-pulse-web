@@ -38,11 +38,17 @@ export function installUnhandledCapture(onUnhandled: UnhandledHandler): () => vo
     report(value, "unhandled_rejection");
   };
 
-  win.addEventListener("error", onError);
-  win.addEventListener("unhandledrejection", onRejection);
-
-  return () => {
-    win.removeEventListener("error", onError);
-    win.removeEventListener("unhandledrejection", onRejection);
+  const uninstall = (): void => {
+    try { win.removeEventListener("error", onError); } finally {
+      win.removeEventListener("unhandledrejection", onRejection);
+    }
   };
+  try {
+    win.addEventListener("error", onError);
+    win.addEventListener("unhandledrejection", onRejection);
+  } catch (error) {
+    try { uninstall(); } catch { /* Preserve the setup failure. */ }
+    throw error;
+  }
+  return uninstall;
 }

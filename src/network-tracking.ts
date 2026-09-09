@@ -11,6 +11,8 @@ export interface NetworkTrackingOptions {
   propagateSessionTo: string[];
   /** Emit `sdk:network_request` events. False when only propagation is wanted. */
   trackRequests: boolean;
+  /** URL privacy policy. The default preserves sanitized paths. */
+  urlMode?: "path" | "origin";
   /** Current session id, or undefined before the session starts. */
   sessionId(): string | undefined;
   /** Called once per tracked request with the level and reserved attributes. */
@@ -21,9 +23,12 @@ function isRequest(input: unknown): input is Request {
   return typeof Request !== "undefined" && input instanceof Request;
 }
 
-function requestUrl(input: RequestInfo | URL): string {
+function requestUrl(input: RequestInfo | URL): string | undefined {
+  if (typeof input === "string") return input;
   if (isRequest(input)) return input.url;
-  return String(input);
+  if (input instanceof URL) return input.href;
+  // Do not coerce arbitrary inputs a second time: fetch owns their semantics.
+  return undefined;
 }
 
 function requestMethod(input: RequestInfo | URL, init?: RequestInit): string {
@@ -74,14 +79,17 @@ function matchesPrefix(raw: string, absolute: string | undefined, prefixes: stri
  * Userinfo is stripped alongside the query: `https://user:token@host/path`
  * would otherwise ship the embedded credentials to the ingest endpoint.
  */
-function sanitizeUrl(raw: string, absolute: string | undefined): string {
+function sanitizeUrl(raw: string, absolute: string | undefined, mode: "path" | "origin"): string | undefined {
   try {
     const parsed = new URL(absolute ?? raw);
+    if (mode === "origin") {
+      return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.origin : undefined;
+    }
     parsed.username = "";
     parsed.password = "";
     return stripQuery(parsed.href);
   } catch {
-    return stripQuery(absolute ?? raw);
+    return mode === "origin" ? undefined : stripQuery(absolute ?? raw);
   }
 }
 
@@ -100,57 +108,76 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
   const original = target.fetch;
   if (typeof original !== "function") return () => undefined;
 
-  const call = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
-    Reflect.apply(original, target, [input, init]) as Promise<Response>;
+  let active = true;
+  const wrapped = function (this: unknown, ...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
+    const [input, init] = args;
+    let nextArgs = args;
+    let attributes: Record<string, string> | undefined;
+    let startedAt = 0;
 
-  const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const raw = requestUrl(input);
-    const absolute = absoluteUrl(raw);
-
-    if (matchesPrefix(raw, absolute, [options.endpoint])) return call(input, init);
-
-    let nextInit = init;
-    if (matchesPrefix(raw, absolute, options.propagateSessionTo)) {
-      const sessionId = options.sessionId();
-      if (sessionId) {
-        // Passing the Request through as `input` keeps its method and body;
-        // only the headers are replaced.
-        const headers = new Headers(init?.headers ?? (isRequest(input) ? input.headers : undefined));
-        headers.set(SESSION_HEADER, sessionId);
-        nextInit = { ...init, headers };
-      }
-    }
-
-    if (!options.trackRequests) return call(input, nextInit);
-
-    const method = requestMethod(input, init);
-    const url = sanitizeUrl(raw, absolute);
-    const startedAt = nowMs();
-
+    // Instrumentation failures must not prevent the original request.
     try {
-      const response = await call(input, nextInit);
-      options.onRequest(levelForStatus(response.status), {
-        _http_method: method,
-        _http_url: url,
-        _http_status: String(response.status),
-        _http_duration_ms: String(Math.round(nowMs() - startedAt)),
-      });
-      return response;
-    } catch (err) {
-      options.onRequest("error", {
-        _http_method: method,
-        _http_url: url,
-        _http_status: "0",
-        _http_duration_ms: String(Math.round(nowMs() - startedAt)),
-      });
-      // The caller still owns this failure.
-      throw err;
+      const raw = requestUrl(input);
+      const absolute = raw === undefined ? undefined : absoluteUrl(raw);
+      const excluded = raw !== undefined && matchesPrefix(raw, absolute, [options.endpoint]);
+      if (active && !excluded) {
+        if (raw !== undefined && matchesPrefix(raw, absolute, options.propagateSessionTo)) {
+          const sessionId = options.sessionId();
+          if (sessionId) {
+            const headers = new Headers(init?.headers ?? (isRequest(input) ? input.headers : undefined));
+            headers.set(SESSION_HEADER, sessionId);
+            nextArgs = [...args];
+            nextArgs[1] = { ...init, headers };
+          }
+        }
+        if (options.trackRequests) {
+          const url = raw === undefined ? undefined : sanitizeUrl(raw, absolute, options.urlMode ?? "path");
+          attributes = { _http_method: requestMethod(input, init) };
+          if (url !== undefined) attributes._http_url = url;
+          startedAt = nowMs();
+        }
+      }
+    } catch {
+      // The platform remains responsible for rejecting invalid request inputs.
     }
+
+    const report = (status: number): void => {
+      if (!active || !attributes) return;
+      try {
+        options.onRequest(status === 0 ? "error" : levelForStatus(status), {
+          ...attributes,
+          _http_status: String(status),
+          _http_duration_ms: String(Math.round(nowMs() - startedAt)),
+        });
+      } catch {
+        // Neither collector nor application hook failures may replace fetch results.
+      }
+    };
+
+    let result: ReturnType<typeof fetch>;
+    try {
+      result = Reflect.apply(original, this, nextArgs) as ReturnType<typeof fetch>;
+    } catch (error) {
+      report(0);
+      throw error;
+    }
+    if (!attributes) return result;
+    // Return the observed promise so an unhandled rejection still reaches the
+    // application's global handler. Observing and returning the original promise
+    // would mark that original rejection handled, silently suppressing it.
+    return result.then((response) => {
+      report(response.status);
+      return response;
+    }, (error: unknown) => {
+      report(0);
+      throw error;
+    });
   };
 
   target.fetch = wrapped as typeof fetch;
 
   return () => {
+    active = false;
     if (target.fetch === (wrapped as typeof fetch)) target.fetch = original;
   };
 }

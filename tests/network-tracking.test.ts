@@ -217,4 +217,115 @@ describe("installNetworkTracking", () => {
     expect(stripQuery("https://a.example/b?c=1#d")).toBe("https://a.example/b");
     expect(stripQuery("https://a.example/b")).toBe("https://a.example/b");
   });
+  it.each([
+    ["https://user:password@api.example.com:8443/invite/secret?token=secret#fragment", "https://api.example.com:8443"],
+    ["http://api.example.com:8080/profile/secret", "http://api.example.com:8080"],
+    ["/api/private?token=secret#fragment", "https://app.example.com"],
+    ["relative/private?secret", "https://app.example.com"],
+    ["//api.example.com/private", "https://api.example.com"],
+    ["https://[bad/private?secret", undefined],
+    ["data:text/plain,secret", undefined],
+    ["file:///private/secret", undefined],
+    ["blob:https://api.example.com/private", undefined],
+    ["javascript:secret", undefined],
+  ])("reports only an HTTP(S) origin for %s", async (url, expected) => {
+    install({ urlMode: "origin" });
+    await fetch(url);
+    expect(requests[0]![1]._http_url).toBe(expected);
+    expect(requests[0]![1]._http_method).toBe("GET");
+    expect(requests[0]![1]._http_status).toBe("200");
+    expect(requests[0]![1]._http_duration_ms).toMatch(/^\d+$/);
+    if (expected === undefined) expect(requests[0]![1]).not.toHaveProperty("_http_url");
+    expect(JSON.stringify(requests)).not.toContain("secret");
+  });
+
+  it("sanitizes failed requests before delivering their metadata", async () => {
+    const failure = new TypeError("private rejection");
+    fetchMock.mockRejectedValue(failure);
+    install({ urlMode: "origin" });
+    await expect(fetch("https://user:password@api.example.com/invite/secret?token=secret")).rejects.toBe(failure);
+    expect(requests[0]![1]._http_url).toBe("https://api.example.com");
+    expect(requests[0]![1]._http_status).toBe("0");
+    expect(JSON.stringify(requests)).not.toContain("secret");
+  });
+
+  it("preserves fetch receiver, argument count and request/response identity", async () => {
+    const response = new Response("response body");
+    const promise = Promise.resolve(response);
+    fetchMock.mockReturnValue(promise);
+    install({ urlMode: "origin" });
+    const receiver = { marker: true };
+    const request = new Request("https://api.example.com/private", { method: "POST", body: "private body" });
+    const headers = new Headers({ Authorization: "app-secret" });
+    const init = { headers, body: "unchanged body", method: "PUT" };
+    const result = Reflect.apply(fetch, receiver, [request, init]);
+    expect(await result).toBe(response);
+    expect(fetchMock.mock.contexts[0]).toBe(receiver);
+    expect(fetchMock.mock.calls[0]).toEqual([request, init]);
+    expect(fetchMock.mock.calls[0]![0]).toBe(request);
+    expect(fetchMock.mock.calls[0]![1]).toBe(init);
+    expect(init.headers.get("Authorization")).toBe("app-secret");
+    expect(request.bodyUsed).toBe(false);
+    expect(await response.text()).toBe("response body");
+    await fetch(new URL("https://api.example.com/private"));
+    expect(fetchMock.mock.calls[1]).toHaveLength(1);
+    await fetch("/api/private", undefined);
+    expect(fetchMock.mock.calls[2]).toHaveLength(2);
+    expect(requests[0]![1]._http_method).toBe("PUT");
+  });
+
+  it("does not change response or rejection when the telemetry callback throws", async () => {
+    const failure = new TypeError("application failure");
+    const response = new Response("ok");
+    fetchMock.mockResolvedValueOnce(response).mockRejectedValueOnce(failure);
+    install({ urlMode: "origin", onRequest: () => { throw new Error("collector failure"); } });
+    expect(await fetch("/private")).toBe(response);
+    await expect(fetch("/private")).rejects.toBe(failure);
+  });
+
+  it("preserves synchronous fetch failures", () => {
+    const failure = new TypeError("bad receiver");
+    fetchMock.mockImplementation(() => { throw failure; });
+    install({ urlMode: "origin" });
+    expect(() => fetch("/private")).toThrow(failure);
+    expect(requests[0]![1]._http_status).toBe("0");
+  });
+
+  it("omits unresolved relative origins and avoids extra coercion of unusual inputs", async () => {
+    vi.stubGlobal("location", undefined);
+    install({ urlMode: "origin" });
+    await fetch("/private");
+    expect(requests[0]![1]).not.toHaveProperty("_http_url");
+    const input = { toString: vi.fn(() => "/private") };
+    await fetch(input as unknown as RequestInfo);
+    expect(input.toString).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[1]![0]).toBe(input);
+    expect(requests[1]![1]).not.toHaveProperty("_http_url");
+  });
+
+  it("preserves ingest exclusion and opt-in propagation in origin mode", async () => {
+    install({ urlMode: "origin", propagateSessionTo: [ENDPOINT, "/api"] });
+    await fetch(`${ENDPOINT}/v1/ingest`);
+    await fetch("/api/private", { headers: { Authorization: "app-secret" } });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]![1]._http_url).toBe("https://app.example.com");
+    expect(sentHeaders(0).has(SESSION_HEADER)).toBe(false);
+    expect(sentHeaders(1).get(SESSION_HEADER)).toBe("session-1");
+    expect(sentHeaders(1).get("Authorization")).toBe("app-secret");
+  });
+
+  it("does not report in-flight requests or annotate retained wrappers after uninstall", async () => {
+    let resolve!: (response: Response) => void;
+    fetchMock.mockReturnValue(new Promise<Response>((done) => { resolve = done; }));
+    install({ urlMode: "origin", propagateSessionTo: ["/api"] });
+    const retained = fetch;
+    const pending = fetch("/api/private");
+    uninstall();
+    resolve(new Response("ok"));
+    await pending;
+    await retained("/api/other");
+    expect(requests).toEqual([]);
+    expect(sentHeaders(1).has(SESSION_HEADER)).toBe(false);
+  });
+
 });

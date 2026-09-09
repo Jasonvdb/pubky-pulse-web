@@ -69,16 +69,17 @@ export class OfflineQueue {
   }
 
   /** Park `events` behind whatever is already queued. */
-  async append(events: LogEvent[]): Promise<void> {
+  async append(events: LogEvent[], isActive: () => boolean = () => true): Promise<void> {
     if (events.length === 0) return;
     await this.withLock(() => {
-      this.store(QUEUE_KEY, [...this.readKey(QUEUE_KEY), ...events]);
+      if (isActive()) this.store(QUEUE_KEY, [...this.readKey(QUEUE_KEY), ...events]);
     });
   }
 
   /** Read every parked event and clear the queue in one step. */
-  async drain(): Promise<LogEvent[]> {
+  async drain(isActive: () => boolean = () => true): Promise<LogEvent[]> {
     return this.withLock(() => {
+      if (!isActive()) return [];
       const events = this.readKey(QUEUE_KEY);
       if (events.length > 0) this.storage.remove(QUEUE_KEY);
       for (const key of this.spillKeys()) {

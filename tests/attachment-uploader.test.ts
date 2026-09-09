@@ -85,19 +85,85 @@ describe("AttachmentUploader", () => {
     vi.unstubAllGlobals();
   });
 
-  it("aborts a stalled reserve at the ingest budget and the put on a size-scaled one", async () => {
-    const timeout = vi.spyOn(AbortSignal, "timeout");
+  it.each(["reserve", "put"])("aborts a stalled %s request at its timeout", async (stage) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", { subtle: { digest: async () => new ArrayBuffer(32) } });
     const uploader = new AttachmentUploader(makeConfig(), debug);
     const bytes = new Uint8Array(3 * 1024 * 1024);
-
+    let signal: AbortSignal | undefined;
+    fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      if (stage === "put" && url.endsWith("/v1/ingest/attachment")) {
+        return Promise.resolve(new Response(JSON.stringify({ upload_url: "https://uploads.example.com/file" })));
+      }
+      signal = init.signal as AbortSignal;
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new Error("aborted"))));
+    });
     uploader.enqueue(EVENT_ID, undefined, [{ data: bytes, filename: "big.bin" }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signal?.aborted).toBe(false);
+    const deadline = stage === "reserve" ? REQUEST_TIMEOUT_MS : uploadTimeoutMs(bytes.length);
+    await vi.advanceTimersByTimeAsync(deadline - 1);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
     await uploader.flush();
+    expect(signal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
 
-    expect(timeout).toHaveBeenNthCalledWith(1, REQUEST_TIMEOUT_MS);
-    expect(timeout).toHaveBeenNthCalledWith(2, uploadTimeoutMs(bytes.length));
-    expect(callsTo("/v1/ingest/attachment")[0]![1].signal).toBeInstanceOf(AbortSignal);
-    expect(callsTo("uploads.example.com")[0]![1].signal).toBeInstanceOf(AbortSignal);
-    timeout.mockRestore();
+  it.each(["timeout", "stop"])("keeps reservation response-body reads abortable until %s", async (ending) => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", { subtle: { digest: async () => new ArrayBuffer(32) } });
+    let signal: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      const response = new Response("", { status: 201 });
+      response.json = () => new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("body aborted")));
+      });
+      return Promise.resolve(response);
+    });
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]) }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signal?.aborted).toBe(false);
+    if (ending === "stop") uploader.stop();
+    else await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS);
+    await uploader.flush();
+    expect(signal?.aborted).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
+  });
+
+  it("discards pending attachments and stops after an in-progress hash when disabled", async () => {
+    let finishHash!: (bytes: ArrayBuffer) => void;
+    vi.stubGlobal("crypto", { subtle: { digest: () => new Promise<ArrayBuffer>((resolve) => { finishHash = resolve; }) } });
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]) }, { data: new Uint8Array([2]) }]);
+    uploader.stop();
+    finishHash(new ArrayBuffer(32));
+    await uploader.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("aborts an active reservation and never starts its upload after stop", async () => {
+    vi.stubGlobal("crypto", { subtle: { digest: async () => new ArrayBuffer(32) } });
+    let signal: AbortSignal | undefined;
+    let finish!: (response: Response) => void;
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      return new Promise<Response>((resolve) => { finish = resolve; });
+    });
+    const uploader = new AttachmentUploader(makeConfig(), debug);
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]) }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    uploader.stop();
+    expect(signal?.aborted).toBe(true);
+    finish(new Response(JSON.stringify({ upload_url: "https://uploads.example.com/file" })));
+    await uploader.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("hashes only the bytes a view spans, not its backing buffer", async () => {
