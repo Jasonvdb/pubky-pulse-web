@@ -303,4 +303,77 @@ describe("event resource safety", () => {
     },
   );
 
+
+  it("keeps reserved exception fields when numeric caller keys enumerate before them", async () => {
+    Pulse.configure(config);
+    const attributes = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [String(index), "value"]));
+    const error = new TypeError("numeric exception attributes");
+    error.stack = "s".repeat(16000);
+    Pulse.captureException(error, { attributes });
+    await Pulse.flush();
+
+    const captured = sent().find((item) => item.message === error.message)!;
+    expect(captured.custom_attributes?._error_type).toBe("TypeError");
+    expect(captured.custom_attributes?._error_stack).toBe(error.stack);
+    expect(Object.keys(captured.custom_attributes!)).toHaveLength(100);
+    expect(captured.custom_attributes?.["97"]).toBe("value");
+    expect(captured.custom_attributes?.["98"]).toBeUndefined();
+  });
+
+  it("reserves all present exception fields before reading numerically ordered caller getters", async () => {
+    Pulse.configure(config);
+    const attributes: Record<string, unknown> = {};
+    const reads: number[] = [];
+    // JavaScript visits integer keys in numeric order, regardless of insertion order.
+    for (let index = 99; index >= 0; index -= 1) {
+      Object.defineProperty(attributes, String(index), {
+        enumerable: true,
+        get() { reads.push(index); return "value"; },
+      });
+    }
+    const error = new TypeError("numeric getter admission", { cause: new Error("original cause") });
+    error.stack = "reserved stack";
+    Object.defineProperty(error, "code", { value: "E_TEST" });
+    Pulse.captureException(error, { attributes });
+    await Pulse.flush();
+
+    expect(reads).toEqual(Array.from({ length: 95 }, (_, index) => index));
+    const captured = sent().find((item) => item.message === error.message)!;
+    expect(captured.custom_attributes).toMatchObject({
+      _error_type: "TypeError",
+      _error_stack: "reserved stack",
+      _error_code: "E_TEST",
+      _error_cause_1_type: "Error",
+      _error_cause_1_message: "original cause",
+    });
+    expect(Object.keys(captured.custom_attributes!)).toHaveLength(100);
+  });
+
+  it("preserves full admitted numeric exception values for beforeSend while reserving error fields", async () => {
+    const full = "sensitive-prefix:" + "x".repeat(150000);
+    let observed: string | undefined;
+    let observedType: string | undefined;
+    Pulse.configure({ ...config, beforeSend: (item) => {
+      if (item.message === "sanitize numeric exception") {
+        observed = item.custom_attributes?.["0"];
+        observedType = item.custom_attributes?._error_type;
+        return { ...item, custom_attributes: { ...item.custom_attributes, "0": "redacted" } };
+      }
+      return item;
+    } });
+    const attributes = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [String(index), index === 0 ? full : "value"]));
+    const error = new Error("sanitize numeric exception");
+    error.stack = "reserved stack";
+    Pulse.captureException(error, { attributes });
+    await Pulse.flush();
+
+    expect(observed).toBe(full);
+    expect(observedType).toBe("Error");
+    const captured = sent().find((item) => item.message === error.message)!;
+    expect(captured.custom_attributes).toMatchObject({
+      "0": "redacted", _error_type: "Error", _error_stack: "reserved stack",
+    });
+    expect(Object.keys(captured.custom_attributes!)).toHaveLength(100);
+  });
+
 });

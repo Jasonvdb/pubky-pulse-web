@@ -348,12 +348,16 @@ function captureException(
     const merged: PulseAttributes = { ...attributes };
     if (kind) merged._unhandled = kind;
     if (userAttributes) {
+      // Integer keys enumerate before diagnostic fields, regardless of insertion
+      // order. Bound the entire merge so normalization cannot displace them.
+      let count = Object.keys(merged).length;
       let visited = 0;
       for (const key in userAttributes) {
         if (!Object.hasOwn(userAttributes, key)) continue;
-        if (visited++ >= MAX_ATTRIBUTES) break;
+        if (visited++ >= MAX_ATTRIBUTES || count >= MAX_ATTRIBUTES) break;
         if (key.length > MAX_ATTRIBUTE_KEY_LENGTH || Object.hasOwn(merged, key)) continue;
         Object.defineProperty(merged, key, { value: userAttributes[key], enumerable: true, configurable: true });
+        count += 1;
       }
     }
     log("error", message, merged, options, { originalException: value });
