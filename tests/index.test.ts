@@ -388,6 +388,86 @@ describe("Pulse", () => {
     expect(sentEvents().filter((event) => event.message === "sdk:network_request")).toHaveLength(1);
   });
 
+  it.each(["disable", "disable-and-init", "shutdown-and-init", "configure"])(
+    "keeps pending user properties out of a replacement client after %s", async (transition) => {
+      vi.useFakeTimers();
+      let finishFlush!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { finishFlush = resolve; }));
+      Pulse.init(config);
+      const properties = Pulse.setUserProperties({ private_property: "belongs-to-original-client" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const replacement = { ...config, endpoint: "https://replacement.example.com" };
+      let shutdown: Promise<void> | undefined;
+      if (transition === "configure") Pulse.configure(replacement);
+      else if (transition === "shutdown-and-init") {
+        shutdown = Pulse.shutdown();
+        Pulse.init(replacement);
+      } else {
+        Pulse.init({ enabled: false });
+        if (transition === "disable-and-init") Pulse.init(replacement);
+      }
+      finishFlush(new Response("{}", { status: 200 }));
+      await properties;
+      await shutdown;
+      await Pulse.flush();
+      expect(identityPosts("/v1/identity/properties")).toEqual([]);
+    },
+  );
+
+  it.each(["disable-and-init", "shutdown-and-init", "configure"])(
+    "does not audit old feedback through the new client after %s", async (transition) => {
+      vi.useFakeTimers();
+      Pulse.init(config);
+      await Pulse.flush();
+      let finishFeedback!: (response: Response) => void;
+      let feedbackSignal: AbortSignal | undefined;
+      // Model a custom fetch that delivers late despite cancellation.
+      fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+        feedbackSignal = init.signal as AbortSignal;
+        return new Promise<Response>((resolve) => { finishFeedback = resolve; });
+      });
+      const feedback = Pulse.sendFeedback("feedback for the original client");
+      const replacement = { ...config, endpoint: "https://replacement.example.com" };
+      if (transition === "configure") Pulse.configure(replacement);
+      else if (transition === "shutdown-and-init") {
+        await Pulse.shutdown();
+        Pulse.init(replacement);
+      } else {
+        Pulse.init({ enabled: false });
+        Pulse.init(replacement);
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(feedbackSignal?.aborted).toBe(true);
+      finishFeedback(new Response(JSON.stringify({ id: "old-feedback", created_at: "2026-09-09T00:00:00.000Z" }), { status: 201 }));
+      expect((await feedback).id).toBe("old-feedback");
+      await Pulse.flush();
+      expect(sentEvents().some((event) => event.message === "sdk:feedback_submitted")).toBe(false);
+      expect(fetchMock.mock.calls.filter((call) => String(call[0]).endsWith("/v1/feedback")))
+        .toHaveLength(1);
+    },
+  );
+
+  it("aborts pending feedback on shutdown before a later opt-out", async () => {
+    vi.useFakeTimers();
+    Pulse.init(config);
+    await Pulse.flush();
+    let feedbackSignal: AbortSignal | undefined;
+    fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+      feedbackSignal = init.signal as AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        feedbackSignal?.addEventListener("abort", () => reject(new Error("feedback cancelled")));
+      });
+    });
+    const feedback = expect(Pulse.sendFeedback("pending feedback")).rejects.toThrow(/feedback cancelled/);
+    await Pulse.shutdown();
+    Pulse.init({ enabled: false });
+    await feedback;
+    expect(feedbackSignal?.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(sentEvents().some((event) => event.message === "sdk:feedback_submitted")).toBe(false);
+  });
+
   it("ignores log calls made before configure", async () => {
     vi.spyOn(console, "debug").mockImplementation(() => undefined);
     Pulse.info("too early");

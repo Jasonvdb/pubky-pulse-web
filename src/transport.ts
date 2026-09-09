@@ -126,7 +126,6 @@ export class Transport {
 
   /** Stop immediately without flushing, replaying, or deleting persisted data. */
   stop(): void {
-    if (this.stopped) return;
     this.stopped = true;
     if (this.timer !== null) clearInterval(this.timer);
     this.timer = null;
@@ -235,12 +234,16 @@ export class Transport {
       clearInterval(this.timer);
       this.timer = null;
     }
-    await this.flush();
-    // The flush is a no-op while offline, and the caller drops this instance
-    // straight afterwards, so park whatever it could not send.
-    const left = this.buffer.splice(0);
-    if (!this.stopped && left.length > 0) await this.queue.append(left, () => !this.stopped);
-    this.stopped = true;
+    try {
+      await this.flush();
+      // The flush is a no-op while offline, so park what it could not send.
+      const left = this.buffer.splice(0);
+      if (!this.stopped && left.length > 0) await this.queue.append(left, () => !this.stopped);
+    } finally {
+      // Feedback, identity requests, and their retry delays may still be active
+      // after the event flush. Retiring a client must release those resources too.
+      this.stop();
+    }
   }
 
   /**

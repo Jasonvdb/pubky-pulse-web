@@ -265,7 +265,7 @@ describe("Transport", () => {
     expect(queue.read().map((event) => event.client_event_id)).toEqual(delivery === "spill" ? ["event-0"] : []);
   });
 
-  it.each(["timeout", "stop"])("keeps feedback response-body reads abortable until %s", async (ending) => {
+  it.each(["timeout", "stop", "shutdown"])("keeps feedback response-body reads abortable until %s", async (ending) => {
     let signal: AbortSignal | undefined;
     fetchMock.mockImplementation((_url: string, init: RequestInit) => {
       signal = init.signal as AbortSignal;
@@ -281,11 +281,49 @@ describe("Transport", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(signal?.aborted).toBe(false);
     if (ending === "stop") tx.stop();
+    else if (ending === "shutdown") await tx.shutdown();
     else await vi.advanceTimersByTimeAsync(10_000);
     await rejected;
     expect(signal?.aborted).toBe(true);
     tx.stop();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["feedback", "identity", "properties"])("shutdown aborts active %s requests and releases their timers", async (kind) => {
+    let signal: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      signal = init.signal as AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("cancelled")));
+      });
+    });
+    const tx = createTransport();
+    const sideRequest = kind === "feedback"
+      ? tx.submitFeedback({ message: "feedback", sdk_name: "pubky-pulse-web", sdk_version: "test", environment: "web", is_dev: true })
+      : kind === "identity" ? tx.claimIdentity("anonymous", "user") : tx.setUserProperties("user", { plan: "pro" });
+    const settled = sideRequest.then(() => "resolved", () => "rejected");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(signal?.aborted).toBe(false);
+    await tx.shutdown();
+    expect(signal?.aborted).toBe(true);
+    await settled;
+    expect(vi.getTimerCount()).toBe(0);
+    tx.stop();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shutdown settles a side-request retry delay without issuing another request", async () => {
+    fetchMock.mockResolvedValue(new Response("", { status: 503 }));
+    const tx = createTransport();
+    const claim = tx.claimIdentity("anonymous", "user");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await tx.shutdown();
+    expect(await claim).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not restore successfully delivered replay events when later disabled", async () => {

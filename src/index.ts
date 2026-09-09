@@ -695,9 +695,13 @@ export const Pulse: PulseApi = {
       debugLog("setUserProperties called before configure()");
       return;
     }
-    // Buffered events land under the same id the properties attach to.
-    await transport.flush();
-    await transport.setUserProperties(identity.currentId, properties);
+    // Keep the request bound to the client and user that initiated it. A flush
+    // may outlive opt-out, shutdown, reconfiguration, or an identity change.
+    const clientTransport = transport;
+    const userId = identity.currentId;
+    await clientTransport.flush();
+    if (transport !== clientTransport) return;
+    await clientTransport.setUserProperties(userId, properties);
   },
 
   async flush(): Promise<void> {
@@ -729,6 +733,12 @@ export const Pulse: PulseApi = {
       throw new Error("Pubky Pulse: sendFeedback called before configure()");
     }
 
+    const clientTransport = transport;
+    const clientConfig = config;
+    const clientSessionId = session?.id;
+    const clientUserId = identity?.currentId;
+    const clientDeviceInfo = deviceInfo;
+
     const trimmed = typeof message === "string" ? message.trim() : "";
     if (!trimmed) {
       throw new Error("Pubky Pulse: feedback message is required");
@@ -743,28 +753,30 @@ export const Pulse: PulseApi = {
     const email = options?.email?.trim() || undefined;
 
     const body: FeedbackSubmission = {
-      bundle_id: config.bundleId,
+      bundle_id: clientConfig.bundleId,
       message: trimmed,
       sdk_name: SDK_NAME,
       sdk_version: SDK_VERSION,
       environment: ENVIRONMENT,
-      is_dev: config.isDev,
+      is_dev: clientConfig.isDev,
     };
-    if (session?.id) body.session_id = session.id;
-    if (identity?.currentId) body.user_id = identity.currentId;
+    if (clientSessionId) body.session_id = clientSessionId;
+    if (clientUserId) body.user_id = clientUserId;
     if (name) body.submitter_name = name;
     if (email) body.submitter_email = email;
-    if (config.appVersion) body.app_version = config.appVersion;
-    if (deviceInfo.deviceModel) body.device_model = deviceInfo.deviceModel;
-    if (deviceInfo.osVersion) body.os_version = deviceInfo.osVersion;
+    if (clientConfig.appVersion) body.app_version = clientConfig.appVersion;
+    if (clientDeviceInfo.deviceModel) body.device_model = clientDeviceInfo.deviceModel;
+    if (clientDeviceInfo.osVersion) body.os_version = clientDeviceInfo.osVersion;
 
-    const receipt = await transport.submitFeedback(body);
+    const receipt = await clientTransport.submitFeedback(body);
 
     // The audit event is best effort: the receipt is what the caller waited for.
-    log("info", "sdk:feedback_submitted", {
-      has_email: email ? "true" : "false",
-      has_name: name ? "true" : "false",
-    });
+    if (transport === clientTransport) {
+      log("info", "sdk:feedback_submitted", {
+        has_email: email ? "true" : "false",
+        has_name: name ? "true" : "false",
+      });
+    }
 
     return receipt;
   },
