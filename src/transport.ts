@@ -118,7 +118,13 @@ export class Transport {
   ) {
     this.config = config;
     this.queue = queue;
-    this.onDebug = onDebug;
+    let diagnosing = false;
+    this.onDebug = (message, detail) => {
+      if (diagnosing) return;
+      diagnosing = true;
+      try { onDebug?.(message, detail); } catch { /* Diagnostics cannot reject background delivery. */ }
+      finally { diagnosing = false; }
+    };
     this.timer = setInterval(() => {
       void this.flush();
     }, config.flushIntervalMs);
@@ -127,13 +133,15 @@ export class Transport {
   /** Stop immediately without flushing, replaying, or deleting persisted data. */
   stop(): void {
     this.stopped = true;
-    if (this.timer !== null) clearInterval(this.timer);
+    if (this.timer !== null) {
+      try { clearInterval(this.timer); } catch { /* A retained interval becomes inert after stop. */ }
+    }
     this.timer = null;
     this.buffer = [];
     this.inFlight = null;
     for (const [controller, timer] of this.requests) {
       clearTimeout(timer);
-      controller.abort();
+      try { controller.abort(); } catch { /* Continue releasing every request. */ }
     }
     this.requests.clear();
     for (const [timer, resolve] of this.delays) {
@@ -163,7 +171,9 @@ export class Transport {
     const controller = new AbortController();
     if (this.stopped) controller.abort();
     if (controller.signal.aborted) throw new Error("Pubky Pulse: transport stopped");
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      try { controller.abort(); } catch { /* A host abort adapter may be broken. */ }
+    }, REQUEST_TIMEOUT_MS);
     this.requests.set(controller, timer);
     try {
       return fetch(url, { ...init, signal: controller.signal }).then<Response | T>((response) =>
@@ -222,7 +232,9 @@ export class Transport {
   flush(): Promise<void> {
     if (this.stopped) return Promise.resolve();
     if (this.flushing) return this.flushing;
-    const run = this.runFlush().finally(() => {
+    const run = this.runFlush().catch((error: unknown) => {
+      this.onDebug?.("failed to flush events", error);
+    }).finally(() => {
       this.flushing = null;
     });
     this.flushing = run;
@@ -231,7 +243,7 @@ export class Transport {
 
   async shutdown(): Promise<void> {
     if (this.timer !== null) {
-      clearInterval(this.timer);
+      try { clearInterval(this.timer); } catch { /* stop() also marks retained callbacks inert. */ }
       this.timer = null;
     }
     try {
@@ -239,6 +251,8 @@ export class Transport {
       // The flush is a no-op while offline, so park what it could not send.
       const left = this.buffer.splice(0);
       if (!this.stopped && left.length > 0) await this.queue.append(left, () => !this.stopped);
+    } catch (error) {
+      this.onDebug?.("failed to park remaining events", error);
     } finally {
       // Feedback, identity requests, and their retry delays may still be active
       // after the event flush. Retiring a client must release those resources too.
@@ -253,6 +267,12 @@ export class Transport {
    * await the cross-tab lock in — so it neither drains it nor rewrites it.
    */
   flushOnUnload(): void {
+    try { this.runUnloadFlush(); } catch (error) {
+      this.onDebug?.("failed to flush on unload", error);
+    }
+  }
+
+  private runUnloadFlush(): void {
     if (this.stopped) return;
     const now = Date.now();
     if (now - this.lastUnloadFlushAt < UNLOAD_DEBOUNCE_MS) return;
@@ -302,15 +322,15 @@ export class Transport {
           // drops here exactly as it does in `post()`.
           if (!this.stopped && !response.ok && (response.status >= 500 || response.status === 429)) {
             this.onDebug?.(`keepalive flush failed with ${response.status}`);
-            void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch));
+            void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);
           } else if (!this.stopped) {
             this.forgetReplay(batch);
           }
         },
         () => {
-          if (!this.stopped) void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch));
+          if (!this.stopped) void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);
         },
-      );
+      ).catch(() => undefined);
     } catch (err) {
       // Still inside the unload turn, so this one has to be the sync path.
       this.onDebug?.("keepalive flush failed", err);

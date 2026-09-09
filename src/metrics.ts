@@ -37,11 +37,11 @@ export function normalizeSlug(slug: string): string {
 
   if (!slugWarningShown) {
     slugWarningShown = true;
-    console.warn(
+    try { console.warn(
       `Pubky Pulse: metric slug "${slug}" was auto-corrected to "${normalized}". ` +
         "Slugs should contain only lowercase letters, numbers, and hyphens. " +
         "Further corrections are not reported.",
-    );
+    ); } catch { /* Diagnostics are best effort, including replaced consoles. */ }
   }
 
   return normalized;

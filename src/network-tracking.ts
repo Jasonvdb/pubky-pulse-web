@@ -31,9 +31,58 @@ function requestUrl(input: RequestInfo | URL): string | undefined {
   return undefined;
 }
 
-function requestMethod(input: RequestInfo | URL, init?: RequestInit): string {
-  const method = init?.method ?? (isRequest(input) ? input.method : undefined);
-  return (method ?? "GET").toUpperCase();
+/** Observe only data properties: fetch must be the sole caller of init getters. */
+function requestMethod(input: RequestInfo | URL, init?: RequestInit): string | undefined {
+  let cursor: object | null = init == null ? null : Object(init);
+  for (let depth = 0; cursor !== null && depth < 32; depth++) {
+    const descriptor = Object.getOwnPropertyDescriptor(cursor, "method");
+    if (descriptor) {
+      if (!("value" in descriptor)) return undefined;
+      const method: unknown = descriptor.value;
+      if (method !== undefined) return typeof method === "string" ? method.toUpperCase() : undefined;
+      break;
+    }
+    cursor = Object.getPrototypeOf(cursor) as object | null;
+  }
+  return isRequest(input) ? input.method : "GET";
+}
+
+/**
+ * Override just the native dictionary's headers read. A fresh proxy target
+ * avoids invariants on frozen init objects; forwarding with the original
+ * receiver preserves inherited fields, accessor ordering and getter `this`.
+ * No Request is constructed, cloned or consumed by instrumentation.
+ */
+function withSessionHeader(input: RequestInfo | URL, init: RequestInit | undefined, sessionId: string): RequestInit {
+  const sourceInit = init ?? {};
+  const overrides: RequestInit = {};
+  return new Proxy(overrides, {
+    get(target, key) {
+      const source = Object.prototype.hasOwnProperty.call(target, key) ? target : sourceInit;
+      const value: unknown = Reflect.get(source, key, source);
+      if (key !== "headers") return value;
+      const originalHeaders = value === undefined && isRequest(input) ? input.headers : value;
+      const headers = new Headers(originalHeaders as HeadersInit | undefined);
+      try {
+        headers.set(SESSION_HEADER, sessionId);
+      } catch {
+        // An invalid session id must not change the application's headers.
+      }
+      return headers;
+    },
+    // Fetch wrappers often spread init before forwarding it. Keep all its own
+    // fields visible, plus our header override, without eagerly reading getters.
+    ownKeys(target) {
+      return [...new Set([...Reflect.ownKeys(sourceInit), ...Reflect.ownKeys(target), "headers"])];
+    },
+    getOwnPropertyDescriptor(target, key) {
+      const override = Reflect.getOwnPropertyDescriptor(target, key);
+      if (override) return override;
+      if (key === "headers") return { configurable: true, enumerable: true, writable: true };
+      const descriptor = Reflect.getOwnPropertyDescriptor(sourceInit, key);
+      return descriptor ? { ...descriptor, configurable: true } : undefined;
+    },
+  });
 }
 
 /** Absolute form of a request URL, or undefined when it cannot be resolved. */
@@ -110,6 +159,7 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
 
   let active = true;
   const wrapped = function (this: unknown, ...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
+    if (!active) return Reflect.apply(original, this, args) as ReturnType<typeof fetch>;
     const [input, init] = args;
     let nextArgs = args;
     let attributes: Record<string, string> | undefined;
@@ -123,16 +173,16 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
       if (active && !excluded) {
         if (raw !== undefined && matchesPrefix(raw, absolute, options.propagateSessionTo)) {
           const sessionId = options.sessionId();
-          if (sessionId) {
-            const headers = new Headers(init?.headers ?? (isRequest(input) ? input.headers : undefined));
-            headers.set(SESSION_HEADER, sessionId);
+          if (sessionId && (init == null || typeof init === "object" || typeof init === "function")) {
             nextArgs = [...args];
-            nextArgs[1] = { ...init, headers };
+            nextArgs[1] = withSessionHeader(input, init, sessionId);
           }
         }
         if (options.trackRequests) {
           const url = raw === undefined ? undefined : sanitizeUrl(raw, absolute, options.urlMode ?? "path");
-          attributes = { _http_method: requestMethod(input, init) };
+          attributes = {};
+          const method = requestMethod(input, init);
+          if (method !== undefined) attributes._http_method = method;
           if (url !== undefined) attributes._http_url = url;
           startedAt = nowMs();
         }
@@ -165,13 +215,18 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
     // Return the observed promise so an unhandled rejection still reaches the
     // application's global handler. Observing and returning the original promise
     // would mark that original rejection handled, silently suppressing it.
-    return result.then((response) => {
-      report(response.status);
-      return response;
-    }, (error: unknown) => {
-      report(0);
-      throw error;
-    });
+    try {
+      return result.then((response) => {
+        try { report(response.status); } catch { /* Response metadata is optional. */ }
+        return response;
+      }, (error: unknown) => {
+        report(0);
+        throw error;
+      });
+    } catch {
+      // Another fetch wrapper may return an unusual promise-like value.
+      return result;
+    }
   };
 
   target.fetch = wrapped as typeof fetch;

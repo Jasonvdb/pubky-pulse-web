@@ -92,6 +92,10 @@ export function collectDeviceInfo(supportedLanguages?: string[]): DeviceInfo {
 
 /** True when the browser reports itself as offline. Unknown counts as online. */
 export function isOnline(): boolean {
-  const nav = (globalThis as { navigator?: { onLine?: unknown } }).navigator;
-  return nav?.onLine === false ? false : true;
+  try {
+    const nav = (globalThis as { navigator?: { onLine?: unknown } }).navigator;
+    return nav?.onLine !== false;
+  } catch {
+    return true;
+  }
 }

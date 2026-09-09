@@ -26,6 +26,14 @@ export function installLifecycle(callbacks: LifecycleCallbacks): () => void {
   if (!win) return () => undefined;
 
   let lastHiddenAt = 0;
+  let active = true;
+  let handling = false;
+  const safely = (action: () => void): void => {
+    if (!active || handling) return;
+    handling = true;
+    try { action(); } catch { /* Lifecycle telemetry must not become a page error. */ }
+    finally { handling = false; }
+  };
 
   const hide = (): void => {
     const now = Date.now();
@@ -35,10 +43,10 @@ export function installLifecycle(callbacks: LifecycleCallbacks): () => void {
   };
 
   const onPageHide = (): void => {
-    hide();
+    safely(hide);
   };
 
-  const onVisibilityChange = (): void => {
+  const onVisibilityChange = (): void => safely(() => {
     if (doc?.visibilityState === "hidden") {
       hide();
       return;
@@ -46,12 +54,12 @@ export function installLifecycle(callbacks: LifecycleCallbacks): () => void {
     // Coming back into view: a long background stint may have ended the
     // session, and the next check is what emits the new one.
     callbacks.onVisible();
-  };
+  });
 
   const uninstall = (): void => {
-    try { win.removeEventListener("pagehide", onPageHide); } finally {
-      doc?.removeEventListener("visibilitychange", onVisibilityChange);
-    }
+    active = false;
+    try { win.removeEventListener("pagehide", onPageHide); } catch { /* Try every listener. */ }
+    try { doc?.removeEventListener("visibilitychange", onVisibilityChange); } catch { /* Retained listeners are inert. */ }
   };
   try {
     win.addEventListener("pagehide", onPageHide);

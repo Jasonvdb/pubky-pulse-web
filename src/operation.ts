@@ -12,14 +12,22 @@ export type OperationLogger = (
 
 /** Turn whatever the caller threw into the single `error` attribute. */
 function describeError(error: unknown): string {
-  if (typeof error === "string") return error;
-  if (error instanceof Error) return error.message || error.name;
-  if (error === null || error === undefined) return "unknown error";
   try {
+    if (typeof error === "string") return error;
+    if (error instanceof Error) return error.message || error.name;
+    if (error === null || error === undefined) return "unknown error";
     return String(error);
   } catch {
     return "unknown error";
   }
+}
+
+let constructing = false;
+const inactiveLogger: OperationLogger = () => undefined;
+
+/** An inert handle performs no clock, identifier or caller-metadata work. */
+export function createInactiveOperation(): PulseOperation {
+  return new PulseOperation(inactiveLogger, "");
 }
 
 /**
@@ -31,7 +39,7 @@ function describeError(error: unknown): string {
  * path, a promise that settles twice) is ignored rather than double-counted.
  */
 export class PulseOperation {
-  /** UUID shared by every event of this operation. */
+  /** UUID shared by every event; empty for a handle created while inactive. */
   readonly trackingId: string;
 
   private readonly log: OperationLogger;
@@ -41,16 +49,23 @@ export class PulseOperation {
 
   constructor(log: OperationLogger, metric: string, attributes?: PulseAttributes) {
     this.log = log;
-    // Normalise once: the terminal events must use the slug the start used,
-    // and a bad slug should only be reported the one time.
-    this.slug = normalizeSlug(metric);
-    this.trackingId = randomUuid();
-    this.startedAt = nowMs();
-
-    this.log("info", metricMessage(this.slug, "start"), {
-      ...attributes,
-      tracking_id: this.trackingId,
-    });
+    this.slug = "";
+    this.trackingId = "";
+    this.startedAt = 0;
+    this.finished = log === inactiveLogger || constructing;
+    if (this.finished) return;
+    constructing = true;
+    try {
+      // Normalise once so the start and terminal events keep the same slug.
+      this.slug = normalizeSlug(metric);
+      this.trackingId = randomUuid();
+      this.startedAt = nowMs();
+      this.log("info", metricMessage(this.slug, "start"), {
+        ...attributes,
+        tracking_id: this.trackingId,
+      });
+    } catch { /* An operation must never replace the application's own result. */ }
+    finally { constructing = false; }
   }
 
   /** Finish successfully. */
@@ -60,7 +75,7 @@ export class PulseOperation {
 
   /** Finish with a failure; logged at error level with an `error` attribute. */
   fail(error: unknown, attributes?: PulseAttributes): void {
-    this.finish("error", "fail", { ...attributes, error: describeError(error) });
+    this.finish("error", "fail", attributes, error);
   }
 
   /** Finish because the work was abandoned rather than failed. */
@@ -72,14 +87,18 @@ export class PulseOperation {
     level: PulseLogLevel,
     phase: Extract<MetricPhase, "complete" | "fail" | "cancel">,
     attributes?: PulseAttributes,
+    error?: unknown,
   ): void {
     if (this.finished) return;
     this.finished = true;
 
-    this.log(level, metricMessage(this.slug, phase), {
-      ...attributes,
-      tracking_id: this.trackingId,
-      duration_ms: String(Math.round(nowMs() - this.startedAt)),
-    });
+    try {
+      this.log(level, metricMessage(this.slug, phase), {
+        ...attributes,
+        ...(phase === "fail" ? { error: describeError(error) } : {}),
+        tracking_id: this.trackingId,
+        duration_ms: String(Math.max(0, Math.round(nowMs() - this.startedAt))),
+      });
+    } catch { /* Finishing is best effort and remains idempotent after a failure. */ }
   }
 }

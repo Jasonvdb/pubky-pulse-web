@@ -24,13 +24,21 @@ export const RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES: Readonly<Record<string, 
 
 /** RFC 4122 v4 id, falling back to `getRandomValues` on older browsers. */
 export function randomUuid(): string {
-  const cryptoRef = (globalThis as { crypto?: Crypto }).crypto;
-  if (cryptoRef?.randomUUID) return cryptoRef.randomUUID();
+  let cryptoRef: Crypto | undefined;
+  try {
+    cryptoRef = (globalThis as { crypto?: Crypto }).crypto;
+    if (typeof cryptoRef?.randomUUID === "function") return cryptoRef.randomUUID();
+  } catch { /* A failing UUID adapter must not interrupt the host application. */ }
 
   const bytes = new Uint8Array(16);
-  if (cryptoRef?.getRandomValues) {
-    cryptoRef.getRandomValues(bytes);
-  } else {
+  let filled = false;
+  try {
+    if (typeof cryptoRef?.getRandomValues === "function") {
+      cryptoRef.getRandomValues(bytes);
+      filled = true;
+    }
+  } catch { /* Older or modified hosts may have neither working crypto API. */ }
+  if (!filled) {
     for (let i = 0; i < bytes.length; i += 1) {
       bytes[i] = Math.floor(Math.random() * 256);
     }

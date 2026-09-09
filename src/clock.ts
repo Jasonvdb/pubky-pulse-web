@@ -1,9 +1,15 @@
-/**
- * Single source of elapsed time for every duration the SDK reports.
- * `performance.now()` is monotonic, so a clock adjustment cannot produce a
- * negative duration; the wall clock is the fallback where it is missing.
- */
+/** Best-effort elapsed time; broken host clocks must never interrupt telemetry callers. */
 export function nowMs(): number {
-  const perf = (globalThis as { performance?: { now?: () => number } }).performance;
-  return typeof perf?.now === "function" ? perf.now() : Date.now();
+  try {
+    const perf = (globalThis as { performance?: { now?: () => number } }).performance;
+    if (typeof perf?.now === "function") {
+      const now = perf.now();
+      if (Number.isFinite(now)) return now;
+    }
+  } catch { /* Fall back when a host clock adapter is unavailable. */ }
+  try {
+    const now = Date.now();
+    if (Number.isFinite(now)) return now;
+  } catch { /* No usable clock: a zero duration is preferable to throwing. */ }
+  return 0;
 }
