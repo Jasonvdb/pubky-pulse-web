@@ -120,6 +120,10 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     throw new Error("Pubky Pulse: networkTracking.urlMode must be path or origin");
   }
 
+  const flushIntervalMs = positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000);
+  if (flushIntervalMs > 2 ** 31 - 1) {
+    throw new Error("Pubky Pulse: flushIntervalMs must not exceed 2147483647");
+  }
   const flushThreshold = positiveInteger(config.flushThreshold, "flushThreshold", 20);
   const maxBufferSize = positiveInteger(config.maxBufferSize, "maxBufferSize", 10000);
   if (flushThreshold > maxBufferSize) {
@@ -143,7 +147,7 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     networkTracking: typeof network === "object" ? true : network ?? false,
     networkUrlMode,
     propagateSessionTo: stringArray(config.propagateSessionTo, "propagateSessionTo") ?? [],
-    flushIntervalMs: positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000),
+    flushIntervalMs,
     flushThreshold,
     maxBufferSize,
     sessionTimeoutMs: positiveInteger(config.sessionTimeoutMs, "sessionTimeoutMs", 1_800_000),

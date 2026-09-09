@@ -1,5 +1,6 @@
 import { encodeBody, byteLength, type EncodedBody } from "./compression";
 import type { ValidatedConfig } from "./configuration";
+import { jsonByteLength, MAX_BUFFER_BYTES, MAX_EVENT_BYTES } from "./event-size";
 import { isOnline } from "./device-info";
 import type { OfflineQueue } from "./offline-queue";
 import type {
@@ -11,6 +12,8 @@ import type {
 
 /** Events per request. The server accepts up to 100; 20 keeps bodies small. */
 export const MAX_BATCH_SIZE = 20;
+/** Separately retained while a request/retry runs; every event is admitted first. */
+export const MAX_IN_FLIGHT_BYTES = MAX_BATCH_SIZE * MAX_EVENT_BYTES;
 /** Server-side hard limit on events in one ingest request. */
 export const MAX_INGEST_EVENTS = 100;
 export const MAX_RETRIES = 5;
@@ -88,6 +91,8 @@ export class Transport {
   private readonly queue: OfflineQueue;
   private readonly onDebug: ((message: string, detail?: unknown) => void) | undefined;
   private buffer: LogEvent[] = [];
+  private bufferBytes = 0;
+  private readonly eventBytes = new WeakMap<LogEvent, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing: Promise<void> | null = null;
   private lastUnloadFlushAt = 0;
@@ -138,6 +143,7 @@ export class Transport {
     }
     this.timer = null;
     this.buffer = [];
+    this.bufferBytes = 0;
     this.inFlight = null;
     for (const [controller, timer] of this.requests) {
       clearTimeout(timer);
@@ -212,14 +218,33 @@ export class Transport {
     };
   }
 
-  enqueue(event: LogEvent): void {
-    if (this.stopped) return;
-    if (this.buffer.length >= this.config.maxBufferSize) {
-      this.buffer.shift();
+  /** Admit fresh and replayed events through the same count and byte budgets. */
+  private bufferEvent(event: LogEvent): void {
+    const size = jsonByteLength(event);
+    if (size === null) {
+      this.replayed.delete(event);
+      this.onDebug?.("event exceeds the SDK payload budget, dropped event");
+      return;
+    }
+    while (this.buffer.length >= this.config.maxBufferSize || this.bufferBytes + size > MAX_BUFFER_BYTES) {
+      const dropped = this.takeBuffered(1);
+      this.forgetReplay(dropped);
       this.onDebug?.("buffer full, dropped oldest event");
     }
+    this.eventBytes.set(event, size);
     this.buffer.push(event);
+    this.bufferBytes += size;
+  }
 
+  private takeBuffered(count = this.buffer.length): LogEvent[] {
+    const taken = this.buffer.splice(0, count);
+    for (const event of taken) this.bufferBytes -= this.eventBytes.get(event) ?? 0;
+    return taken;
+  }
+
+  enqueue(event: LogEvent): void {
+    if (this.stopped) return;
+    this.bufferEvent(event);
     if (this.buffer.length >= this.config.flushThreshold) {
       void this.flush();
     }
@@ -249,7 +274,7 @@ export class Transport {
     try {
       await this.flush();
       // The flush is a no-op while offline, so park what it could not send.
-      const left = this.buffer.splice(0);
+      const left = this.takeBuffered();
       if (!this.stopped && left.length > 0) await this.queue.append(left, () => !this.stopped);
     } catch (error) {
       this.onDebug?.("failed to park remaining events", error);
@@ -278,7 +303,7 @@ export class Transport {
     if (now - this.lastUnloadFlushAt < UNLOAD_DEBOUNCE_MS) return;
     this.lastUnloadFlushAt = now;
 
-    const pending = [...this.takeInFlight(), ...this.buffer.splice(0)];
+    const pending = [...this.takeInFlight(), ...this.takeBuffered()];
     if (pending.length === 0) return;
 
     if (!isOnline()) {
@@ -433,23 +458,30 @@ export class Transport {
       return;
     }
 
-    const parked = await this.queue.drain(() => !this.stopped);
+    let parked = await this.queue.drain(() => !this.stopped);
     for (const event of parked) this.replayed.add(event);
     if (this.stopped) {
       this.restoreReplay();
       return;
     }
-    if (parked.length > 0) this.buffer.unshift(...parked);
+    if (parked.length > 0) {
+      const fresh = this.takeBuffered();
+      for (const event of parked) this.bufferEvent(event);
+      for (const event of fresh) this.bufferEvent(event);
+      // A stalled request must not keep discarded replay or fresh events alive.
+      fresh.length = 0;
+      parked = [];
+    }
 
     while (!this.stopped && this.buffer.length > 0) {
-      const batch = this.buffer.splice(0, MAX_BATCH_SIZE);
+      const batch = this.takeBuffered(MAX_BATCH_SIZE);
       const outcome = await this.sendBatch(batch);
       if (this.stopped) return;
       if (outcome === "park") {
         // The endpoint is unreachable: park this batch and everything behind
         // it rather than burning retries on each remaining batch. An unload
         // flush that already took the batch has parked or sent it itself.
-        const rest = this.buffer.splice(0);
+        const rest = this.takeBuffered();
         const toPark = this.inFlightTaken ? rest : [...batch, ...rest];
         await this.queue.append(toPark, () => !this.stopped);
         if (!this.stopped) this.forgetReplay(toPark);

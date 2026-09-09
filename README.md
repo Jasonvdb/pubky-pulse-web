@@ -74,6 +74,18 @@ Existing `Pulse.configure()` remains the strict API: configuration errors throw,
 SSR, and valid repeated calls explicitly replace the configuration. Existing logger calls before
 configuration retain their one-time console note; `captureException` never emits that note.
 
+## Host application boundaries
+
+Logging, metrics, screen tracking, attachment work and SDK diagnostics are best effort. Telemetry
+failures are contained and can drop data. History cleanup preserves hooks installed by other libraries;
+retained Pulse wrappers become inactive. These protections cannot guarantee recovery from browser
+memory exhaustion or interrupt a nonterminating application callback.
+
+Keep handling intentional API failures: strict `Pulse.configure()` can throw, invalid `setUser()`
+input rejects, and feedback/questionnaire requests reject on validation or request failure. Use
+`await` with your application's error handling, or attach `.catch(...)` when deliberately not awaiting.
+`Pulse.init()` reports setup failures through its result instead.
+
 ## Use it in your environment
 
 ### Static page
@@ -592,7 +604,8 @@ the timestamp the server recorded.
 ## Attachments
 
 Attach a `Blob`, a `File` or a `Uint8Array` to a single event. The file is hashed and uploaded out
-of band, so the event itself is never delayed.
+of band; uploading does not hold up the event's network batch. Accepted typed-array data is copied
+synchronously into a bounded snapshot before it is queued.
 
 ```ts
 Pulse.error(err, "import failed", { rows: "1200" }, {
@@ -601,7 +614,25 @@ Pulse.error(err, "import failed", { rows: "1200" }, {
 ```
 
 Uploads need `crypto.subtle`, which browsers only expose in a secure context. Over plain HTTP they
-are skipped with a debug note; the event still goes out. `Pulse.flush()` waits for the upload queue.
+are skipped with a debug note; the event still goes out.
+
+The browser limit is **5 MiB per file**, reduced intentionally from the earlier 2 GiB ceiling. Across
+active and pending attachments, one loaded SDK module admits **20 files and 20 MiB of payload**,
+including work retained across disable/reinitialization. New excess files are dropped before reading
+or hashing; each enqueue inspects at most the first 20 entries. Server quotas can be smaller; server
+wire formats and the Node.js, Swift and Android SDK limits are unchanged.
+
+Metadata is snapshotted when accepted. Filenames over 1,024 UTF-16 code units or content types over
+255 are rejected, without truncation. `Uint8Array` data is copied so a small subarray cannot retain a
+large backing buffer or change after enqueue. Blob sizes are checked before reading; Blob uploads
+still use the original Blob as the request body. The payload budget is not a total browser heap cap:
+hashing and platform operations can hold additional working memory.
+
+`Pulse.flush()` and `Pulse.shutdown()` wait up to 120 seconds for attachments. Each background item
+also has a 120-second waiting deadline, with PUT requests limited to 80 seconds. A noncancelable
+Blob read, hash, or request may outlive that wait: its payload reservation remains occupied until the
+underlying operation settles. Stop drops pending items and aborts requests; canceled items do not
+advance to later upload stages. Remaining accepted background work can continue after a flush returns.
 
 ## Network tracking
 
@@ -619,7 +650,7 @@ keeps only protocol, hostname and port for HTTP(S), resolving relative URLs agai
 Malformed or non-HTTP(S) URLs omit `_http_url`; the raw value is never used as an origin fallback.
 The mode applies before `beforeSend`, buffering, console or offline persistence, including failures.
 
-The `sdk:network_request` event retains method, status and duration: debug for 2xx/3xx, warn for
+The `sdk:network_request` event reports available method, status and duration: debug for 2xx/3xx, warn for
 other responses and error with status `0` on rejection. SDK endpoint requests remain excluded.
 The application's request URL, body and headers are unchanged except for explicitly requested
 session propagation; response and rejection values retain their identity and normal fetch behavior.
@@ -632,7 +663,11 @@ to both the events and the header below.
 
 `propagateSessionTo` lists URL prefixes that receive the `X-Pulse-Session-Id` header, and works
 whether or not `networkTracking` is on — the same `fetch` wrapper is installed when either is set.
-Only list origins you control: the header should not leak to third parties.
+Only list origins you control: the header should not leak to third parties. Propagation and metadata
+are best effort when an input or host API cannot be safely inspected. Tracking alone does not evaluate
+request method getters; `_http_method` can therefore be absent. Header propagation delegates native
+option reads with the original getter receiver, preserving inherited/non-enumerable options, streams
+and abort signals. Treat the header as optional at the receiving API.
 
 ## Flush and shutdown
 
@@ -640,7 +675,7 @@ Batches are sent every `flushIntervalMs`, or as soon as `flushThreshold` events 
 rarely need to intervene, but both are available:
 
 ```ts
-await Pulse.flush(); // send everything buffered, including attachments
+await Pulse.flush(); // attempt queued events and wait within the attachment deadline
 await Pulse.shutdown(); // flush, then remove every page hook the SDK installed
 ```
 
@@ -660,6 +695,19 @@ A failed request is retried with exponential backoff, one second doubling to thi
 header on a `429` or a `503` extends that wait — it never shortens it — to at most a minute. A batch
 still undelivered after six attempts is parked. Ingest deduplicates on the event id, so a batch that
 was both parked and sent is counted once.
+
+Event resource limits also apply independently of event counts: **128 KiB of serialized JSON per
+event**, **4 MiB in the queued event buffer**, and a **1 MiB offline queue budget**. A separate
+in-flight batch can retain up to **2.5 MiB**; these payload limits are not a total heap cap. The oldest
+buffered events are dropped to make room; an oversized event is dropped before attachment scheduling. At most 100
+own attributes are inspected, and keys longer than 256 UTF-16 code units are skipped. `beforeSend`
+still receives full message and admitted attribute strings; string truncation and the event byte
+check happen after the hook returns.
+
+Offline storage keeps bounded payloads across the shared key and unload spill keys. An unload write
+cannot rewrite the shared key without its lock, so fresh events may be dropped when it fills the
+budget. Cross-tab aggregate limits are best effort during concurrent unloads; storage quota failures
+can also discard telemetry. Increasing `maxBufferSize` does not increase these byte limits.
 
 ## Configuration
 
@@ -683,7 +731,7 @@ was both parked and sent is counted once.
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |
 | `flushThreshold` | `number` | `20` | Buffered events that trigger an immediate flush. |
-| `maxBufferSize` | `number` | `10000` | Buffered events kept before the oldest are dropped. |
+| `maxBufferSize` | `number` | `10000` | Buffered event count ceiling; the separate 4 MiB byte cap can drop oldest events sooner. |
 | `sessionTimeoutMs` | `number` | `1800000` | Idle time after which a new session starts. |
 | `supportedLanguages` | `string[]` | not sent | The locales your app ships. Written through to the app record on the server and used for localization-gap analysis. Set it explicitly; the SDK never derives it from the browser. |
 

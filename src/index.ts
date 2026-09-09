@@ -3,7 +3,15 @@ import { validateConfiguration, type ValidatedConfig } from "./configuration";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
 import { isIgnoredError } from "./error-filter";
-import { buildEvent, MAX_EVENT_MESSAGE_LENGTH, normalizeAttributes, type EventContext } from "./event-builder";
+import {
+  buildEvent,
+  MAX_ATTRIBUTES,
+  MAX_ATTRIBUTE_KEY_LENGTH,
+  MAX_EVENT_MESSAGE_LENGTH,
+  normalizeAttributes,
+  type EventContext,
+} from "./event-builder";
+import { jsonByteLength } from "./event-size";
 import { IdentityManager } from "./identity";
 import { installLifecycle } from "./lifecycle";
 import { metricMessage, stepMessage } from "./metrics";
@@ -204,12 +212,14 @@ function processEvent(event: LogEvent, hint: PulseEventHint): LogEvent | null {
     }
     if (result.custom_attributes !== undefined) {
       const attributes = result.custom_attributes;
-      if (!attributes || typeof attributes !== "object" || Array.isArray(attributes) ||
-          Object.values(attributes).some((value) => typeof value !== "string")) return null;
-      snapshot.custom_attributes = normalizeAttributes(attributes);
+      if (!attributes || typeof attributes !== "object" || Array.isArray(attributes)) return null;
+      // Validate only admitted entries: later getters must never run merely
+      // because the callback returned an oversized dictionary.
+      const normalized = normalizeAttributes(attributes, true, true);
+      snapshot.custom_attributes = normalized;
     }
     if (result.supported_languages !== undefined) {
-      if (!Array.isArray(result.supported_languages) ||
+      if (!Array.isArray(result.supported_languages) || jsonByteLength(result.supported_languages) === null ||
           result.supported_languages.some((value) => typeof value !== "string")) return null;
       snapshot.supported_languages = [...result.supported_languages];
     }
@@ -251,7 +261,7 @@ function recordEvent(
     };
 
     const event = processEvent(buildEvent(ctx, level, message, attributes, options?.screenName), hint);
-    if (!event) return;
+    if (!event || jsonByteLength(event) === null) return;
     printToConsole(event.level, event.message, event.custom_attributes);
     transport.enqueue(event);
     if (options?.attachments?.length) {
@@ -332,8 +342,20 @@ function captureException(
       capturedErrors.add(value);
     }
     const { message, attributes } = extractErrorAttributes(value, userMessage);
-    const merged: PulseAttributes = { ...userAttributes, ...attributes };
+    // Reserve diagnostic fields first, then admit bounded caller attributes.
+    // Spreading the entire caller dictionary would execute every getter before
+    // the builder's resource limits could run.
+    const merged: PulseAttributes = { ...attributes };
     if (kind) merged._unhandled = kind;
+    if (userAttributes) {
+      let visited = 0;
+      for (const key in userAttributes) {
+        if (!Object.hasOwn(userAttributes, key)) continue;
+        if (visited++ >= MAX_ATTRIBUTES) break;
+        if (key.length > MAX_ATTRIBUTE_KEY_LENGTH || Object.hasOwn(merged, key)) continue;
+        Object.defineProperty(merged, key, { value: userAttributes[key], enumerable: true, configurable: true });
+      }
+    }
     log("error", message, merged, options, { originalException: value });
   } catch {
     // No diagnostic may expose an exception that capture policy could not sanitize.

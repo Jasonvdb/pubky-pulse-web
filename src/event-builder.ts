@@ -11,6 +11,8 @@ import {
 
 export const MAX_EVENT_MESSAGE_LENGTH = 2000;
 export const MAX_ATTRIBUTE_VALUE_LENGTH = 200;
+export const MAX_ATTRIBUTES = 100;
+export const MAX_ATTRIBUTE_KEY_LENGTH = 256;
 /** A stack trace is worthless once trimmed to 200 characters. */
 export const MAX_ERROR_STACK_LENGTH = 16000;
 
@@ -65,6 +67,7 @@ export function randomUuid(): string {
 export function normalizeAttributes(
   attrs?: PulseAttributes,
   truncate = true,
+  stringsOnly = false,
 ): Record<string, string> | undefined {
   if (!attrs) return undefined;
 
@@ -72,7 +75,15 @@ export function normalizeAttributes(
   // from resolving to an inherited function and bypassing the cap, and lets a
   // `__proto__` key be stored as an ordinary attribute.
   const result: Record<string, string> = Object.create(null) as Record<string, string>;
-  for (const [key, value] of Object.entries(attrs)) {
+  let visited = 0;
+  for (const key in attrs) {
+    if (!Object.hasOwn(attrs, key)) continue;
+    if (visited++ >= MAX_ATTRIBUTES) break;
+    // Skip names instead of truncating them into collisions. Do not evaluate
+    // a value that will never be admitted to the event.
+    if (key.length > MAX_ATTRIBUTE_KEY_LENGTH) continue;
+    const value = attrs[key];
+    if (stringsOnly && typeof value !== "string") throw new Error("Pubky Pulse: invalid hook attribute");
     if (value === undefined || value === null) continue;
     const cap = Object.hasOwn(RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES, key)
       ? RESERVED_ATTRIBUTE_VALUE_LENGTH_OVERRIDES[key]!

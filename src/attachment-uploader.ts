@@ -1,26 +1,34 @@
 /**
  * Out-of-band upload of files attached to an event. Uploads run serially in a
  * background queue so a screenshot never delays the event itself; `flush()`
- * waits for the queue to empty.
+ * waits for the queue to empty, with a bounded wait for stalled host APIs.
  */
 
 import type { ValidatedConfig } from "./configuration";
 import { REQUEST_TIMEOUT_MS } from "./transport";
 import type { PulseAttachment } from "./types";
 
-/** Absolute SDK safety net. Real limits are the project's server-side quotas. */
-export const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024 * 1024;
+/** Browser memory safety limits; the server may impose smaller quotas. */
+export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+export const MAX_ATTACHMENT_QUEUE_BYTES = 20 * 1024 * 1024;
+export const MAX_ATTACHMENT_QUEUE_ITEMS = 20;
+/** Bounds both an item's background wait and one explicit flush call. */
+export const MAX_ATTACHMENT_WAIT_MS = 120_000;
+
+// Shared across uploader lifetimes: stopping or timing out cannot cancel an
+// already running Blob read, digest, or a host fetch that ignores abort.
+let retainedBytes = 0;
+let retainedItems = 0;
 
 /** Fixed part of an upload's budget, before the size allowance. */
 export const UPLOAD_TIMEOUT_BASE_MS = 30_000;
 /** Allowance per megabyte, generous enough for a slow mobile connection. */
 export const UPLOAD_TIMEOUT_PER_MB_MS = 10_000;
 /** Ceiling, so a stalled upload can never hold `flush()` open indefinitely. */
-export const MAX_UPLOAD_TIMEOUT_MS = 30 * 60_000;
+export const MAX_UPLOAD_TIMEOUT_MS = 80_000;
 
 /**
- * Attachments run to 2 GiB, so the 10s ingest budget would abort legitimate
- * large uploads; the PUT gets a size-derived budget instead.
+ * The PUT gets a size-derived budget, up to 80 seconds for a 5 MiB file.
  */
 export function uploadTimeoutMs(sizeBytes: number): number {
   const allowance = Math.ceil(sizeBytes / (1024 * 1024)) * UPLOAD_TIMEOUT_PER_MB_MS;
@@ -52,7 +60,12 @@ export function inferContentType(filename: string): string {
 interface PendingUpload {
   clientEventId: string;
   userId?: string;
-  attachment: PulseAttachment;
+  data: Blob | Uint8Array;
+  filename: string;
+  contentType: string;
+  sizeBytes: number;
+  cancelled: boolean;
+  release(): void;
 }
 
 interface ReserveResponse {
@@ -83,33 +96,53 @@ export class AttachmentUploader {
   private pending: PendingUpload[] = [];
   private draining: Promise<void> | null = null;
   private stopped = false;
-  private readonly requests = new Map<AbortController, ReturnType<typeof setTimeout>>();
+  private readonly requests = new Map<AbortController, { timer: ReturnType<typeof setTimeout>; owner: PendingUpload }>();
+  private wakeDrain: (() => void) | null = null;
 
   constructor(config: ValidatedConfig, onDebug?: (message: string, detail?: unknown) => void) {
     this.config = config;
     this.onDebug = onDebug;
   }
 
+  private debug(message: string, detail?: unknown): void {
+    try {
+      if (detail === undefined) this.onDebug?.(message);
+      else this.onDebug?.(message, detail);
+    } catch { /* Diagnostics must not reject background work or application calls. */ }
+  }
+
   /** Discard pending uploads and abort active requests when consent is withdrawn. */
   stop(): void {
     this.stopped = true;
-    this.pending = [];
-    for (const [controller, timer] of this.requests) {
-      clearTimeout(timer);
-      controller.abort();
-    }
-    this.requests.clear();
+    for (const item of this.pending.splice(0)) item.release();
+    this.wakeDrain?.();
+    this.abortRequests();
   }
 
-  private request(url: string, init: RequestInit, timeoutMs: number): Promise<Response>;
-  private request<T>(url: string, init: RequestInit, timeoutMs: number, consume: (response: Response) => Promise<T>): Promise<T>;
-  private async request<T>(url: string, init: RequestInit, timeoutMs: number, consume?: (response: Response) => Promise<T>): Promise<Response | T> {
-    if (this.stopped) throw new Error("Pubky Pulse: attachment uploader stopped");
+  private abortRequests(owner?: PendingUpload): void {
+    for (const [controller, request] of this.requests) {
+      if (owner && request.owner !== owner) continue;
+      try { clearTimeout(request.timer); } catch { /* Continue aborting other work. */ }
+      try { controller.abort(); } catch { /* A host may have replaced AbortController. */ }
+    }
+  }
+
+  private async request<T = Response>(
+    owner: PendingUpload,
+    url: string,
+    init: RequestInit,
+    timeoutMs: number,
+    consume?: (response: Response) => Promise<T>,
+  ): Promise<Response | T> {
+    if (this.stopped || owner.cancelled) throw new Error("Pubky Pulse: attachment uploader stopped");
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    this.requests.set(controller, timer);
+    const timer = setTimeout(() => {
+      try { controller.abort(); } catch { /* The end-to-end deadline still bounds waiting. */ }
+    }, timeoutMs);
+    this.requests.set(controller, { timer, owner });
     try {
       const response = await fetch(url, { ...init, signal: controller.signal });
+      if (this.stopped || owner.cancelled) throw new Error("Pubky Pulse: attachment upload cancelled");
       return consume ? await consume(response) : response;
     } finally {
       clearTimeout(timer);
@@ -117,39 +150,147 @@ export class AttachmentUploader {
     }
   }
 
-  /** Queue every attachment of one event. Returns immediately. */
+  /** Queue a bounded snapshot of each accepted attachment. Excess newest files are dropped. */
   enqueue(clientEventId: string, userId: string | undefined, attachments: PulseAttachment[]): void {
-    if (this.stopped || attachments.length === 0) return;
-
-    if (!subtleCrypto()) {
-      this.onDebug?.("crypto.subtle is unavailable (insecure context); skipping attachments");
-      return;
+    try {
+      if (this.stopped || !Array.isArray(attachments) || attachments.length === 0) return;
+      if (!subtleCrypto()) {
+        this.debug("crypto.subtle is unavailable (insecure context); skipping attachments");
+        return;
+      }
+      const count = Math.min(attachments.length, MAX_ATTACHMENT_QUEUE_ITEMS);
+      for (let index = 0; index < count; index++) {
+        if (retainedItems >= MAX_ATTACHMENT_QUEUE_ITEMS) break;
+        try {
+          const item = this.snapshot(clientEventId, userId, attachments[index]!);
+          if (item) this.pending.push(item);
+        } catch (error) {
+          this.debug("skipping invalid attachment", error);
+        }
+      }
+      if (!this.draining && this.pending.length > 0) this.draining = this.drain();
+    } catch (error) {
+      this.debug("could not queue attachments", error);
     }
-
-    for (const attachment of attachments) {
-      this.pending.push({ clientEventId, userId, attachment });
-    }
-    if (!this.draining) this.draining = this.drain();
   }
 
-  /** Resolve once the queue is empty. Resolves immediately when it is idle. */
+  private snapshot(clientEventId: string, userId: string | undefined, attachment: PulseAttachment): PendingUpload | null {
+    const source = attachment.data;
+    const blob = isBlob(source);
+    if (!blob && !(source instanceof Uint8Array)) {
+      this.debug("attachment data must be a Blob, File or Uint8Array");
+      return null;
+    }
+    const sizeBytes = blob ? source.size : source.byteLength;
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || sizeBytes > MAX_ATTACHMENT_BYTES) {
+      this.debug("skipping attachment: size exceeds the SDK cap or is invalid");
+      return null;
+    }
+    if (sizeBytes === 0) {
+      this.debug("skipping empty attachment");
+      return null;
+    }
+    if (retainedBytes + sizeBytes > MAX_ATTACHMENT_QUEUE_BYTES) return null;
+    if (blob) {
+      const sizeGetter = Object.getOwnPropertyDescriptor(Blob.prototype, "size")?.get;
+      const actualSize: unknown = sizeGetter ? Reflect.apply(sizeGetter, source, []) : undefined;
+      if (actualSize !== sizeBytes) {
+        this.debug("skipping attachment with inconsistent Blob size");
+        return null;
+      }
+    }
+
+    let filename = attachment.filename;
+    let contentType = attachment.contentType;
+    if (blob) {
+      const fileName = (source as Blob & { name?: unknown }).name;
+      filename ??= typeof fileName === "string" && fileName ? fileName : undefined;
+      if (!contentType) contentType = source.type || undefined;
+    }
+    const name = filename ?? "attachment.bin";
+    if (typeof name !== "string" || name.length > 1024 ||
+        (contentType !== undefined && (typeof contentType !== "string" || contentType.length > 255))) {
+      this.debug("skipping attachment with invalid or oversized metadata");
+      return null;
+    }
+    const type = contentType ?? inferContentType(name);
+    // Caller getters can re-enter enqueue or withdraw consent during snapshotting.
+    if (this.stopped || retainedItems >= MAX_ATTACHMENT_QUEUE_ITEMS ||
+        retainedBytes + sizeBytes > MAX_ATTACHMENT_QUEUE_BYTES) return null;
+    retainedItems++;
+    retainedBytes += sizeBytes;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      retainedItems--;
+      retainedBytes -= sizeBytes;
+    };
+    try {
+      // Copy every accepted typed array, including subarrays, so neither its
+      // backing allocation nor later application writes affect queued data.
+      let data: Blob | Uint8Array = source;
+      if (!blob) {
+        const copy = new Uint8Array(sizeBytes);
+        Uint8Array.prototype.set.call(copy, source);
+        data = copy;
+      }
+      return { clientEventId, userId, data, filename: name, contentType: type, sizeBytes, cancelled: false, release };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  /** Wait for queued work, but return within two minutes even if a host API stalls. */
   async flush(): Promise<void> {
-    while (this.draining) {
-      await this.draining;
+    const draining = this.draining;
+    if (!draining) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        draining,
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, MAX_ATTACHMENT_WAIT_MS); }),
+      ]);
+    } catch (error) {
+      this.debug("attachment flush failed", error);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async waitForWork(item: PendingUpload, work: Promise<void>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await new Promise<void>((resolve) => {
+        const cancel = () => {
+          item.cancelled = true;
+          this.abortRequests(item);
+          resolve();
+        };
+        this.wakeDrain = cancel;
+        timer = setTimeout(cancel, MAX_ATTACHMENT_WAIT_MS);
+        void work.then(resolve, resolve);
+      });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      this.wakeDrain = null;
     }
   }
 
   private async drain(): Promise<void> {
     try {
-      let next = this.pending.shift();
-      while (!this.stopped && next) {
-        try {
-          await this.uploadOne(next);
-        } catch (err) {
-          this.onDebug?.("attachment upload failed", err);
-        }
-        next = this.pending.shift();
+      while (!this.stopped) {
+        const item = this.pending.shift();
+        if (!item) break;
+        // The reservation belongs to the actual work, never to its timeout.
+        const work = this.uploadOne(item).catch((error: unknown) => {
+          this.debug("attachment upload failed", error);
+        }).finally(() => item.release());
+        await this.waitForWork(item, work);
       }
+    } catch (error) {
+      this.debug("attachment queue failed", error);
     } finally {
       this.draining = null;
     }
@@ -157,54 +298,28 @@ export class AttachmentUploader {
 
   private async uploadOne(item: PendingUpload): Promise<void> {
     const subtle = subtleCrypto();
-    if (!subtle) return;
-
-    const source = item.attachment.data;
-    const blob = isBlob(source) ? source : null;
-    let filename = item.attachment.filename;
-    let contentType = item.attachment.contentType;
-
-    if (blob) {
-      const asFile = blob as Blob & { name?: string };
-      filename ??= typeof asFile.name === "string" && asFile.name ? asFile.name : undefined;
-      if (!contentType && blob.type) contentType = blob.type;
-    } else if (!(source instanceof Uint8Array)) {
-      this.onDebug?.("attachment data must be a Blob, File or Uint8Array");
+    if (!subtle || this.stopped || item.cancelled) return;
+    const blob = isBlob(item.data) ? item.data : null;
+    const bytes = blob
+      ? new Uint8Array(await Reflect.apply(Blob.prototype.arrayBuffer, blob, []) as ArrayBuffer)
+      : item.data as Uint8Array;
+    if (this.stopped || item.cancelled) return;
+    if (bytes.byteLength !== item.sizeBytes) {
+      this.debug("attachment bytes changed size while reading");
       return;
     }
-
-    const name = filename ?? "attachment.bin";
-    const type = contentType ?? inferContentType(name);
-    // `Blob.size` is known without reading the file, so an empty or over-cap
-    // attachment is rejected before it is materialised in the heap.
-    const sizeBytes = blob ? blob.size : (source as Uint8Array).length;
-
-    if (sizeBytes === 0) {
-      this.onDebug?.(`skipping empty attachment "${name}"`);
-      return;
-    }
-    if (sizeBytes > MAX_ATTACHMENT_BYTES) {
-      this.onDebug?.(`skipping attachment "${name}": ${sizeBytes} bytes exceeds the SDK cap`);
-      return;
-    }
-
-    const bytes = blob ? new Uint8Array(await blob.arrayBuffer()) : (source as Uint8Array);
-    if (this.stopped) return;
     const sha256 = await sha256Hex(bytes, subtle);
-    if (this.stopped) return;
+    if (this.stopped || item.cancelled) return;
     const reserved = await this.reserve({
       clientEventId: item.clientEventId,
       userId: item.userId,
-      filename: name,
-      contentType: type,
-      sizeBytes,
+      filename: item.filename,
+      contentType: item.contentType,
+      sizeBytes: item.sizeBytes,
       sha256,
-    });
-    if (this.stopped || !reserved) return;
-
-    // The Blob itself is the body: the browser streams it instead of copying
-    // the hashed buffer into the request, which can then be collected.
-    await this.putBytes(reserved.upload_url, blob ?? bytes, sizeBytes, name);
+    }, item);
+    if (this.stopped || item.cancelled || !reserved) return;
+    await this.putBytes(reserved.upload_url, blob ?? bytes, item.sizeBytes, item.filename, item);
   }
 
   private async reserve(args: {
@@ -214,7 +329,7 @@ export class AttachmentUploader {
     contentType: string;
     sizeBytes: number;
     sha256: string;
-  }): Promise<ReserveResponse | null> {
+  }, item: PendingUpload): Promise<ReserveResponse | null> {
     const payload: Record<string, unknown> = {
       client_event_id: args.clientEventId,
       original_filename: args.filename,
@@ -226,7 +341,7 @@ export class AttachmentUploader {
     if (args.userId) payload.user_id = args.userId;
 
     try {
-      const { response, body } = await this.request(`${this.config.endpoint}/v1/ingest/attachment`, {
+      const result = await this.request(item, `${this.config.endpoint}/v1/ingest/attachment`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -237,17 +352,18 @@ export class AttachmentUploader {
         response,
         body: response.ok ? await response.json() as ReserveResponse : null,
       }));
+      const { response, body } = result as { response: Response; body: ReserveResponse | null };
       if (!response.ok) {
-        this.onDebug?.(`attachment reserve for "${args.filename}" failed (${response.status})`);
+        this.debug(`attachment reserve for "${args.filename}" failed (${response.status})`);
         return null;
       }
       if (!body || typeof body.upload_url !== "string") {
-        this.onDebug?.(`attachment reserve for "${args.filename}" returned no upload url`);
+        this.debug(`attachment reserve for "${args.filename}" returned no upload url`);
         return null;
       }
       return body;
     } catch (err) {
-      this.onDebug?.("attachment reserve failed", err);
+      this.debug("attachment reserve failed", err);
       return null;
     }
   }
@@ -257,9 +373,10 @@ export class AttachmentUploader {
     body: Blob | Uint8Array,
     sizeBytes: number,
     name: string,
+    item: PendingUpload,
   ): Promise<void> {
     try {
-      const response = await this.request(url, {
+      const response = await this.request(item, url, {
         method: "PUT",
         headers: {
           "Content-Type": "application/octet-stream",
@@ -268,10 +385,10 @@ export class AttachmentUploader {
         body: body as unknown as BodyInit,
       }, uploadTimeoutMs(sizeBytes));
       if (!response.ok) {
-        this.onDebug?.(`attachment upload "${name}" failed (${response.status})`);
+        this.debug(`attachment upload "${name}" failed (${response.status})`);
       }
     } catch (err) {
-      this.onDebug?.("attachment upload failed", err);
+      this.debug("attachment upload failed", err);
     }
   }
 }
