@@ -48,6 +48,49 @@ function requestMethod(input: RequestInfo | URL, init?: RequestInit): string | u
 }
 
 /**
+ * Distinguish an unavailable header adapter from an application conversion
+ * failure. Once a header initializer has been inspected, replaying it could
+ * invoke getters twice or consume a one-shot iterable again.
+ */
+function sessionHeaders(value: unknown, sessionId: string): unknown {
+  let inspected = false;
+  let initializer = value;
+  if (value !== null && (typeof value === "object" || typeof value === "function")) {
+    initializer = new Proxy({}, {
+      get(_target, key) {
+        inspected = true;
+        const member: unknown = Reflect.get(value, key, value);
+        if (key === Symbol.iterator && typeof member === "function") {
+          return (...args: unknown[]) => Reflect.apply(member, value, args);
+        }
+        return member;
+      },
+      ownKeys() {
+        inspected = true;
+        return Reflect.ownKeys(value);
+      },
+      getOwnPropertyDescriptor(_target, key) {
+        inspected = true;
+        const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+        return descriptor ? { ...descriptor, configurable: true } : undefined;
+      },
+    });
+  }
+  let headers: Headers;
+  try {
+    headers = new Headers(initializer as HeadersInit | undefined);
+  } catch (error) {
+    if (inspected) throw error;
+    // No caller header state was consumed, so native fetch can own conversion.
+    return value;
+  }
+  try {
+    headers.set(SESSION_HEADER, sessionId);
+  } catch { /* Preserve successfully converted application headers without annotation. */ }
+  return headers;
+}
+
+/**
  * Override just the native dictionary's headers read. A fresh proxy target
  * avoids invariants on frozen init objects; forwarding with the original
  * receiver preserves inherited fields, accessor ordering and getter `this`.
@@ -62,13 +105,7 @@ function withSessionHeader(input: RequestInfo | URL, init: RequestInit | undefin
       const value: unknown = Reflect.get(source, key, source);
       if (key !== "headers") return value;
       const originalHeaders = value === undefined && isRequest(input) ? input.headers : value;
-      const headers = new Headers(originalHeaders as HeadersInit | undefined);
-      try {
-        headers.set(SESSION_HEADER, sessionId);
-      } catch {
-        // An invalid session id must not change the application's headers.
-      }
-      return headers;
+      return sessionHeaders(originalHeaders, sessionId);
     },
     // Fetch wrappers often spread init before forwarding it. Keep all its own
     // fields visible, plus our header override, without eagerly reading getters.

@@ -8,6 +8,7 @@ import { resetSlugWarning } from "../src/metrics";
 import { SafeStorage } from "../src/storage";
 import { OfflineQueue } from "../src/offline-queue";
 import { Transport } from "../src/transport";
+import { AttachmentUploader } from "../src/attachment-uploader";
 import { validateConfiguration } from "../src/configuration";
 import type { LogEvent, PulseAttributes } from "../src/types";
 import { resetTestEnvironment, testLocalStorage, testNavigator, testWindow, testDocument } from "./setup";
@@ -44,6 +45,39 @@ describe("runtime host safety", () => {
     await Pulse.shutdown();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it.each(["shutdown", "reconfigure", "failed-flush"])("stops retired attachment work after %s finishes draining", async (mode) => {
+    vi.useFakeTimers();
+    let release!: (buffer: ArrayBuffer) => void;
+    const pending = new Promise<ArrayBuffer>((resolve) => { release = resolve; });
+    vi.stubGlobal("crypto", { subtle: { digest: () => pending } });
+    request.mockImplementation(async (url: string) => String(url).endsWith("/v1/ingest/attachment")
+      ? new Response(JSON.stringify({ upload_url: "https://upload.example.com/file" }))
+      : new Response("{}"));
+    Pulse.configure(config);
+    Pulse.info("with-files", undefined, { attachments: [
+      { data: new Uint8Array([1]) }, { data: new Uint8Array([2]) }, { data: new Uint8Array([3]) },
+    ] });
+    try {
+      if (mode === "failed-flush") {
+        vi.spyOn(AttachmentUploader.prototype, "flush").mockRejectedValueOnce(new Error("flush failed"));
+        await Pulse.shutdown();
+      } else {
+        const shutdown = mode === "shutdown" ? Pulse.shutdown() : undefined;
+        if (mode === "reconfigure") Pulse.configure({ ...config, appVersion: "next" });
+        await vi.advanceTimersByTimeAsync(120_000);
+        if (shutdown) await shutdown;
+      }
+      Pulse.init({ enabled: false });
+      release(new ArrayBuffer(32));
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+      expect(request.mock.calls.filter(([url]) => String(url).includes("/v1/ingest/attachment"))).toEqual([]);
+    } finally {
+      Pulse.init({ enabled: false });
+      release(new ArrayBuffer(32));
+      for (let i = 0; i < 50; i++) await Promise.resolve();
+    }
   });
 
   it("keeps log calls and subsequent delivery working when UUID generation fails", async () => {

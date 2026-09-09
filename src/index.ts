@@ -451,6 +451,9 @@ async function drainClient(previousTransport: Transport | null, previousAttachme
     try { await previousAttachments?.flush(); } catch { /* Background delivery is best effort. */ }
   } finally {
     if (previousTransport) retiringTransports.delete(previousTransport);
+    // A bounded flush can finish before noncancelable attachment work settles.
+    // Stop it before dropping the reference needed by later consent withdrawal.
+    try { previousAttachments?.stop(); } catch { /* Retirement cleanup is best effort. */ }
     if (previousAttachments) retiringAttachments.delete(previousAttachments);
   }
 }

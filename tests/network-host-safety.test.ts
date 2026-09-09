@@ -138,6 +138,36 @@ describe("request behavior with instrumentation", () => {
     install();
     await expect(fetch("https://app.example.com/api/orders", "invalid" as RequestInit)).rejects.toBeInstanceOf(TypeError);
   });
+  it("forwards original headers when the optional Headers adapter fails before conversion", async () => {
+    const reads: string[] = [];
+    const init = {
+      get headers() { expect(this).toBe(init); reads.push("headers"); return { "X-App": "yes" }; },
+      get method() { expect(this).toBe(init); reads.push("method"); return "POST"; },
+    };
+    const baseline = new Request("https://app.example.com/api/orders", init);
+    const baselineReads = [...reads];
+    reads.length = 0;
+    let sent!: Request;
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => { sent = new Request(input, options); return new Response("ok"); }));
+    vi.stubGlobal("Headers", class { constructor() { throw new Error("header adapter unavailable"); } });
+    install();
+    await expect(fetch("https://app.example.com/api/orders", init)).resolves.toBeInstanceOf(Response);
+    expect(sent.method).toBe(baseline.method);
+    expect(sent.headers.get("X-App")).toBe("yes");
+    expect(reads).toEqual(baselineReads);
+  });
+  it("does not replay throwing native header getters or iterable conversion", async () => {
+    const failure = new Error("application header failure");
+    const getHeaders = vi.fn(() => { throw failure; });
+    const getIterator = vi.fn(() => { throw failure; });
+    const badIterable = Object.defineProperty({}, Symbol.iterator, { get: getIterator });
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => { new Request(input, options); return new Response("ok"); }));
+    install();
+    await expect(fetch("https://app.example.com/api/orders", Object.defineProperty({}, "headers", { get: getHeaders }))).rejects.toBe(failure);
+    await expect(fetch("https://app.example.com/api/orders", { headers: badIterable })).rejects.toBe(failure);
+    expect(getHeaders).toHaveBeenCalledTimes(1);
+    expect(getIterator).toHaveBeenCalledTimes(1);
+  });
   it("contains a response metadata getter failure", async () => {
     const response = new Response("ok");
     Object.defineProperty(response, "status", { get() { throw new Error("metadata failed"); } });
