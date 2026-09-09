@@ -664,10 +664,17 @@ to both the events and the header below.
 `propagateSessionTo` lists URL prefixes that receive the `X-Pulse-Session-Id` header, and works
 whether or not `networkTracking` is on — the same `fetch` wrapper is installed when either is set.
 Only list origins you control: the header should not leak to third parties. Propagation and metadata
-are best effort when an input or host API cannot be safely inspected. Tracking alone does not evaluate
-request method getters; `_http_method` can therefore be absent. Header propagation delegates native
-option reads with the original getter receiver, preserving inherited/non-enumerable options, streams
-and abort signals. Treat the header as optional at the receiving API.
+are best effort when an input or host API cannot be safely inspected. Method metadata is captured
+only when the underlying fetch or another wrapper reads `init.method`, preserving getter receiver,
+read count and native conversion order. Primitive string methods, including ordinary POSTs, are
+reported; methods requiring extra coercion or never read by a wrapper can omit `_http_method`.
+
+Instrumentation forwards `RequestInit` through a distinct object to observe reads safely. Tracking
+alone forwards wrapper writes/deletions to the original options; propagation uses local overrides.
+Inherited/non-enumerable fields, streams and abort signals remain available. Explicitly freezing a
+propagation facade can skip the optional header. Code relying on options-object identity or exotic
+Proxy reflection needs integration testing; universal Proxy transparency is not promised. Treat the
+header as optional at the receiving API.
 
 ## Flush and shutdown
 

@@ -22,10 +22,10 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
-function install(propagate = true): void {
+function install(propagate = true, onRequest: (level: unknown, attributes: Record<string, string>) => void = () => {}): void {
   uninstall = installNetworkTracking({
     endpoint: "https://pulse.example.com", propagateSessionTo: propagate ? ["https://app.example.com/api"] : [],
-    trackRequests: true, sessionId: () => "session", onRequest() {},
+    trackRequests: true, sessionId: () => "session", onRequest,
   });
 }
 
@@ -62,7 +62,8 @@ describe("request behavior with instrumentation", () => {
     methodReads = 0;
     let sent!: Request;
     vi.stubGlobal("fetch", vi.fn(async (input, options) => {
-      if (!propagate) expect(options).toBe(init);
+      // Lazy observation uses a facade; native reads still use the original receiver.
+      expect(options === init).toBe(false);
       sent = new Request(input, options);
       return new Response("ok");
     }));
@@ -167,6 +168,127 @@ describe("request behavior with instrumentation", () => {
     await expect(fetch("https://app.example.com/api/orders", { headers: badIterable })).rejects.toBe(failure);
     expect(getHeaders).toHaveBeenCalledTimes(1);
     expect(getIterator).toHaveBeenCalledTimes(1);
+  });
+  it("does not inspect RequestInit proxy descriptors or prototypes before native conversion", async () => {
+    let method = "POST";
+    const descriptors = vi.fn(() => { method = "DELETE"; return undefined; });
+    const prototypes = vi.fn(() => { method = "DELETE"; return null; });
+    const init = new Proxy({}, {
+      get(_target, key) { return key === "method" ? method : undefined; },
+      getOwnPropertyDescriptor: descriptors,
+      getPrototypeOf: prototypes,
+    });
+    let sent!: Request;
+    const reported = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => { sent = new Request(input, options); return new Response("ok"); }));
+    install(false, reported);
+    await fetch("https://app.example.com/api/orders", init);
+    expect(sent.method).toBe("POST");
+    expect(descriptors).not.toHaveBeenCalled();
+    expect(prototypes).not.toHaveBeenCalled();
+    expect(reported.mock.calls[0]![1]._http_method).toBe("POST");
+  });
+  it("observes method getter results only on the underlying fetch read", async () => {
+    const getter = vi.fn(function (this: unknown) { expect(this).toBe(init); return "post"; });
+    const init = Object.defineProperty({}, "method", { get: getter });
+    const reported = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => {
+      expect(getter).not.toHaveBeenCalled();
+      const sent = new Request(input, options);
+      expect(sent.method).toBe("POST");
+      return new Response("ok");
+    }));
+    install(false, reported);
+    await fetch("https://app.example.com/api/orders", init);
+    expect(getter).toHaveBeenCalledTimes(1);
+    expect(reported.mock.calls[0]![1]._http_method).toBe("POST");
+  });
+  it.each([false, true])("retains an explicit inherited abort signal through wrapper presence checks, propagation=%s", async (propagate) => {
+    const controller = new AbortController();
+    const failure = new Error("caller cancelled");
+    controller.abort(failure);
+    const init = Object.create({ signal: controller.signal });
+    vi.stubGlobal("fetch", vi.fn(async (_input, options) => {
+      if (!("signal" in options)) options.signal = new AbortController().signal;
+      expect(Object.hasOwn(options, "signal")).toBe(false);
+      expect(options.signal).toBe(controller.signal);
+      options.signal.throwIfAborted();
+      return new Response("ok");
+    }));
+    install(propagate);
+    await expect(fetch("https://app.example.com/api/orders", init)).rejects.toBe(failure);
+  });
+  it.each([false, true])("respects wrapper deletion, replacement and enumeration, propagation=%s", async (propagate) => {
+    const init: RequestInit = { method: "POST", body: "before", credentials: "include" };
+    let sent!: Request;
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => {
+      delete options.credentials;
+      delete options.body;
+      options.method = "PUT";
+      expect("credentials" in options).toBe(false);
+      expect(Object.keys(options)).not.toContain("body");
+      sent = new Request(input, { ...options });
+      return new Response("ok");
+    }));
+    install(propagate);
+    await fetch("https://app.example.com/api/orders", init);
+    expect(sent.method).toBe("PUT");
+    expect(sent.credentials).toBe("same-origin");
+    expect(await sent.text()).toBe("");
+    expect(init).toEqual(propagate ? { method: "POST", body: "before", credentials: "include" } : { method: "PUT" });
+  });
+  it.each([false, true])("converts frozen RequestInit values and inherited methods, propagation=%s", async (propagate) => {
+    const signal = new AbortController().signal;
+    const init = Object.freeze(Object.assign(Object.create({ method: "POST" }), { signal, body: "payload" }));
+    let sent!: Request;
+    const reported = vi.fn();
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => {
+      expect(options.signal).toBe(signal);
+      sent = new Request(input, options);
+      return new Response("ok");
+    }));
+    install(propagate, reported);
+    await fetch("https://app.example.com/api/orders", init);
+    expect(sent.method).toBe("POST");
+    expect(await sent.text()).toBe("payload");
+    expect(reported.mock.calls[0]![1]._http_method).toBe("POST");
+    expect(Object.keys(init)).toEqual(["signal", "body"]);
+  });
+  it("forwards tracking-only setters, deletion and freezing to the original options", async () => {
+    let method = "POST";
+    const init: RequestInit = { body: "payload", get method() { return method; }, set method(value) { expect(this).toBe(init); method = value!; } };
+    let sent!: Request;
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => {
+      options.method = "PUT";
+      delete options.body;
+      Object.freeze(options);
+      expect(Object.isFrozen(init)).toBe(true);
+      expect(Object.isFrozen(options)).toBe(true);
+      sent = new Request(input, options);
+      return new Response("ok");
+    }));
+    install(false);
+    await fetch("https://app.example.com/api/orders", init);
+    expect(sent.method).toBe("PUT");
+    expect(await sent.text()).toBe("");
+  });
+  it("supports a wrapper freezing the propagation facade without changing native options", async () => {
+    let methodReads = 0;
+    const init = Object.create({ credentials: "include" });
+    Object.defineProperty(init, "method", { enumerable: true, configurable: true, get() { expect(this).toBe(init); methodReads++; return "POST"; } });
+    let sent!: Request;
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => {
+      Object.freeze(options);
+      expect(Object.isFrozen(options)).toBe(true);
+      expect(methodReads).toBe(0);
+      sent = new Request(input, options);
+      return new Response("ok");
+    }));
+    install();
+    await fetch("https://app.example.com/api/orders", init);
+    expect(sent.method).toBe("POST");
+    expect(sent.credentials).toBe("include");
+    expect(methodReads).toBe(1);
   });
   it("contains a response metadata getter failure", async () => {
     const response = new Response("ok");

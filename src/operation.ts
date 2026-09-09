@@ -1,5 +1,5 @@
 import { nowMs } from "./clock";
-import { randomUuid } from "./event-builder";
+import { MAX_ATTRIBUTES, MAX_ATTRIBUTE_KEY_LENGTH, randomUuid } from "./event-builder";
 import { metricMessage, normalizeSlug, type MetricPhase } from "./metrics";
 import type { PulseAttributes, PulseLogLevel } from "./types";
 
@@ -20,6 +20,22 @@ function describeError(error: unknown): string {
   } catch {
     return "unknown error";
   }
+}
+
+/** Reserve correlation fields before admitting bounded, uncoerced caller values. */
+function operationAttributes(reserved: Record<string, string>, caller?: PulseAttributes): PulseAttributes {
+  const result: PulseAttributes = Object.assign(Object.create(null) as PulseAttributes, reserved);
+  if (!caller) return result;
+  let count = Object.keys(reserved).length;
+  let visited = 0;
+  for (const key in caller) {
+    if (!Object.hasOwn(caller, key)) continue;
+    if (visited++ >= MAX_ATTRIBUTES || count >= MAX_ATTRIBUTES) break;
+    if (key.length > MAX_ATTRIBUTE_KEY_LENGTH || Object.hasOwn(result, key)) continue;
+    result[key] = caller[key];
+    count += 1;
+  }
+  return result;
 }
 
 let constructing = false;
@@ -60,10 +76,9 @@ export class PulseOperation {
       this.slug = normalizeSlug(metric);
       this.trackingId = randomUuid();
       this.startedAt = nowMs();
-      this.log("info", metricMessage(this.slug, "start"), {
-        ...attributes,
+      this.log("info", metricMessage(this.slug, "start"), operationAttributes({
         tracking_id: this.trackingId,
-      });
+      }, attributes));
     } catch { /* An operation must never replace the application's own result. */ }
     finally { constructing = false; }
   }
@@ -93,12 +108,12 @@ export class PulseOperation {
     this.finished = true;
 
     try {
-      this.log(level, metricMessage(this.slug, phase), {
-        ...attributes,
-        ...(phase === "fail" ? { error: describeError(error) } : {}),
+      const reserved: Record<string, string> = {
         tracking_id: this.trackingId,
         duration_ms: String(Math.max(0, Math.round(nowMs() - this.startedAt))),
-      });
+      };
+      if (phase === "fail") reserved.error = describeError(error);
+      this.log(level, metricMessage(this.slug, phase), operationAttributes(reserved, attributes));
     } catch { /* Finishing is best effort and remains idempotent after a failure. */ }
   }
 }

@@ -121,4 +121,68 @@ describe("PulseOperation", () => {
     expect(logged[1]?.attributes?.tracking_id).toBe(operation.trackingId);
     expect(logged[1]?.attributes?.duration_ms).toBe("40");
   });
+
+  it.each(["start", "complete", "fail", "cancel"] as const)(
+    "bounds caller-attribute reads before constructing the %s event", (phase) => {
+      const attributes = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`field-${index}`, "value"]));
+      const overflow = vi.fn(() => "not admitted");
+      Object.defineProperty(attributes, "overflow", { enumerable: true, get: overflow });
+      const operation = newOperation("bounded-operation", phase === "start" ? attributes : undefined);
+      if (phase === "complete") operation.complete(attributes);
+      if (phase === "fail") operation.fail("failure", attributes);
+      if (phase === "cancel") operation.cancel(attributes);
+
+      expect(overflow).not.toHaveBeenCalled();
+      const emitted = logged.at(-1)!.attributes!;
+      expect(Object.keys(emitted)).toHaveLength(100);
+      expect(emitted.tracking_id).toBe(operation.trackingId);
+      if (phase !== "start") expect(emitted.duration_ms).toBeDefined();
+      if (phase === "fail") expect(emitted.error).toBe("failure");
+    },
+  );
+
+  it.each(["start", "complete", "fail", "cancel"] as const)(
+    "skips oversized and inherited attribute keys for %s without evaluating their getters", (phase) => {
+      const skipped = vi.fn(() => "not admitted");
+      const inherited = { get parent() { return skipped(); } };
+      const attributes: PulseAttributes = Object.create(inherited) as PulseAttributes;
+      attributes["x".repeat(256)] = "boundary key";
+      Object.defineProperty(attributes, "__proto__", { enumerable: true, value: "ordinary own attribute" });
+      Object.defineProperty(attributes, "x".repeat(257), { enumerable: true, get: skipped });
+      Object.defineProperty(attributes, "hidden", { enumerable: false, get: skipped });
+      const operation = newOperation("bounded-operation", phase === "start" ? attributes : undefined);
+      if (phase === "complete") operation.complete(attributes);
+      if (phase === "fail") operation.fail("failure", attributes);
+      if (phase === "cancel") operation.cancel(attributes);
+
+      expect(skipped).not.toHaveBeenCalled();
+      const emitted = logged.at(-1)!.attributes!;
+      expect(emitted["x".repeat(256)]).toBe("boundary key");
+      expect(emitted["x".repeat(257)]).toBeUndefined();
+      expect(Object.hasOwn(emitted, "__proto__")).toBe(true);
+      expect(emitted["__proto__"]).toBe("ordinary own attribute");
+      expect(emitted.parent).toBeUndefined();
+      expect(emitted.hidden).toBeUndefined();
+    },
+  );
+
+  it.each(["start", "complete", "fail", "cancel"] as const)(
+    "reserves %s operation fields without reading caller attempts to replace them", (phase) => {
+      const spoof = vi.fn(() => "spoofed");
+      const attributes: PulseAttributes = {};
+      const reserved = phase === "start" ? ["tracking_id"] : ["tracking_id", "duration_ms"];
+      if (phase === "fail") reserved.push("error");
+      for (const key of reserved) Object.defineProperty(attributes, key, { enumerable: true, get: spoof });
+      const operation = newOperation("bounded-operation", phase === "start" ? attributes : undefined);
+      if (phase === "complete") operation.complete(attributes);
+      if (phase === "fail") operation.fail("actual failure", attributes);
+      if (phase === "cancel") operation.cancel(attributes);
+
+      expect(spoof).not.toHaveBeenCalled();
+      expect(logged.at(-1)?.attributes?.tracking_id).toBe(operation.trackingId);
+      if (phase !== "start") expect(logged.at(-1)?.attributes?.duration_ms).not.toBe("spoofed");
+      if (phase === "fail") expect(logged.at(-1)?.attributes?.error).toBe("actual failure");
+    },
+  );
+
 });

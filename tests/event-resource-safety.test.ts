@@ -258,4 +258,49 @@ describe("event resource safety", () => {
     expect(() => validateConfiguration({ ...config, flushIntervalMs: 2 ** 31 })).toThrow(/flushIntervalMs/);
     expect(validateConfiguration({ ...config, flushIntervalMs: 2 ** 31 - 1 }).flushIntervalMs).toBe(2 ** 31 - 1);
   });
+
+  it.each(["complete", "fail", "cancel"] as const)(
+    "retains operation correlation and %s details when caller attributes fill the budget", async (phase) => {
+      Pulse.configure(config);
+      vi.spyOn(performance, "now").mockReturnValueOnce(1000).mockReturnValueOnce(1250);
+      const attributes = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [`field-${index}`, "value"]));
+      const operation = Pulse.startOperation("bounded-operation", attributes);
+      if (phase === "fail") operation.fail("actual failure", attributes);
+      else operation[phase](attributes);
+      await Pulse.flush();
+
+      const metricEvents = sent().filter((item) => item.message.startsWith("metric:"));
+      expect(metricEvents).toHaveLength(2);
+      for (const item of metricEvents) {
+        expect(Object.keys(item.custom_attributes!)).toHaveLength(100);
+        expect(item.custom_attributes?.tracking_id).toBe(operation.trackingId);
+      }
+      expect(metricEvents[1]?.custom_attributes?.duration_ms).toBe("250");
+      if (phase === "fail") expect(metricEvents[1]?.custom_attributes?.error).toBe("actual failure");
+    },
+  );
+
+  it.each(["complete", "fail", "cancel"] as const)(
+    "preserves full admitted operation strings for beforeSend sanitization through %s", async (phase) => {
+      const full = "sensitive-prefix:" + "x".repeat(150000);
+      const observed: string[] = [];
+      Pulse.configure({ ...config, beforeSend: (item) => {
+        if (item.message.startsWith("metric:")) {
+          observed.push(item.custom_attributes!.detail!);
+          item.custom_attributes!.detail = "redacted";
+        }
+        return item;
+      } });
+      const operation = Pulse.startOperation("sanitize-operation", { detail: full });
+      if (phase === "fail") operation.fail("failure", { detail: full });
+      else operation[phase]({ detail: full });
+      await Pulse.flush();
+
+      expect(observed).toEqual([full, full]);
+      const metricEvents = sent().filter((item) => item.message.startsWith("metric:"));
+      expect(metricEvents).toHaveLength(2);
+      expect(metricEvents.map((item) => item.custom_attributes?.detail)).toEqual(["redacted", "redacted"]);
+    },
+  );
+
 });

@@ -31,20 +31,68 @@ function requestUrl(input: RequestInfo | URL): string | undefined {
   return undefined;
 }
 
-/** Observe only data properties: fetch must be the sole caller of init getters. */
-function requestMethod(input: RequestInfo | URL, init?: RequestInit): string | undefined {
-  let cursor: object | null = init == null ? null : Object(init);
-  for (let depth = 0; cursor !== null && depth < 32; depth++) {
-    const descriptor = Object.getOwnPropertyDescriptor(cursor, "method");
-    if (descriptor) {
-      if (!("value" in descriptor)) return undefined;
-      const method: unknown = descriptor.value;
-      if (method !== undefined) return typeof method === "string" ? method.toUpperCase() : undefined;
-      break;
+/** Read a Request's platform method without invoking an overridden instance getter. */
+function defaultMethod(input: RequestInfo | URL): string | undefined {
+  if (!isRequest(input)) return "GET";
+  const getter = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
+  return getter ? Reflect.apply(getter, input, []) as string : undefined;
+}
+
+/** Observe the exact read performed by fetch or a preceding fetch wrapper. */
+function observeMethod(init: RequestInit, onMethod: (value: unknown) => void): RequestInit {
+  const target = Object.create(null) as RequestInit;
+  const synchronize = (): void => {
+    for (const key of Reflect.ownKeys(init)) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(init, key);
+      if (descriptor) Reflect.defineProperty(target, key, descriptor);
     }
-    cursor = Object.getPrototypeOf(cursor) as object | null;
-  }
-  return isRequest(input) ? input.method : "GET";
+    Reflect.setPrototypeOf(target, Reflect.getPrototypeOf(init));
+    Reflect.preventExtensions(target);
+  };
+  // An empty target matters: using a caller Proxy as the target would make
+  // engine invariant checks execute its descriptor traps after every read.
+  return new Proxy(target, {
+    get(_target, key) {
+      const value: unknown = Reflect.get(init, key, init);
+      if (key === "method") {
+        try { onMethod(value); } catch { /* Metadata cannot change request conversion. */ }
+      }
+      return value;
+    },
+    set(_target, key, value) { return Reflect.set(init, key, value, init); },
+    has(_target, key) { return Reflect.has(init, key); },
+    deleteProperty(_target, key) {
+      if (!Reflect.deleteProperty(init, key)) return false;
+      return Reflect.deleteProperty(target, key);
+    },
+    ownKeys() { return Reflect.ownKeys(init); },
+    getOwnPropertyDescriptor(_target, key) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(init, key);
+      if (!descriptor) return undefined;
+      const existing = Reflect.getOwnPropertyDescriptor(target, key);
+      return existing?.configurable === false || !Reflect.isExtensible(target)
+        ? descriptor : { ...descriptor, configurable: true };
+    },
+    defineProperty(_target, key, descriptor) {
+      if (!Reflect.defineProperty(init, key, descriptor)) return false;
+      const actual = Reflect.getOwnPropertyDescriptor(init, key);
+      return actual !== undefined && Reflect.defineProperty(target, key, actual);
+    },
+    getPrototypeOf() { return Reflect.getPrototypeOf(init); },
+    setPrototypeOf(_target, prototype) {
+      return Reflect.setPrototypeOf(init, prototype) && Reflect.setPrototypeOf(target, prototype);
+    },
+    isExtensible() {
+      const extensible = Reflect.isExtensible(init);
+      if (!extensible && Reflect.isExtensible(target)) synchronize();
+      return extensible;
+    },
+    preventExtensions() {
+      if (!Reflect.preventExtensions(init)) return false;
+      synchronize();
+      return true;
+    },
+  });
 }
 
 /**
@@ -98,26 +146,99 @@ function sessionHeaders(value: unknown, sessionId: string): unknown {
  */
 function withSessionHeader(input: RequestInfo | URL, init: RequestInit | undefined, sessionId: string): RequestInit {
   const sourceInit = init ?? {};
-  const overrides: RequestInit = {};
+  const overrides = Object.create(null) as RequestInit;
+  const deleted = new Set<PropertyKey>();
+  let detached = false;
+  let annotate = true;
+
+  const sourceDescriptor = (key: PropertyKey): PropertyDescriptor | undefined => {
+    if (deleted.has(key)) return undefined;
+    const descriptor = Reflect.getOwnPropertyDescriptor(sourceInit, key);
+    if (!descriptor) return undefined;
+    if ("value" in descriptor) return { ...descriptor, configurable: true };
+    return {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get: descriptor.get ? () => Reflect.apply(descriptor.get!, sourceInit, []) : undefined,
+      set: descriptor.set ? (value: unknown) => Reflect.apply(descriptor.set!, sourceInit, [value]) : undefined,
+    };
+  };
+  const keys = (): Array<string | symbol> => detached
+    ? Reflect.ownKeys(overrides)
+    : [...new Set([
+      ...Reflect.ownKeys(sourceInit).filter((key) => !deleted.has(key)),
+      ...Reflect.ownKeys(overrides),
+      ...(annotate ? ["headers"] : []),
+    ])];
+  const descriptor = (key: PropertyKey): PropertyDescriptor | undefined => {
+    const own = Reflect.getOwnPropertyDescriptor(overrides, key);
+    if (own || detached) return own;
+    return sourceDescriptor(key) ?? (key === "headers" && annotate
+      ? { configurable: true, enumerable: true, writable: true, value: undefined }
+      : undefined);
+  };
+  const detach = (): void => {
+    if (detached) return;
+    // Explicit freezing/reflection is a caller action, so materialize descriptors
+    // here rather than inspecting caller proxies before fetch starts reading.
+    for (const key of keys()) {
+      if (!Object.hasOwn(overrides, key)) {
+        const property = descriptor(key);
+        if (property) Reflect.defineProperty(overrides, key, property);
+      }
+    }
+    Reflect.setPrototypeOf(overrides, Reflect.getPrototypeOf(sourceInit));
+    detached = true;
+    // A frozen data property must return its exact value. Header propagation is
+    // optional, so keep the original headers when a wrapper freezes the facade.
+    annotate = false;
+  };
+
   return new Proxy(overrides, {
-    get(target, key) {
-      const source = Object.prototype.hasOwnProperty.call(target, key) ? target : sourceInit;
-      const value: unknown = Reflect.get(source, key, source);
-      if (key !== "headers") return value;
+    get(target, key, receiver) {
+      let value: unknown;
+      if (Object.hasOwn(target, key)) value = Reflect.get(target, key, receiver);
+      else if (detached) value = Reflect.get(target, key, sourceInit);
+      else if (deleted.has(key)) {
+        const prototype = Reflect.getPrototypeOf(sourceInit);
+        value = prototype === null ? undefined : Reflect.get(prototype, key, sourceInit);
+      } else value = Reflect.get(sourceInit, key, sourceInit);
+      if (key !== "headers" || !annotate) return value;
+      const own = Reflect.getOwnPropertyDescriptor(target, key);
+      if (own?.configurable === false && ("value" in own ? !own.writable : !own.get)) return value;
       const originalHeaders = value === undefined && isRequest(input) ? input.headers : value;
       return sessionHeaders(originalHeaders, sessionId);
     },
-    // Fetch wrappers often spread init before forwarding it. Keep all its own
-    // fields visible, plus our header override, without eagerly reading getters.
-    ownKeys(target) {
-      return [...new Set([...Reflect.ownKeys(sourceInit), ...Reflect.ownKeys(target), "headers"])];
+    has(target, key) {
+      if (detached) return Reflect.has(target, key);
+      if (Object.hasOwn(target, key) || (key === "headers" && annotate)) return true;
+      if (!deleted.has(key)) return Reflect.has(sourceInit, key);
+      const prototype = Reflect.getPrototypeOf(sourceInit);
+      return prototype !== null && Reflect.has(prototype, key);
     },
-    getOwnPropertyDescriptor(target, key) {
-      const override = Reflect.getOwnPropertyDescriptor(target, key);
-      if (override) return override;
-      if (key === "headers") return { configurable: true, enumerable: true, writable: true };
-      const descriptor = Reflect.getOwnPropertyDescriptor(sourceInit, key);
-      return descriptor ? { ...descriptor, configurable: true } : undefined;
+    set(target, key, value) {
+      if (detached || Object.hasOwn(target, key)) return Reflect.set(target, key, value, target);
+      const original = sourceDescriptor(key);
+      return Reflect.defineProperty(target, key, {
+        configurable: true, enumerable: original?.enumerable ?? true, writable: true, value,
+      });
+    },
+    deleteProperty(target, key) {
+      if (!Reflect.deleteProperty(target, key)) return false;
+      if (!detached) deleted.add(key);
+      if (key === "headers") annotate = false;
+      return true;
+    },
+    ownKeys: keys,
+    getOwnPropertyDescriptor(_target, key) { return descriptor(key); },
+    getPrototypeOf(target) { return detached ? Reflect.getPrototypeOf(target) : Reflect.getPrototypeOf(sourceInit); },
+    setPrototypeOf(target, prototype) {
+      detach();
+      return Reflect.setPrototypeOf(target, prototype);
+    },
+    preventExtensions(target) {
+      detach();
+      return Reflect.preventExtensions(target);
     },
   });
 }
@@ -218,10 +339,22 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
         if (options.trackRequests) {
           const url = raw === undefined ? undefined : sanitizeUrl(raw, absolute, options.urlMode ?? "path");
           attributes = {};
-          const method = requestMethod(input, init);
-          if (method !== undefined) attributes._http_method = method;
+          if (init == null) {
+            const method = defaultMethod(input);
+            if (method !== undefined) attributes._http_method = method;
+          }
           if (url !== undefined) attributes._http_url = url;
           startedAt = nowMs();
+          const effectiveInit = nextArgs[1];
+          if (effectiveInit !== null && (typeof effectiveInit === "object" || typeof effectiveInit === "function")) {
+            nextArgs = [...nextArgs];
+            nextArgs[1] = observeMethod(effectiveInit, (value) => {
+              const method = typeof value === "string" ? value.toUpperCase()
+                : value === undefined ? defaultMethod(input) : undefined;
+              if (method === undefined) delete attributes!._http_method;
+              else attributes!._http_method = method;
+            });
+          }
         }
       }
     } catch {
