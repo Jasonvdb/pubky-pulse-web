@@ -358,10 +358,9 @@ function installObservers(validated: ValidatedConfig): void {
         trackRequests: validated.networkTracking,
         urlMode: validated.networkUrlMode,
         sessionId: () => session?.id ?? undefined,
-        onRequest(level, attributes, error): void {
+        onRequest(level, attributes, hint): void {
           // The hint stays transient: the rejection never enters the event.
-          log(level, "sdk:network_request", attributes, undefined,
-            error === undefined ? {} : { originalException: error });
+          log(level, "sdk:network_request", attributes, undefined, hint ?? {});
         },
       }),
     );

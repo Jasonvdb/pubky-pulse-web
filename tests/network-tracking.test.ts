@@ -5,14 +5,14 @@ import {
   stripQuery,
   type NetworkTrackingOptions,
 } from "../src/network-tracking";
-import type { PulseLogLevel } from "../src/types";
+import type { PulseEventHint, PulseLogLevel } from "../src/types";
 import { resetTestEnvironment } from "./setup";
 
 const ENDPOINT = "https://pulse.example.com";
 
 describe("installNetworkTracking", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
-  let requests: Array<[PulseLogLevel, Record<string, string>, unknown]>;
+  let requests: Array<[PulseLogLevel, Record<string, string>, PulseEventHint | undefined]>;
   let uninstall: () => void;
 
   function install(overrides: Partial<NetworkTrackingOptions> = {}): void {
@@ -21,8 +21,8 @@ describe("installNetworkTracking", () => {
       propagateSessionTo: [],
       trackRequests: true,
       sessionId: () => "session-1",
-      onRequest: (level, attributes, error) => {
-        requests.push([level, attributes, error]);
+      onRequest: (level, attributes, hint) => {
+        requests.push([level, attributes, hint]);
       },
       ...overrides,
     });
@@ -99,7 +99,7 @@ describe("installNetworkTracking", () => {
 
     expect(requests[0]![0]).toBe("error");
     expect(requests[0]![1]._http_status).toBe("0");
-    expect(requests[0]![2]).toBe(failure);
+    expect(requests[0]![2]).toEqual({ originalException: failure });
   });
 
   it("records a request aborted mid-flight as a cancellation and rethrows it", async () => {
@@ -118,7 +118,7 @@ describe("installNetworkTracking", () => {
     expect(requests[0]![1]._http_method).toBe("GET");
     expect(requests[0]![1]._http_url).toBe("https://api.example.com/users");
     expect(requests[0]![1]._http_duration_ms).toMatch(/^\d+$/);
-    expect(requests[0]![2]).toBe(controller.signal.reason);
+    expect(requests[0]![2]).toEqual({ originalException: controller.signal.reason });
   });
 
   it("records a pre-aborted signal as a cancellation", async () => {
@@ -159,7 +159,7 @@ describe("installNetworkTracking", () => {
 
     expect(requests[0]![0]).toBe("error");
     expect(requests[0]![1]._http_status).toBe("0");
-    expect(requests[0]![2]).toBe(reason);
+    expect(requests[0]![2]).toEqual({ originalException: reason });
   });
 
   it("reports a custom abort reason as a failure, not a cancellation", async () => {
@@ -175,7 +175,30 @@ describe("installNetworkTracking", () => {
       .rejects.toBe(reason);
 
     expect(requests[0]![0]).toBe("error");
-    expect(requests[0]![2]).toBe(reason);
+    expect(requests[0]![2]).toEqual({ originalException: reason });
+  });
+
+  it("still hands the hook a hint when the rejection value is undefined", async () => {
+    fetchMock.mockImplementation(() => Promise.reject());
+    install();
+
+    let rejected = false;
+    let rejection: unknown = "not rejected";
+    try {
+      await fetch("https://api.example.com/users");
+    } catch (error) {
+      rejected = true;
+      rejection = error;
+    }
+
+    expect(rejected).toBe(true);
+    // The caller's rejection value keeps its identity, undefined included.
+    expect(rejection).toBeUndefined();
+    expect(requests[0]![0]).toBe("error");
+    expect(requests[0]![1]._http_status).toBe("0");
+    expect(requests[0]![2]).toEqual({ originalException: undefined });
+    // The hint must be distinguishable from a completed response, which sends none.
+    expect(Object.hasOwn(requests[0]![2]!, "originalException")).toBe(true);
   });
 
   it("skips the sdk's own endpoint", async () => {
@@ -368,9 +391,11 @@ describe("installNetworkTracking", () => {
       .mockImplementationOnce(() => { throw cancelled; });
     install({ urlMode: "origin" });
     expect(() => fetch("/private")).toThrow(failure);
-    expect(requests[0]).toEqual(["error", expect.objectContaining({ _http_status: "0" }), failure]);
+    expect(requests[0]).toEqual(["error", expect.objectContaining({ _http_status: "0" }),
+      { originalException: failure }]);
     expect(() => fetch("/private")).toThrow(cancelled);
-    expect(requests[1]).toEqual(["debug", expect.objectContaining({ _http_status: "0" }), cancelled]);
+    expect(requests[1]).toEqual(["debug", expect.objectContaining({ _http_status: "0" }),
+      { originalException: cancelled }]);
   });
 
   it("omits unresolved relative origins and avoids extra coercion of unusual inputs", async () => {

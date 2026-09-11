@@ -1,5 +1,5 @@
 import { nowMs } from "./clock";
-import type { PulseLogLevel } from "./types";
+import type { PulseEventHint, PulseLogLevel } from "./types";
 
 /** Header the app's own backend reads to join its logs to this session. */
 export const SESSION_HEADER = "X-Pulse-Session-Id";
@@ -17,9 +17,10 @@ export interface NetworkTrackingOptions {
   sessionId(): string | undefined;
   /**
    * Called once per tracked request with the level and reserved attributes.
-   * `error` is the original rejection or throw, and undefined for a response.
+   * A failed request supplies a hint carrying the original rejection or throw
+   * as `originalException`, whatever its value; a response supplies no hint.
    */
-  onRequest(level: PulseLogLevel, attributes: Record<string, string>, error?: unknown): void;
+  onRequest(level: PulseLogLevel, attributes: Record<string, string>, hint?: PulseEventHint): void;
 }
 
 function isRequest(input: unknown): input is Request {
@@ -157,14 +158,14 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
       // The platform remains responsible for rejecting invalid request inputs.
     }
 
-    const report = (status: number, error?: unknown): void => {
+    const report = (status: number, hint?: PulseEventHint): void => {
       if (!active || !attributes) return;
       try {
-        options.onRequest(status === 0 ? levelForRejection(error) : levelForStatus(status), {
+        options.onRequest(status === 0 ? levelForRejection(hint?.originalException) : levelForStatus(status), {
           ...attributes,
           _http_status: String(status),
           _http_duration_ms: String(Math.round(nowMs() - startedAt)),
-        }, error);
+        }, hint);
       } catch {
         // Neither collector nor application hook failures may replace fetch results.
       }
@@ -174,7 +175,7 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
     try {
       result = Reflect.apply(original, this, nextArgs) as ReturnType<typeof fetch>;
     } catch (error) {
-      report(0, error);
+      report(0, { originalException: error });
       throw error;
     }
     if (!attributes) return result;
@@ -185,7 +186,7 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
       report(response.status);
       return response;
     }, (error: unknown) => {
-      report(0, error);
+      report(0, { originalException: error });
       throw error;
     });
   };
