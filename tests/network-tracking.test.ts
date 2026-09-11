@@ -12,7 +12,7 @@ const ENDPOINT = "https://pulse.example.com";
 
 describe("installNetworkTracking", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
-  let requests: Array<[PulseLogLevel, Record<string, string>]>;
+  let requests: Array<[PulseLogLevel, Record<string, string>, unknown]>;
   let uninstall: () => void;
 
   function install(overrides: Partial<NetworkTrackingOptions> = {}): void {
@@ -21,8 +21,8 @@ describe("installNetworkTracking", () => {
       propagateSessionTo: [],
       trackRequests: true,
       sessionId: () => "session-1",
-      onRequest: (level, attributes) => {
-        requests.push([level, attributes]);
+      onRequest: (level, attributes, error) => {
+        requests.push([level, attributes, error]);
       },
       ...overrides,
     });
@@ -60,6 +60,7 @@ describe("installNetworkTracking", () => {
     expect(attributes._http_url).toBe("https://api.example.com/users");
     expect(attributes._http_status).toBe("200");
     expect(attributes._http_duration_ms).toMatch(/^\d+$/);
+    expect(requests[0]![2]).toBeUndefined();
   });
 
   it("uses the method from the init object", async () => {
@@ -98,6 +99,83 @@ describe("installNetworkTracking", () => {
 
     expect(requests[0]![0]).toBe("error");
     expect(requests[0]![1]._http_status).toBe("0");
+    expect(requests[0]![2]).toBe(failure);
+  });
+
+  it("records a request aborted mid-flight as a cancellation and rethrows it", async () => {
+    const controller = new AbortController();
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+      controller.abort();
+      return Promise.reject(init?.signal?.reason);
+    });
+    install();
+
+    const pending = fetch("https://api.example.com/users", { signal: controller.signal });
+    await expect(pending).rejects.toBe(controller.signal.reason);
+
+    expect(requests[0]![0]).toBe("debug");
+    expect(requests[0]![1]._http_status).toBe("0");
+    expect(requests[0]![1]._http_method).toBe("GET");
+    expect(requests[0]![1]._http_url).toBe("https://api.example.com/users");
+    expect(requests[0]![1]._http_duration_ms).toMatch(/^\d+$/);
+    expect(requests[0]![2]).toBe(controller.signal.reason);
+  });
+
+  it("records a pre-aborted signal as a cancellation", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) =>
+      Promise.reject(init?.signal?.reason));
+    install();
+
+    await expect(fetch("https://api.example.com/users", { signal: controller.signal }))
+      .rejects.toBe(controller.signal.reason);
+
+    expect(requests[0]![0]).toBe("debug");
+    expect(requests[0]![1]._http_status).toBe("0");
+  });
+
+  it("records a Request carrying an aborted signal as a cancellation", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const request = new Request("https://api.example.com/users", { signal: controller.signal });
+    fetchMock.mockImplementation((input: Request) => Promise.reject(input.signal.reason));
+    install();
+
+    await expect(fetch(request)).rejects.toBe(controller.signal.reason);
+
+    expect(requests[0]![0]).toBe("debug");
+    expect(requests[0]![1]._http_status).toBe("0");
+  });
+
+  it.each([
+    ["a timeout", new DOMException("The operation timed out", "TimeoutError")],
+    ["a thrown string", "rejected"],
+  ])("keeps %s at error level", async (_label, reason) => {
+    fetchMock.mockRejectedValue(reason);
+    install();
+
+    await expect(fetch("https://api.example.com/users")).rejects.toBe(reason);
+
+    expect(requests[0]![0]).toBe("error");
+    expect(requests[0]![1]._http_status).toBe("0");
+    expect(requests[0]![2]).toBe(reason);
+  });
+
+  it("reports a custom abort reason as a failure, not a cancellation", async () => {
+    const controller = new AbortController();
+    const reason = new Error("slow");
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+      controller.abort(reason);
+      return Promise.reject(init?.signal?.reason);
+    });
+    install();
+
+    await expect(fetch("https://api.example.com/users", { signal: controller.signal }))
+      .rejects.toBe(reason);
+
+    expect(requests[0]![0]).toBe("error");
+    expect(requests[0]![2]).toBe(reason);
   });
 
   it("skips the sdk's own endpoint", async () => {
@@ -285,10 +363,14 @@ describe("installNetworkTracking", () => {
 
   it("preserves synchronous fetch failures", () => {
     const failure = new TypeError("bad receiver");
-    fetchMock.mockImplementation(() => { throw failure; });
+    const cancelled = new DOMException("aborted", "AbortError");
+    fetchMock.mockImplementationOnce(() => { throw failure; })
+      .mockImplementationOnce(() => { throw cancelled; });
     install({ urlMode: "origin" });
     expect(() => fetch("/private")).toThrow(failure);
-    expect(requests[0]![1]._http_status).toBe("0");
+    expect(requests[0]).toEqual(["error", expect.objectContaining({ _http_status: "0" }), failure]);
+    expect(() => fetch("/private")).toThrow(cancelled);
+    expect(requests[1]).toEqual(["debug", expect.objectContaining({ _http_status: "0" }), cancelled]);
   });
 
   it("omits unresolved relative origins and avoids extra coercion of unusual inputs", async () => {
