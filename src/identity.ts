@@ -124,8 +124,16 @@ export class IdentityManager {
   }
 
   private runClaim(anonymousId: string, userId: string): Promise<void> {
-    return this.hooks.claim(anonymousId, userId).catch((err: unknown) => {
-      this.hooks.onDebug?.("identity claim failed", err);
-    });
+    const report = (error: unknown): void => {
+      try { this.hooks.onDebug?.("identity claim failed", error); } catch { /* Optional diagnostic. */ }
+    };
+    try {
+      // Preserve immediate claim dispatch, including adapters that throw before
+      // returning a promise. A failed claim is retried on a later initialization.
+      return this.hooks.claim(anonymousId, userId).catch(report);
+    } catch (error) {
+      report(error);
+      return Promise.resolve();
+    }
   }
 }

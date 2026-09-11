@@ -21,11 +21,16 @@ export type StorageWriteResult = "persisted" | "quota" | "memory-only";
  */
 export function isQuotaExceededError(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
-  const err = error as { name?: unknown; code?: unknown };
-  if (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED") {
-    return true;
+  try {
+    const err = error as { name?: unknown; code?: unknown };
+    if (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED") {
+      return true;
+    }
+    return err.code === 22 || err.code === 1014;
+  } catch {
+    // Even the value thrown by a storage adapter can have hostile getters.
+    return false;
   }
-  return err.code === 22 || err.code === 1014;
 }
 
 function resolveBackend(kind: StorageKind): Storage | null {

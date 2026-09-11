@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MAX_OFFLINE_BYTES } from "../src/event-size";
 import { MAX_OFFLINE_EVENTS, OfflineQueue } from "../src/offline-queue";
 import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import type { LogEvent } from "../src/types";
@@ -77,8 +78,10 @@ describe("OfflineQueue", () => {
   it("keeps the newest events when over the cap", async () => {
     await queue.append(makeEvents(MAX_OFFLINE_EVENTS + 5));
     const stored = queue.read();
-    expect(stored).toHaveLength(MAX_OFFLINE_EVENTS);
-    expect(stored[0]?.client_event_id).toBe("event-5");
+    expect(stored.length).toBeGreaterThan(0);
+    expect(stored.length).toBeLessThan(MAX_OFFLINE_EVENTS);
+    expect(stored).toEqual(makeRange(MAX_OFFLINE_EVENTS + 5 - stored.length, stored.length));
+    expect(Buffer.byteLength(JSON.stringify(stored))).toBeLessThanOrEqual(MAX_OFFLINE_BYTES);
   });
 
   it("drops the oldest half and retries once when storage is over quota", async () => {
@@ -201,8 +204,10 @@ describe("OfflineQueue", () => {
       queue.spill(makeEvents(MAX_OFFLINE_EVENTS + 3));
 
       const stored = queue.read();
-      expect(stored).toHaveLength(MAX_OFFLINE_EVENTS);
-      expect(stored[0]?.client_event_id).toBe("event-3");
+      expect(stored.length).toBeGreaterThan(0);
+      expect(stored.length).toBeLessThan(MAX_OFFLINE_EVENTS);
+      expect(stored).toEqual(makeRange(MAX_OFFLINE_EVENTS + 3 - stored.length, stored.length));
+      expect(Buffer.byteLength(JSON.stringify(stored))).toBeLessThanOrEqual(MAX_OFFLINE_BYTES);
     });
 
     it("writes nothing for an empty batch", () => {
@@ -253,34 +258,35 @@ describe("OfflineQueue", () => {
       }
     });
 
-    it("drops the oldest whole spill rather than growing past the cap", () => {
-      const half = MAX_OFFLINE_EVENTS / 2;
-      spillAt(0, makeRange(0, half));
-      spillAt(1, makeRange(half, half));
-      // The queue is exactly full, so this one costs the oldest spill its key.
-      spillAt(2, makeRange(MAX_OFFLINE_EVENTS, 1));
+    it("drops the oldest whole spill rather than growing past the byte cap", () => {
+      const half = 6;
+      const wideRange = (start: number, count: number) => makeRange(start, count)
+        .map((event) => ({ ...event, source_module: "x".repeat(80 * 1024) }));
+      spillAt(0, wideRange(0, half));
+      spillAt(1, wideRange(half, half));
+      // Two batches fit; the third costs the oldest spill its key.
+      spillAt(2, wideRange(half * 2, 1));
 
       const stored = queue.read();
       expect(spillKeys()).toHaveLength(2);
       expect(stored).toHaveLength(half + 1);
       expect(stored[0]?.client_event_id).toBe(`event-${half}`);
-      expect(stored.at(-1)?.client_event_id).toBe(`event-${MAX_OFFLINE_EVENTS}`);
+      expect(stored.at(-1)?.client_event_id).toBe(`event-${half * 2}`);
+      expect(Buffer.byteLength(JSON.stringify(stored))).toBeLessThanOrEqual(MAX_OFFLINE_BYTES);
     });
 
-    it("trims to the newest events when the shared key alone fills the cap", async () => {
+    it("preserves the locked shared queue when no additional spill event can fit", async () => {
       await queue.append(makeRange(0, MAX_OFFLINE_EVENTS));
-      // Nothing can be shed here — rewriting the shared key needs the lock a
-      // spill has no turn to await — so the readers trim instead.
+      const before = queue.read();
+      const raw = testLocalStorage.getItem(QUEUE_KEY);
+      // The shared queue nearly fills its byte budget. Unload cannot rewrite
+      // that key, so newer incoming spill events are dropped when no room remains.
       spillAt(0, makeRange(MAX_OFFLINE_EVENTS, 100));
 
-      const stored = queue.read();
-      expect(stored).toHaveLength(MAX_OFFLINE_EVENTS);
-      expect(stored[0]?.client_event_id).toBe("event-100");
-      expect(stored.at(-1)?.client_event_id).toBe(`event-${MAX_OFFLINE_EVENTS + 99}`);
-
-      const drained = await queue.drain();
-      expect(drained).toHaveLength(MAX_OFFLINE_EVENTS);
-      expect(drained[0]?.client_event_id).toBe("event-100");
+      expect(queue.read()).toEqual(before);
+      expect(testLocalStorage.getItem(QUEUE_KEY)).toBe(raw);
+      expect(spillKeys()).toHaveLength(0);
+      expect(await queue.drain()).toEqual(before);
       expect(testLocalStorage.keys()).toEqual([]);
     });
   });

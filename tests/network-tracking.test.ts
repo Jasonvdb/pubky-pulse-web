@@ -37,7 +37,11 @@ describe("installNetworkTracking", () => {
   beforeEach(() => {
     resetTestEnvironment();
     requests = [];
-    fetchMock = vi.fn(() => Promise.resolve(new Response("{}", { status: 200 })));
+    fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      // Model native dictionary conversion so method metadata is observed lazily.
+      void init?.method;
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
     vi.stubGlobal("fetch", fetchMock);
     uninstall = () => undefined;
   });
@@ -104,9 +108,10 @@ describe("installNetworkTracking", () => {
 
   it("records a request aborted mid-flight as a cancellation and rethrows it", async () => {
     const controller = new AbortController();
-    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
       controller.abort();
-      return Promise.reject(init?.signal?.reason);
+      return Promise.reject(request.signal.reason);
     });
     install();
 
@@ -353,7 +358,10 @@ describe("installNetworkTracking", () => {
   it("preserves fetch receiver, argument count and request/response identity", async () => {
     const response = new Response("response body");
     const promise = Promise.resolve(response);
-    fetchMock.mockReturnValue(promise);
+    fetchMock.mockImplementation((_input: RequestInfo | URL, init?: RequestInit) => {
+      void init?.method;
+      return promise;
+    });
     install({ urlMode: "origin" });
     const receiver = { marker: true };
     const request = new Request("https://api.example.com/private", { method: "POST", body: "private body" });
@@ -364,7 +372,12 @@ describe("installNetworkTracking", () => {
     expect(fetchMock.mock.contexts[0]).toBe(receiver);
     expect(fetchMock.mock.calls[0]).toEqual([request, init]);
     expect(fetchMock.mock.calls[0]![0]).toBe(request);
-    expect(fetchMock.mock.calls[0]![1]).toBe(init);
+    // The options facade has a distinct identity to observe native reads only.
+    const forwarded = fetchMock.mock.calls[0]![1] as RequestInit;
+    expect(forwarded === init).toBe(false);
+    expect(forwarded.body).toBe(init.body);
+    expect(forwarded.headers).toBe(headers);
+    expect(init.method).toBe("PUT");
     expect(init.headers.get("Authorization")).toBe("app-secret");
     expect(request.bodyUsed).toBe(false);
     expect(await response.text()).toBe("response body");

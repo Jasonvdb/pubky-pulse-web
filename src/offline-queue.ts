@@ -1,4 +1,5 @@
 import { randomUuid } from "./event-builder";
+import { jsonByteLength, MAX_OFFLINE_BYTES, stringByteLength } from "./event-size";
 import { type SafeStorage, type StorageWriteResult } from "./storage";
 import type { LogEvent } from "./types";
 
@@ -17,9 +18,22 @@ const LOCK_NAME = "pulse_offline_queue";
 /** Hard cap on parked events, across every key; the oldest are dropped first. */
 export const MAX_OFFLINE_EVENTS = 10000;
 
-/** The newest `MAX_OFFLINE_EVENTS`, which is all any reader is entitled to. */
-function capped(events: LogEvent[]): LogEvent[] {
-  return events.length > MAX_OFFLINE_EVENTS ? events.slice(-MAX_OFFLINE_EVENTS) : events;
+/** Keep the newest admissible events within both budgets before serialization. */
+function capped(events: LogEvent[], byteLimit = MAX_OFFLINE_BYTES, countLimit = MAX_OFFLINE_EVENTS): LogEvent[] {
+  const kept: LogEvent[] = [];
+  let size = 2;
+  const oldest = Math.max(0, events.length - MAX_OFFLINE_EVENTS);
+  for (let index = events.length - 1; index >= oldest && kept.length < countLimit; index -= 1) {
+    const event = events[index];
+    if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+    const eventSize = jsonByteLength(event);
+    if (eventSize === null) continue;
+    const nextSize = size + eventSize + (kept.length > 0 ? 1 : 0);
+    if (nextSize > byteLimit) break;
+    kept.push(event);
+    size = nextSize;
+  }
+  return kept.reverse();
 }
 
 /** The slice of the Web Locks API this module uses. */
@@ -63,16 +77,33 @@ export class OfflineQueue {
    * flush path uses `drain`.
    */
   read(): LogEvent[] {
-    const events = this.readKey(QUEUE_KEY);
-    for (const key of this.spillKeys()) events.push(...this.readKey(key));
-    return capped(events);
+    let events = this.readKey(QUEUE_KEY);
+    for (const key of this.spillKeys()) events = capped([...events, ...this.readKey(key)]);
+    return events;
   }
 
   /** Park `events` behind whatever is already queued. */
   async append(events: LogEvent[], isActive: () => boolean = () => true): Promise<void> {
+    // Retain only bounded work while waiting for another tab's lock.
+    events = capped(events);
     if (events.length === 0) return;
     await this.withLock(() => {
-      if (isActive()) this.store(QUEUE_KEY, [...this.readKey(QUEUE_KEY), ...events]);
+      if (!isActive()) return;
+      const incoming = events;
+      const current = this.readKey(QUEUE_KEY);
+      const spills = this.spillKeys().map((key) => this.storedUsage(key));
+      let spillBytes = spills.reduce((sum, item) => sum + item.bytes, 0);
+      let spillCount = spills.reduce((sum, item) => sum + item.count, 0);
+      const incomingBytes = jsonByteLength(incoming, MAX_OFFLINE_BYTES)!;
+      // An append holds the shared lock. Shed older spill keys only when the
+      // incoming batch itself cannot fit; ordinary small spills remain intact.
+      for (const spill of spills) {
+        if (spillBytes + incomingBytes <= MAX_OFFLINE_BYTES && spillCount + incoming.length <= MAX_OFFLINE_EVENTS) break;
+        this.storage.remove(spill.key);
+        spillBytes -= spill.bytes;
+        spillCount -= spill.count;
+      }
+      this.store(QUEUE_KEY, [...current, ...incoming], MAX_OFFLINE_BYTES - spillBytes, MAX_OFFLINE_EVENTS - spillCount);
     });
   }
 
@@ -80,13 +111,13 @@ export class OfflineQueue {
   async drain(isActive: () => boolean = () => true): Promise<LogEvent[]> {
     return this.withLock(() => {
       if (!isActive()) return [];
-      const events = this.readKey(QUEUE_KEY);
+      let events = this.readKey(QUEUE_KEY);
       if (events.length > 0) this.storage.remove(QUEUE_KEY);
       for (const key of this.spillKeys()) {
-        events.push(...this.readKey(key));
+        events = capped([...events, ...this.readKey(key)]);
         this.storage.remove(key);
       }
-      return capped(events);
+      return events;
     });
   }
 
@@ -97,10 +128,11 @@ export class OfflineQueue {
    * `drain` folds the spill back in and removes it.
    */
   spill(events: LogEvent[]): void {
-    if (events.length === 0) return;
-    this.shedForSpill(events.length);
+    const incoming = capped(events);
+    if (incoming.length === 0) return;
+    const budget = this.shedForSpill(incoming);
     const at = String(Date.now()).padStart(SPILL_TIMESTAMP_DIGITS, "0");
-    this.store(`${SPILL_PREFIX}${at}:${randomUuid()}`, events);
+    this.store(`${SPILL_PREFIX}${at}:${randomUuid()}`, incoming, budget.bytes, budget.count);
   }
 
   /** The spill keys oldest first; the timestamp in the name is what sorts. */
@@ -108,31 +140,46 @@ export class OfflineQueue {
     return this.storage.keys(SPILL_PREFIX).sort();
   }
 
-  /**
-   * Make room for `incoming` events by removing the oldest whole spill keys,
-   * so a page hidden over and over cannot grow the aggregate past the cap.
-   * The shared key is never rewritten here — there is no turn to await the
-   * lock in — so a queue already at the cap sheds only spills, and `read` and
-   * `drain` trim whatever is left over.
-   */
-  private shedForSpill(incoming: number): void {
-    const keys = this.spillKeys();
-    const counts = keys.map((key) => this.readKey(key).length);
-    let stored = this.readKey(QUEUE_KEY).length + counts.reduce((sum, n) => sum + n, 0);
+  private storedUsage(key: string): { key: string; count: number; bytes: number } {
+    const count = this.readKey(key).length;
+    const raw = this.storage.get(key);
+    return { key, count, bytes: raw ? stringByteLength(raw, MAX_OFFLINE_BYTES) ?? 0 : 0 };
+  }
 
-    for (const [index, key] of keys.entries()) {
-      if (stored + incoming <= MAX_OFFLINE_EVENTS) return;
-      this.storage.remove(key);
-      stored -= counts[index]!;
+  /**
+   * Unload cannot acquire a lock or rewrite the shared key. Shed old spills,
+   * then admit only the incoming events that fit beside the protected shared
+   * data. Concurrent tabs may transiently race this best-effort aggregate cap;
+   * every reader and writer also applies its own bounded payload admission.
+   */
+  private shedForSpill(incoming: LogEvent[]): { bytes: number; count: number } {
+    const shared = this.storedUsage(QUEUE_KEY);
+    const spills = this.spillKeys().map((key) => this.storedUsage(key));
+    let storedBytes = shared.bytes + spills.reduce((sum, item) => sum + item.bytes, 0);
+    let storedCount = shared.count + spills.reduce((sum, item) => sum + item.count, 0);
+    const incomingBytes = jsonByteLength(incoming, MAX_OFFLINE_BYTES)!;
+    for (const spill of spills) {
+      if (storedBytes + incomingBytes <= MAX_OFFLINE_BYTES && storedCount + incoming.length <= MAX_OFFLINE_EVENTS) break;
+      this.storage.remove(spill.key);
+      storedBytes -= spill.bytes;
+      storedCount -= spill.count;
     }
+    return {
+      bytes: Math.max(0, MAX_OFFLINE_BYTES - storedBytes),
+      count: Math.max(0, MAX_OFFLINE_EVENTS - storedCount),
+    };
   }
 
   private readKey(key: string): LogEvent[] {
     const raw = this.storage.get(key);
     if (!raw) return [];
+    if (stringByteLength(raw, MAX_OFFLINE_BYTES) === null) {
+      this.storage.remove(key);
+      return [];
+    }
     try {
       const parsed: unknown = JSON.parse(raw);
-      return Array.isArray(parsed) ? (parsed as LogEvent[]) : [];
+      return Array.isArray(parsed) ? capped(parsed as LogEvent[]) : [];
     } catch {
       // Corrupt payload: drop it rather than failing every future flush.
       this.storage.remove(key);
@@ -141,13 +188,13 @@ export class OfflineQueue {
   }
 
   /** Persist `events` under `key`, keeping only the newest `MAX_OFFLINE_EVENTS`. */
-  private store(key: string, events: LogEvent[]): void {
-    if (events.length === 0) {
+  private store(key: string, events: LogEvent[], byteLimit = MAX_OFFLINE_BYTES, countLimit = MAX_OFFLINE_EVENTS): void {
+    let pending = capped(events, byteLimit, countLimit);
+    if (pending.length === 0) {
       this.storage.remove(key);
       return;
     }
 
-    let pending = capped(events);
     const first = this.persist(key, pending);
     if (first === "persisted") return;
     if (first !== "quota") {

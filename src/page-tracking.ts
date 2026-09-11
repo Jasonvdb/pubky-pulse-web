@@ -7,12 +7,6 @@
 
 import { nowMs } from "./clock";
 
-/** Set while the History API is patched, so a second install cannot stack. */
-let originalPushState: History["pushState"] | null = null;
-let originalReplaceState: History["replaceState"] | null = null;
-/** The active tracker's navigation hook, swapped out on `restore()`. */
-let navigationListener: (() => void) | null = null;
-
 export interface ScreenCallbacks {
   /** A screen became visible. */
   onAppeared(screenName: string): void;
@@ -27,47 +21,45 @@ export function currentPath(): string {
   return path ? path : "/";
 }
 
-function patchHistory(): void {
-  const history = (globalThis as { history?: History }).history;
-  if (!history || originalPushState) return;
-
-  // Keep the originals unbound so `restore()` puts back the exact functions.
-  const push = history.pushState;
-  const replace = history.replaceState;
-  originalPushState = push;
-  originalReplaceState = replace;
-
-  // The original runs first so the URL has already changed when we compare.
-  history.pushState = function patchedPushState(
-    this: History,
-    ...args: Parameters<History["pushState"]>
-  ): void {
-    const before = currentPath();
-    Reflect.apply(push, this ?? history, args);
-    if (currentPath() !== before) navigationListener?.();
+function patchHistory(onNavigation: () => void): () => void {
+  let active = true;
+  const restores: Array<() => void> = [];
+  try {
+    const history = (globalThis as { history?: History }).history;
+    if (history) {
+      for (const method of ["pushState", "replaceState"] as const) {
+        try {
+          const original = history[method];
+          if (typeof original !== "function") continue;
+          const wrapped = function (this: History, ...args: Parameters<History["pushState"]>): void {
+            let before: string | undefined;
+            if (active) {
+              try { before = currentPath(); } catch { /* Navigation does not depend on location access. */ }
+            }
+            // Preserve the host's receiver, return value and original exception.
+            const result = Reflect.apply(original, this, args);
+            if (active) {
+              try {
+                if (before !== undefined && currentPath() !== before) onNavigation();
+              } catch { /* Telemetry must not interrupt a completed navigation. */ }
+            }
+            return result;
+          };
+          // Record cleanup before assignment in case a host setter partially succeeds.
+          restores.push(() => {
+            if (history[method] === wrapped) history[method] = original;
+          });
+          history[method] = wrapped;
+        } catch { /* Each method is optional, including on read-only History objects. */ }
+      }
+    }
+  } catch { /* A host can deny access to History altogether. */ }
+  return () => {
+    active = false;
+    for (const restore of restores.splice(0)) {
+      try { restore(); } catch { /* Retained wrappers remain inactive. */ }
+    }
   };
-  history.replaceState = function patchedReplaceState(
-    this: History,
-    ...args: Parameters<History["replaceState"]>
-  ): void {
-    const before = currentPath();
-    Reflect.apply(replace, this ?? history, args);
-    if (currentPath() !== before) navigationListener?.();
-  };
-}
-
-function restoreHistory(): void {
-  const history = (globalThis as { history?: History }).history;
-  if (history && originalPushState && originalReplaceState) {
-    try {
-      if (history.pushState !== originalPushState) history.pushState = originalPushState;
-    } catch { /* A host may have made the method read-only. */ }
-    try {
-      if (history.replaceState !== originalReplaceState) history.replaceState = originalReplaceState;
-    } catch { /* Still release our references to the tracker. */ }
-  }
-  originalPushState = null;
-  originalReplaceState = null;
 }
 
 /**
@@ -83,6 +75,7 @@ export class PageTracker {
   private enteredAt = 0;
   private popstateHandler: (() => void) | null = null;
   private installed = false;
+  private restoreHistory: (() => void) | null = null;
 
   constructor(callbacks: ScreenCallbacks, screenNameForPath?: (pathname: string) => string) {
     this.callbacks = callbacks;
@@ -102,40 +95,36 @@ export class PageTracker {
     if (this.installed) return;
     this.installed = true;
 
-    patchHistory();
-    navigationListener = () => {
-      this.enterCurrentPath();
+    const navigate = () => {
+      if (!this.installed) return;
+      try { this.enterCurrentPath(); } catch { /* Tracking is best effort. */ }
     };
-
-    const win = (globalThis as { window?: Window }).window;
-    if (win) {
-      this.popstateHandler = () => {
-        this.enterCurrentPath();
-      };
-      win.addEventListener("popstate", this.popstateHandler);
-    }
-
-    this.enterCurrentPath();
+    this.restoreHistory = patchHistory(navigate);
+    try {
+      const win = (globalThis as { window?: Window }).window;
+      if (win) {
+        this.popstateHandler = navigate;
+        win.addEventListener("popstate", navigate);
+      }
+    } catch { /* History tracking can still work without a popstate listener. */ }
+    navigate();
   }
 
   /** Report a screen change the SDK cannot see, e.g. a modal or a tab. */
   trackScreen(name: string): void {
-    this.enter(name);
+    try { this.enter(name); } catch { /* Manual telemetry cannot interrupt the caller. */ }
   }
 
   /** Undo `install()` and forget the current screen. */
   restore(): void {
-    const win = (globalThis as { window?: Window }).window;
-    if (win && this.popstateHandler) {
-      try { win.removeEventListener("popstate", this.popstateHandler); } catch { /* Continue restoring history. */ }
-    }
+    this.installed = false;
+    try {
+      const win = (globalThis as { window?: Window }).window;
+      if (win && this.popstateHandler) win.removeEventListener("popstate", this.popstateHandler);
+    } catch { /* Continue restoring history. */ }
     this.popstateHandler = null;
-
-    if (this.installed) {
-      navigationListener = null;
-      restoreHistory();
-      this.installed = false;
-    }
+    this.restoreHistory?.();
+    this.restoreHistory = null;
     this.current = null;
     this.enteredAt = 0;
   }
@@ -167,10 +156,14 @@ export class PageTracker {
 
     const at = nowMs();
     if (this.current !== null) {
-      this.callbacks.onDisappeared(this.current, Math.max(0, Math.round(at - this.enteredAt)));
+      try {
+        this.callbacks.onDisappeared(this.current, Math.max(0, Math.round(at - this.enteredAt)));
+      } catch { /* Continue tracking the screen even if its previous event failed. */ }
     }
     this.current = name;
     this.enteredAt = at;
-    if (name !== null) this.callbacks.onAppeared(name);
+    if (name !== null) {
+      try { this.callbacks.onAppeared(name); } catch { /* A collector cannot break navigation. */ }
+    }
   }
 }

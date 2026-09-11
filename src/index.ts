@@ -3,13 +3,21 @@ import { validateConfiguration, type ValidatedConfig } from "./configuration";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
 import { isIgnoredError } from "./error-filter";
-import { buildEvent, MAX_EVENT_MESSAGE_LENGTH, normalizeAttributes, type EventContext } from "./event-builder";
+import {
+  buildEvent,
+  MAX_ATTRIBUTES,
+  MAX_ATTRIBUTE_KEY_LENGTH,
+  MAX_EVENT_MESSAGE_LENGTH,
+  normalizeAttributes,
+  type EventContext,
+} from "./event-builder";
+import { jsonByteLength } from "./event-size";
 import { IdentityManager } from "./identity";
 import { installLifecycle } from "./lifecycle";
 import { metricMessage, stepMessage } from "./metrics";
 import { installNetworkTracking } from "./network-tracking";
 import { OfflineQueue } from "./offline-queue";
-import { PulseOperation } from "./operation";
+import { createInactiveOperation, PulseOperation } from "./operation";
 import { PageTracker, type ScreenCallbacks } from "./page-tracking";
 import {
   dismissQuestionnaires as dismissQuestionnairesRequest,
@@ -106,6 +114,9 @@ let capturingException = false;
 /** Weak references retain no errors; each initialized client has its own lifetime. */
 let capturedErrors = new WeakSet<Error>();
 let initializing = false;
+let logging = false;
+let recordingEvent = false;
+let diagnosing = false;
 let quietDisabled = false;
 const retiringTransports = new Set<Transport>();
 const retiringAttachments = new Set<AttachmentUploader>();
@@ -113,12 +124,13 @@ const retiringAttachments = new Set<AttachmentUploader>();
 const uninstallers: Array<() => void> = [];
 
 function debugLog(message: string, detail?: unknown): void {
-  if (!config?.debug) return;
-  if (detail === undefined) {
-    console.error(`Pubky Pulse: ${message}`);
-  } else {
-    console.error(`Pubky Pulse: ${message}`, detail);
-  }
+  if (!config?.debug || diagnosing) return;
+  diagnosing = true;
+  try {
+    if (detail === undefined) console.error(`Pubky Pulse: ${message}`);
+    else console.error(`Pubky Pulse: ${message}`, detail);
+  } catch { /* Host console adapters are optional telemetry, too. */ }
+  finally { diagnosing = false; }
 }
 
 /**
@@ -130,26 +142,30 @@ function printToConsole(
   message: string,
   attributes?: Record<string, string>,
 ): void {
-  if (!config?.consoleLogging) return;
-  if (message.startsWith("sdk:")) return;
-  if (message.startsWith("metric:") && message.endsWith(":start")) return;
+  if (!config?.consoleLogging || diagnosing) return;
+  diagnosing = true;
+  try {
+    if (message.startsWith("sdk:")) return;
+    if (message.startsWith("metric:") && message.endsWith(":start")) return;
 
-  let line = `[pulse] ${level.toUpperCase().padEnd(5)} ${message}`;
-  if (attributes && Object.keys(attributes).length > 0) {
-    const pairs = Object.entries(attributes)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, value]) => `${key}=${value}`)
-      .join(", ");
-    line += ` {${pairs}}`;
-  }
+    let line = `[pulse] ${level.toUpperCase().padEnd(5)} ${message}`;
+    if (attributes && Object.keys(attributes).length > 0) {
+      const pairs = Object.entries(attributes)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, value]) => `${key}=${value}`)
+        .join(", ");
+      line += ` {${pairs}}`;
+    }
 
-  if (level === "error") {
-    console.error(line);
-  } else if (level === "warn") {
-    console.warn(line);
-  } else {
-    console.log(line);
-  }
+    if (level === "error") {
+      console.error(line);
+    } else if (level === "warn") {
+      console.warn(line);
+    } else {
+      console.log(line);
+    }
+  } catch { /* A mirror failure must not prevent event delivery. */ }
+  finally { diagnosing = false; }
 }
 
 /** A hook owns its result; keep a detached, valid wire snapshot for delivery. */
@@ -196,12 +212,14 @@ function processEvent(event: LogEvent, hint: PulseEventHint): LogEvent | null {
     }
     if (result.custom_attributes !== undefined) {
       const attributes = result.custom_attributes;
-      if (!attributes || typeof attributes !== "object" || Array.isArray(attributes) ||
-          Object.values(attributes).some((value) => typeof value !== "string")) return null;
-      snapshot.custom_attributes = normalizeAttributes(attributes);
+      if (!attributes || typeof attributes !== "object" || Array.isArray(attributes)) return null;
+      // Validate only admitted entries: later getters must never run merely
+      // because the callback returned an oversized dictionary.
+      const normalized = normalizeAttributes(attributes, true, true);
+      snapshot.custom_attributes = normalized;
     }
     if (result.supported_languages !== undefined) {
-      if (!Array.isArray(result.supported_languages) ||
+      if (!Array.isArray(result.supported_languages) || jsonByteLength(result.supported_languages) === null ||
           result.supported_languages.some((value) => typeof value !== "string")) return null;
       snapshot.supported_languages = [...result.supported_languages];
     }
@@ -226,22 +244,24 @@ function recordEvent(
   sessionIdOverride?: string,
   hint: PulseEventHint = {},
 ): void {
-  const sessionId = sessionIdOverride ?? session?.id;
-  if (initializing || !config || !identity || !sessionId || !transport) return;
-
-  if (level === "error" && isIgnoredError(config.ignoreErrors, message, attributes)) return;
-
-  const ctx: EventContext = {
-    config,
-    deviceInfo,
-    sessionId,
-    userId: identity.currentId,
-    screenName: pageTracker?.screenName,
-  };
-
+  if (recordingEvent || diagnosing) return;
+  recordingEvent = true;
   try {
+    const sessionId = sessionIdOverride ?? session?.id;
+    if (initializing || !config || !identity || !sessionId || !transport) return;
+
+    if (level === "error" && isIgnoredError(config.ignoreErrors, message, attributes)) return;
+
+    const ctx: EventContext = {
+      config,
+      deviceInfo,
+      sessionId,
+      userId: identity.currentId,
+      screenName: pageTracker?.screenName,
+    };
+
     const event = processEvent(buildEvent(ctx, level, message, attributes, options?.screenName), hint);
-    if (!event) return;
+    if (!event || jsonByteLength(event) === null) return;
     printToConsole(event.level, event.message, event.custom_attributes);
     transport.enqueue(event);
     if (options?.attachments?.length) {
@@ -249,6 +269,8 @@ function recordEvent(
     }
   } catch (err) {
     if (!Object.hasOwn(hint, "originalException")) debugLog("failed to record event", err);
+  } finally {
+    recordingEvent = false;
   }
 }
 
@@ -259,18 +281,21 @@ function log(
   options?: PulseLogOptions,
   hint: PulseEventHint = {},
 ): void {
-  if (processingEvent || initializing || quietDisabled) return;
-  if (!config || !session || !transport) {
-    if (!unconfiguredWarningShown) {
-      unconfiguredWarningShown = true;
-      console.debug("Pubky Pulse: log call before configure() was ignored.");
+  if (processingEvent || initializing || quietDisabled || logging || recordingEvent || diagnosing) return;
+  logging = true;
+  try {
+    if (!config || !session || !transport) {
+      if (!unconfiguredWarningShown) {
+        unconfiguredWarningShown = true;
+        try { console.debug("Pubky Pulse: log call before configure() was ignored."); } catch { /* Optional diagnostic. */ }
+      }
+      return;
     }
-    return;
-  }
-
-  // Every call counts as activity, and may roll the session over first.
-  session.touch();
-  recordEvent(level, message, attributes, options, undefined, hint);
+    // Session lifecycle callbacks may record their own events during rotation.
+    session.touch();
+    recordEvent(level, message, attributes, options, undefined, hint);
+  } catch { /* Telemetry failures must never escape a host logging call. */ }
+  finally { logging = false; }
 }
 
 /** Emits the session lifecycle events as the session manager rolls over. */
@@ -317,8 +342,24 @@ function captureException(
       capturedErrors.add(value);
     }
     const { message, attributes } = extractErrorAttributes(value, userMessage);
-    const merged: PulseAttributes = { ...userAttributes, ...attributes };
+    // Reserve diagnostic fields first, then admit bounded caller attributes.
+    // Spreading the entire caller dictionary would execute every getter before
+    // the builder's resource limits could run.
+    const merged: PulseAttributes = { ...attributes };
     if (kind) merged._unhandled = kind;
+    if (userAttributes) {
+      // Integer keys enumerate before diagnostic fields, regardless of insertion
+      // order. Bound the entire merge so normalization cannot displace them.
+      let count = Object.keys(merged).length;
+      let visited = 0;
+      for (const key in userAttributes) {
+        if (!Object.hasOwn(userAttributes, key)) continue;
+        if (visited++ >= MAX_ATTRIBUTES || count >= MAX_ATTRIBUTES) break;
+        if (key.length > MAX_ATTRIBUTE_KEY_LENGTH || Object.hasOwn(merged, key)) continue;
+        Object.defineProperty(merged, key, { value: userAttributes[key], enumerable: true, configurable: true });
+        count += 1;
+      }
+    }
     log("error", message, merged, options, { originalException: value });
   } catch {
     // No diagnostic may expose an exception that capture policy could not sanitize.
@@ -397,10 +438,13 @@ function disableClient(): void {
   session = null;
   offlineQueue = null;
   deviceInfo = {};
-  previousTransport?.stop();
-  previousAttachments?.stop();
-  for (const previous of retiringTransports) previous.stop();
-  for (const previous of retiringAttachments) previous.stop();
+  const stop = (resource: { stop(): void } | null): void => {
+    try { resource?.stop(); } catch { /* A broken resource cannot block other cleanup. */ }
+  };
+  stop(previousTransport);
+  stop(previousAttachments);
+  for (const previous of retiringTransports) stop(previous);
+  for (const previous of retiringAttachments) stop(previous);
   uninstallObservers();
 }
 
@@ -408,10 +452,13 @@ async function drainClient(previousTransport: Transport | null, previousAttachme
   if (previousTransport) retiringTransports.add(previousTransport);
   if (previousAttachments) retiringAttachments.add(previousAttachments);
   try {
-    await previousTransport?.shutdown();
-    await previousAttachments?.flush();
+    try { await previousTransport?.shutdown(); } catch { /* Still drain attachments. */ }
+    try { await previousAttachments?.flush(); } catch { /* Background delivery is best effort. */ }
   } finally {
     if (previousTransport) retiringTransports.delete(previousTransport);
+    // A bounded flush can finish before noncancelable attachment work settles.
+    // Stop it before dropping the reference needed by later consent withdrawal.
+    try { previousAttachments?.stop(); } catch { /* Retirement cleanup is best effort. */ }
     if (previousAttachments) retiringAttachments.delete(previousAttachments);
   }
 }
@@ -654,14 +701,18 @@ export const Pulse: PulseApi = {
       debugLog("trackScreen called before configure()");
       return;
     }
-    pageTracker.trackScreen(name);
+    try { pageTracker.trackScreen(name); } catch { /* Screen telemetry is best effort. */ }
   },
 
   step(name: string, attributes?: PulseAttributes): void {
-    log("info", stepMessage(name), attributes);
+    if (quietDisabled || processingEvent || logging || recordingEvent || diagnosing) return;
+    try { log("info", stepMessage(name), attributes); } catch { /* Caller-owned coercion. */ }
   },
 
   startOperation(metric: string, attributes?: PulseAttributes): PulseOperation {
+    if (!config || quietDisabled || initializing || processingEvent || logging || recordingEvent || diagnosing) {
+      return createInactiveOperation();
+    }
     return new PulseOperation(
       (level, message, operationAttributes) => {
         log(level, message, operationAttributes);
@@ -672,7 +723,8 @@ export const Pulse: PulseApi = {
   },
 
   recordMetric(metric: string, attributes?: PulseAttributes): void {
-    log("info", metricMessage(metric, "record"), attributes);
+    if (quietDisabled || processingEvent || logging || recordingEvent || diagnosing) return;
+    try { log("info", metricMessage(metric, "record"), attributes); } catch { /* Metric normalization is best effort. */ }
   },
 
   async setUser(identifier: string): Promise<void> {
@@ -688,7 +740,7 @@ export const Pulse: PulseApi = {
       debugLog("clearUser called before configure()");
       return;
     }
-    identity.clearUser(options);
+    try { identity.clearUser(options); } catch { /* Clearing telemetry identity must not interrupt logout. */ }
   },
 
   async setUserProperties(properties: Record<string, string>): Promise<void> {
@@ -700,14 +752,16 @@ export const Pulse: PulseApi = {
     // may outlive opt-out, shutdown, reconfiguration, or an identity change.
     const clientTransport = transport;
     const userId = identity.currentId;
-    await clientTransport.flush();
-    if (transport !== clientTransport) return;
-    await clientTransport.setUserProperties(userId, properties);
+    try {
+      await clientTransport.flush();
+      if (transport !== clientTransport) return;
+      await clientTransport.setUserProperties(userId, properties);
+    } catch { /* Optional identity metadata is best effort. */ }
   },
 
   async flush(): Promise<void> {
-    await transport?.flush();
-    await attachments?.flush();
+    try { await transport?.flush(); } catch { /* Still flush attachments. */ }
+    try { await attachments?.flush(); } catch { /* Background delivery is best effort. */ }
   },
 
   async shutdown(): Promise<void> {

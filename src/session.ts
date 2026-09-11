@@ -26,22 +26,25 @@ export interface SessionCallbacks {
  * time origin is the honest answer.
  */
 export function launchDurationMs(): number | undefined {
-  const perf = (globalThis as { performance?: Performance }).performance;
-  if (!perf) return undefined;
-
   try {
-    const entries = perf.getEntriesByType?.("navigation") as
-      | PerformanceNavigationTiming[]
-      | undefined;
-    const nav = entries?.[0];
-    for (const mark of [nav?.loadEventEnd, nav?.domContentLoadedEventEnd, nav?.responseEnd]) {
-      if (typeof mark === "number" && mark > 0) return Math.round(mark);
+    const perf = (globalThis as { performance?: Performance }).performance;
+    if (!perf) return undefined;
+    try {
+      const entries = perf.getEntriesByType?.("navigation") as
+        | PerformanceNavigationTiming[]
+        | undefined;
+      const nav = entries?.[0];
+      for (const mark of [nav?.loadEventEnd, nav?.domContentLoadedEventEnd, nav?.responseEnd]) {
+        if (typeof mark === "number" && mark > 0) return Math.round(mark);
+      }
+    } catch {
+      // Navigation Timing Level 2 is missing; fall through to the time origin.
     }
-  } catch {
-    // Navigation Timing Level 2 is missing; fall through to the time origin.
-  }
 
-  return typeof perf.now === "function" ? Math.round(perf.now()) : undefined;
+    return typeof perf.now === "function" ? Math.round(perf.now()) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
