@@ -381,6 +381,33 @@ describe("Pulse", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("hints the original rejection for a failed fetch and keeps cancellations at debug", async () => {
+    const seen: Array<[LogEvent, PulseEventHint]> = [];
+    const failure = new TypeError("Failed to fetch");
+    const controller = new AbortController();
+    controller.abort();
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url.endsWith("/failed")) return Promise.reject(failure);
+      if (url.endsWith("/cancelled")) return Promise.reject(init?.signal?.reason);
+      return Promise.resolve(new Response("{}", { status: 200 }));
+    });
+    Pulse.configure({ ...config, networkTracking: true,
+      beforeSend(event, hint) { seen.push([event, hint]); return event; } });
+
+    await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
+    await expect(fetch("https://api.example.com/cancelled", { signal: controller.signal }))
+      .rejects.toBe(controller.signal.reason);
+    await Pulse.flush();
+
+    const network = sentEvents().filter((event) => event.message === "sdk:network_request");
+    expect(network.map((event) => [event.level, event.custom_attributes?._http_url]))
+      .toEqual([["error", "https://api.example.com/failed"], ["debug", "https://api.example.com/cancelled"]]);
+    const hints = seen.filter(([event]) => event.message === "sdk:network_request").map(([, hint]) => hint);
+    expect(hints).toEqual([{ originalException: failure }, { originalException: controller.signal.reason }]);
+    // The hint stays transient: no copy of the rejection reaches the wire.
+    expect(JSON.stringify(sentEvents())).not.toContain("Failed to fetch");
+  });
+
   it("does not apply ignoreErrors to lower-level network events", async () => {
     Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["sdk:network_request"] });
     await fetch("https://api.example.com/profile");

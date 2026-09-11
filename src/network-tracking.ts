@@ -1,5 +1,5 @@
 import { nowMs } from "./clock";
-import type { PulseLogLevel } from "./types";
+import type { PulseEventHint, PulseLogLevel } from "./types";
 
 /** Header the app's own backend reads to join its logs to this session. */
 export const SESSION_HEADER = "X-Pulse-Session-Id";
@@ -15,8 +15,12 @@ export interface NetworkTrackingOptions {
   urlMode?: "path" | "origin";
   /** Current session id, or undefined before the session starts. */
   sessionId(): string | undefined;
-  /** Called once per tracked request with the level and reserved attributes. */
-  onRequest(level: PulseLogLevel, attributes: Record<string, string>): void;
+  /**
+   * Called once per tracked request with the level and reserved attributes.
+   * A failed request supplies a hint carrying the original rejection or throw
+   * as `originalException`, whatever its value; a response supplies no hint.
+   */
+  onRequest(level: PulseLogLevel, attributes: Record<string, string>, hint?: PulseEventHint): void;
 }
 
 function isRequest(input: unknown): input is Request {
@@ -99,6 +103,19 @@ function levelForStatus(status: number): PulseLogLevel {
 }
 
 /**
+ * A request the app cancelled itself rejects with an `AbortError`, the default
+ * reason `controller.abort()` supplies, so it is a breadcrumb rather than a
+ * failure. Anything else — a `TypeError` from the network, a `TimeoutError`
+ * from `AbortSignal.timeout()`, a custom abort reason — is indistinguishable
+ * from a real problem and stays an error. `signal.aborted` alone is not
+ * evidence: the request may have failed before anyone aborted it.
+ */
+function levelForRejection(error: unknown): PulseLogLevel {
+  const name = typeof error === "object" && error !== null ? (error as { name?: unknown }).name : undefined;
+  return name === "AbortError" ? "debug" : "error";
+}
+
+/**
  * Wrap `fetch` to time requests and, where asked, forward the session id. The
  * SDK's own traffic is passed straight through so a failing ingest call cannot
  * generate the events that would be ingested next.
@@ -141,14 +158,14 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
       // The platform remains responsible for rejecting invalid request inputs.
     }
 
-    const report = (status: number): void => {
+    const report = (status: number, hint?: PulseEventHint): void => {
       if (!active || !attributes) return;
       try {
-        options.onRequest(status === 0 ? "error" : levelForStatus(status), {
+        options.onRequest(status === 0 ? levelForRejection(hint?.originalException) : levelForStatus(status), {
           ...attributes,
           _http_status: String(status),
           _http_duration_ms: String(Math.round(nowMs() - startedAt)),
-        });
+        }, hint);
       } catch {
         // Neither collector nor application hook failures may replace fetch results.
       }
@@ -158,7 +175,7 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
     try {
       result = Reflect.apply(original, this, nextArgs) as ReturnType<typeof fetch>;
     } catch (error) {
-      report(0);
+      report(0, { originalException: error });
       throw error;
     }
     if (!attributes) return result;
@@ -169,7 +186,7 @@ export function installNetworkTracking(options: NetworkTrackingOptions): () => v
       report(response.status);
       return response;
     }, (error: unknown) => {
-      report(0);
+      report(0, { originalException: error });
       throw error;
     });
   };
