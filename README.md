@@ -400,8 +400,9 @@ Error object is attempted at most once per configured client lifetime, even when
 or throws. A WeakSet does not retain objects; a new configuration clears it. Distinct Error objects
 with the same message and repeated primitive throws remain reportable.
 
-Hints provide the original thrown value for exception capture and automatic error paths. Plain
-logger and SDK events receive an empty hint. The SDK uses hints only during the synchronous hook:
+Hints provide the original thrown value for exception capture, automatic error paths and the
+automatic `sdk:network_request` event of a failed or cancelled fetch. Plain logger and other SDK
+events receive an empty hint. The SDK uses hints only during the synchronous hook:
 they are not part of the event, persisted, uploaded, buffered or retained for replay. Do not copy
 `hint.originalException` into the event. One-argument hooks remain compatible.
 
@@ -651,7 +652,10 @@ Malformed or non-HTTP(S) URLs omit `_http_url`; the raw value is never used as a
 The mode applies before `beforeSend`, buffering, console or offline persistence, including failures.
 
 The `sdk:network_request` event reports available method, status and duration: debug for 2xx/3xx, warn for
-other responses and error with status `0` on rejection. SDK endpoint requests remain excluded.
+other responses, error with status `0` when the request fails — a network failure, a timeout, or an
+abort with a custom reason — and debug with status `0` when the request is intentionally cancelled
+and rejects with a default `AbortError`. The failure event's `beforeSend` hint carries the original
+rejection as `originalException`, so apps can classify further. SDK endpoint requests remain excluded.
 The application's request URL, body and headers are unchanged except for explicitly requested
 session propagation; response and rejection values retain their identity and normal fetch behavior.
 Origin hostnames may themselves contain identifiers. This is not a general PII guarantee: app

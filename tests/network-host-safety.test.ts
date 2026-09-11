@@ -290,6 +290,40 @@ describe("request behavior with instrumentation", () => {
     expect(sent.credentials).toBe("include");
     expect(methodReads).toBe(1);
   });
+  it.each([false, true])("classifies cancellation after native conversion without disrupting a throwing hook, propagation=%s", async (propagate) => {
+    const controller = new AbortController();
+    controller.abort();
+    const method = vi.fn(() => "POST");
+    const init = Object.create({ signal: controller.signal });
+    Object.defineProperty(init, "method", { get: method });
+    const reported = vi.fn(() => { throw new Error("collector failed"); });
+    vi.stubGlobal("fetch", vi.fn(async (input, options) => {
+      if (!("signal" in options)) options.signal = new AbortController().signal;
+      const request = new Request(input, options);
+      request.signal.throwIfAborted();
+      return new Response("ok");
+    }));
+    install(propagate, reported);
+    await expect(fetch("https://app.example.com/api/orders", init)).rejects.toBe(controller.signal.reason);
+    expect(method).toHaveBeenCalledTimes(1);
+    expect(reported).toHaveBeenCalledExactlyOnceWith("debug", expect.objectContaining({
+      _http_method: "POST", _http_status: "0",
+    }), { originalException: controller.signal.reason });
+  });
+  it.each([false, true])("contains rejection metadata getters and preserves the original rejection, propagation=%s", async (propagate) => {
+    const name = vi.fn(() => { throw new Error("classification failed"); });
+    const failure = Object.defineProperty({}, "name", { get: name });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw failure; }));
+    install(propagate);
+    await expect(fetch("https://app.example.com/api/orders")).rejects.toBe(failure);
+    expect(name).toHaveBeenCalledTimes(1);
+  });
+  it("preserves unusual fetch return values when attaching the observer fails", () => {
+    const result = Object.defineProperty({}, "then", { get() { throw new Error("observer unavailable"); } });
+    vi.stubGlobal("fetch", vi.fn(() => result));
+    install(false);
+    expect(fetch("https://app.example.com/api/orders")).toBe(result);
+  });
   it("contains a response metadata getter failure", async () => {
     const response = new Response("ok");
     Object.defineProperty(response, "status", { get() { throw new Error("metadata failed"); } });
