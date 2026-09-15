@@ -3,6 +3,7 @@ import { Pulse } from "../src/index";
 import type { IngestRequest, LogEvent, PulseEventHint } from "../src/types";
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
+import { SESSION_ACTIVITY_KEY, SESSION_ID_KEY } from "../src/session";
 import { STORAGE_PREFIX } from "../src/storage";
 import {
   resetTestEnvironment,
@@ -900,6 +901,64 @@ describe("Pulse", () => {
         { anonymous_id: "pulse_anon_saved", user_id: "user-99" },
       ]);
     });
+  });
+
+  it("deletes every persisted browser value on reset and starts clean afterwards", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    await Pulse.setUser("user-7");
+    Pulse.info("before-reset");
+    testNavigator.onLine = false;
+    await Pulse.flush();
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const queueKeys = (): string[] =>
+      testLocalStorage.keys().filter((key) => key.startsWith(`${STORAGE_PREFIX}offline_queue`));
+    expect(queueKeys().length).toBeGreaterThan(0);
+
+    Pulse.reset();
+
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBeNull();
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + USER_ID_KEY)).toBeNull();
+    expect(queueKeys()).toEqual([]);
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBeNull();
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ACTIVITY_KEY)).toBeNull();
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
+
+    testNavigator.onLine = true;
+    fetchMock.mockClear();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    Pulse.info("after-reset");
+    await Pulse.flush();
+    const messages = sentEvents().map((event) => event.message);
+    expect(messages).toContain("after-reset");
+    expect(messages).not.toContain("before-reset");
+  });
+
+  it("clears identity held only in the storage fallback, so the next init is a new browser", () => {
+    testLocalStorage.throwOnSet = "error";
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    expect(anonymousId).toMatch(/^pulse_anon_/);
+    expect(testLocalStorage.length).toBe(0);
+
+    Pulse.reset();
+    Pulse.init(config);
+
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+  });
+
+  it("resets before any initialization without throwing or touching host keys", () => {
+    testLocalStorage.setItem("app.theme", "dark");
+
+    expect(() => Pulse.reset()).not.toThrow();
+
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
   });
 
   it("reverts to the anonymous id on clearUser", async () => {

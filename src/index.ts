@@ -30,8 +30,8 @@ import {
   type QuestionnaireContext,
 } from "./questionnaires";
 import { SessionManager } from "./session";
-import { localStore } from "./storage";
-import { Transport } from "./transport";
+import { localStore, sessionStore } from "./storage";
+import { Transport, type TransportStopOptions } from "./transport";
 import { installUnhandledCapture, type UnhandledKind } from "./unhandled-capture";
 import {
   ENVIRONMENT,
@@ -424,8 +424,13 @@ function uninstallObservers(): void {
   pageTracker = null;
 }
 
-/** Drop this pipeline without flushing or clearing any persisted browser data. */
-function disableClient(): void {
+/**
+ * Drop this pipeline without flushing. Persisted browser data is left alone
+ * unless `discardReplay` says otherwise — see `Pulse.reset`, the only caller
+ * that follows this with a purge and so cannot let a transport hand replayed
+ * events back to the queue.
+ */
+function disableClient(options?: TransportStopOptions): void {
   capturedErrors = new WeakSet<Error>();
   quietDisabled = true;
   initializing = false;
@@ -438,14 +443,24 @@ function disableClient(): void {
   session = null;
   offlineQueue = null;
   deviceInfo = {};
-  const stop = (resource: { stop(): void } | null): void => {
-    try { resource?.stop(); } catch { /* A broken resource cannot block other cleanup. */ }
+  const stopTransport = (previous: Transport | null): void => {
+    try { previous?.stop(options); } catch { /* A broken resource cannot block other cleanup. */ }
   };
-  stop(previousTransport);
-  stop(previousAttachments);
-  for (const previous of retiringTransports) stop(previous);
-  for (const previous of retiringAttachments) stop(previous);
+  const stopAttachments = (previous: AttachmentUploader | null): void => {
+    try { previous?.stop(); } catch { /* A broken resource cannot block other cleanup. */ }
+  };
+  stopTransport(previousTransport);
+  stopAttachments(previousAttachments);
+  for (const previous of retiringTransports) stopTransport(previous);
+  for (const previous of retiringAttachments) stopAttachments(previous);
   uninstallObservers();
+}
+
+/** Delete every value the SDK keeps in this browser, in both storage areas. */
+function purgeStoredState(): void {
+  for (const store of [localStore, sessionStore]) {
+    try { store.clear(); } catch { /* A hostile storage adapter cannot block the rest of the deletion. */ }
+  }
 }
 
 async function drainClient(previousTransport: Transport | null, previousAttachments: AttachmentUploader | null): Promise<void> {
@@ -601,6 +616,16 @@ export interface PulseApi {
   dismissQuestionnaires(): Promise<Date>;
   flush(): Promise<void>;
   shutdown(): Promise<void>;
+  /**
+   * The client-side deletion control for consent withdrawal. Disables any
+   * running client, then deletes everything the SDK kept in this browser: the
+   * anonymous id, the user id, the session, and queued events.
+   * `init({ enabled: false })` keeps that storage so a later enabled
+   * initialization can replay it; `reset()` deletes it. A later `init` starts
+   * as a new browser with a fresh anonymous id. Nothing already sent to the
+   * server is recalled, and `clearUser` is not a deletion control.
+   */
+  reset(): void;
   /** Session id for the current page, or undefined before `configure`. */
   readonly sessionId: string | undefined;
   /**
@@ -778,6 +803,12 @@ export const Pulse: PulseApi = {
     deviceInfo = {};
     quietDisabled = false;
     await drainClient(previousTransport, previousAttachments);
+  },
+
+  reset(): void {
+    // Deletion has to happen even if tearing the pipeline down goes wrong.
+    try { disableClient({ discardReplay: true }); } catch { /* Consent withdrawal never throws into the host app. */ }
+    purgeStoredState();
   },
 
   async sendFeedback(

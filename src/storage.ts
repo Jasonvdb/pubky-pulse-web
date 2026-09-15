@@ -133,6 +133,14 @@ export class SafeStorage {
     return [...found];
   }
 
+  /**
+   * Delete every SDK key, from the backend and the in-memory fallback alike.
+   * Host app keys are untouched: only the prefixed namespace is enumerated.
+   */
+  clear(): void {
+    for (const key of this.keys("")) this.remove(key);
+  }
+
   remove(key: string): void {
     this.memory.delete(key);
     const backend = resolveBackend(this.kind);

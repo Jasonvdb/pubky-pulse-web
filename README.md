@@ -64,7 +64,8 @@ and keep the running client. To change options, use `await Pulse.shutdown()` (wh
 
 `Pulse.init({ enabled: false })` stops an active client and discards its pending in-memory telemetry
 without flushing or parking it. It leaves pre-existing browser storage intact; a later enabled
-initialization can replay that old queue. Already transmitted requests cannot be recalled.
+initialization can replay that old queue. Use `Pulse.reset()` instead when that storage has to go
+away — on a withdrawal of consent, say. Already transmitted requests cannot be recalled.
 Initialization failures roll back installed collectors and return `error`. Invalid configuration
 returns `invalid-configuration`; a supplied invalid endpoint never falls back to the hosted service.
 An invalid reinitialization preserves an already-running valid client. Diagnostics contain no keys,
@@ -473,6 +474,19 @@ Pulse.clearUser({ newAnonymousId: true }); // sign-out on a shared device
 
 Call `setUser` on every page load where you know who the user is; the claim is idempotent.
 
+`clearUser` is a sign-out, not a deletion control: it forgets who the person is and keeps
+collecting. `Pulse.reset()` is the deletion control. It disables the running client and then deletes
+everything the SDK kept in this browser — the anonymous id, the user id, the session, and any queued
+events — so nothing is left to replay:
+
+```ts
+Pulse.reset(); // the person withdrew consent
+```
+
+The next `Pulse.init` starts as a new browser with a fresh anonymous id. Nothing already sent to the
+server is recalled by it; delete that server-side. Calling it before any initialization is a safe
+no-op, and it never throws into your app.
+
 The promise waits for the flush and the claim request attempts. Those retry with exponential
 backoff, so against an endpoint that is failing or hanging the await can take a couple of minutes.
 When the browser is offline nothing is attempted: `setUser` returns straight away and the claim is
@@ -688,7 +702,11 @@ rarely need to intervene, but both are available:
 ```ts
 await Pulse.flush(); // attempt queued events and wait within the attachment deadline
 await Pulse.shutdown(); // flush, then remove every page hook the SDK installed
+Pulse.reset(); // stop without flushing and delete this browser's stored SDK data
 ```
+
+`shutdown` drains what is pending and leaves the offline queue for the next page load; `reset` is
+the consent-withdrawal path and deletes it. See [Identity](#identity).
 
 When the page is hidden or unloaded the SDK flushes on its own with a `keepalive` request and parks
 whatever does not fit — including the batch that was still waiting out a retry — in an offline queue

@@ -62,6 +62,17 @@ export function retryDelayMs(attempt: number, retryAfterMs: number | null): numb
 
 type BatchOutcome = "sent" | "dropped" | "park";
 
+/** Options for {@link Transport.stop}. */
+export interface TransportStopOptions {
+  /**
+   * Drop the drained-but-unacknowledged replay instead of returning it to the
+   * offline queue. The restore runs through an async cross-tab lock, so a
+   * synchronous purge right after `stop()` would lose the race to it and the
+   * events it just deleted would reappear.
+   */
+  discardReplay?: boolean;
+}
+
 /**
  * Greedily take events that fit inside the keepalive budget. Returns the batch
  * to send and the remainder to park.
@@ -136,7 +147,7 @@ export class Transport {
   }
 
   /** Stop immediately without flushing, replaying, or deleting persisted data. */
-  stop(): void {
+  stop(options?: TransportStopOptions): void {
     this.stopped = true;
     if (this.timer !== null) {
       try { clearInterval(this.timer); } catch { /* A retained interval becomes inert after stop. */ }
@@ -156,8 +167,11 @@ export class Transport {
     }
     this.delays.clear();
     // Restoring a replay already removed from storage preserves consent-era data.
-    // Fresh in-memory telemetry is deliberately discarded.
-    this.restoreReplay();
+    // Fresh in-memory telemetry is deliberately discarded. A reset is the one
+    // caller that wants the replay gone too, and cannot wait for the restore's
+    // lock to settle before it purges storage.
+    if (options?.discardReplay) this.replayed.clear();
+    else this.restoreReplay();
   }
 
   private restoreReplay(): void {

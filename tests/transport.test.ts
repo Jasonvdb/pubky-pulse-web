@@ -235,6 +235,33 @@ describe("Transport", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { mode: "restores", options: undefined as { discardReplay?: boolean } | undefined, left: ["event-0"] },
+    { mode: "discards", options: { discardReplay: true }, left: [] as string[] },
+  ])("$mode drained replay events on stop, before the cross-tab lock settles", async ({ options, left }) => {
+    testNavigator.locks = new TestLockManager();
+    await queue.append([makeEvent(0)]);
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      const signal = init.signal as AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const tx = createTransport();
+    const flushing = tx.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    tx.stop(options);
+    // A reset purges storage right here, with no turn in which to await the
+    // restore's lock, so the queue must be empty in both modes at this point.
+    expect(queue.read()).toEqual([]);
+
+    await flushing;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(left);
+  });
+
   it("cancels a retry delay and does not park fresh telemetry on stop", async () => {
     fetchMock.mockResolvedValue(new Response("", { status: 503 }));
     const tx = createTransport();
