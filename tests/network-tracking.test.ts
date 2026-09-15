@@ -6,7 +6,7 @@ import {
   type NetworkTrackingOptions,
 } from "../src/network-tracking";
 import type { PulseEventHint, PulseLogLevel } from "../src/types";
-import { resetTestEnvironment } from "./setup";
+import { resetTestEnvironment, testNavigator } from "./setup";
 
 const ENDPOINT = "https://pulse.example.com";
 
@@ -432,6 +432,54 @@ describe("installNetworkTracking", () => {
     expect(sentHeaders(0).has(SESSION_HEADER)).toBe(false);
     expect(sentHeaders(1).get(SESSION_HEADER)).toBe("session-1");
     expect(sentHeaders(1).get("Authorization")).toBe("app-secret");
+  });
+
+  it("downgrades a rejection to a warning while the browser reports offline", async () => {
+    const failure = new TypeError("Failed to fetch");
+    fetchMock.mockRejectedValue(failure);
+    testNavigator.onLine = false;
+    install();
+
+    await expect(fetch("https://api.example.com/users")).rejects.toBe(failure);
+
+    // Offline is a fact about the network, not a defect in the application.
+    expect(requests[0]![0]).toBe("warn");
+    expect(requests[0]![1]._http_status).toBe("0");
+    expect(requests[0]![2]).toEqual({ originalException: failure });
+  });
+
+  it("keeps a cancellation at debug level while the browser reports offline", async () => {
+    const cancelled = new DOMException("aborted", "AbortError");
+    fetchMock.mockRejectedValue(cancelled);
+    testNavigator.onLine = false;
+    install();
+
+    await expect(fetch("https://api.example.com/users")).rejects.toBe(cancelled);
+
+    expect(requests[0]![0]).toBe("debug");
+  });
+
+  it("keeps a rejection at error level while the browser reports online", async () => {
+    const failure = new TypeError("Failed to fetch");
+    fetchMock.mockRejectedValue(failure);
+    testNavigator.onLine = true;
+    install();
+
+    await expect(fetch("https://api.example.com/users")).rejects.toBe(failure);
+
+    expect(requests[0]![0]).toBe("error");
+  });
+
+  it("does not let a hostile rejection name suppress the event", async () => {
+    const failure = new Error("boom");
+    Object.defineProperty(failure, "name", { get: () => { throw new Error("hostile"); } });
+    fetchMock.mockRejectedValue(failure);
+    install();
+
+    await expect(fetch("https://api.example.com/users")).rejects.toBe(failure);
+
+    expect(requests[0]![0]).toBe("error");
+    expect(requests[0]![1]._http_status).toBe("0");
   });
 
   it("does not report in-flight requests or annotate retained wrappers after uninstall", async () => {

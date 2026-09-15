@@ -118,6 +118,12 @@ let logging = false;
 let recordingEvent = false;
 let diagnosing = false;
 let quietDisabled = false;
+/**
+ * Whether this session's debug network events are kept, decided once so a
+ * sampled session carries a complete request timeline rather than a random
+ * scattering of one. Keyed by session id, and re-decided when it changes.
+ */
+let networkSample: { sessionId: string; keep: boolean } | null = null;
 const retiringTransports = new Set<Transport>();
 const retiringAttachments = new Set<AttachmentUploader>();
 /** Uninstallers for everything `configure()` hooked into the page. */
@@ -368,6 +374,17 @@ function captureException(
   }
 }
 
+/** Sample the debug tier of `sdk:network_request` by session, not by request. */
+function keepSampledNetworkEvent(rate: number): boolean {
+  if (rate >= 1) return true;
+  const sessionId = session?.id;
+  if (rate <= 0 || !sessionId) return false;
+  if (networkSample?.sessionId !== sessionId) {
+    networkSample = { sessionId, keep: Math.random() < rate };
+  }
+  return networkSample.keep;
+}
+
 function installObservers(validated: ValidatedConfig): void {
   uninstallers.push(
     installLifecycle({
@@ -400,8 +417,22 @@ function installObservers(validated: ValidatedConfig): void {
         urlMode: validated.networkUrlMode,
         sessionId: () => session?.id ?? undefined,
         onRequest(level, attributes, hint): void {
+          // Only the high-volume debug tier is sampled; failures always ship.
+          if (level === "debug" && !keepSampledNetworkEvent(validated.networkSampleRate)) return;
+          let merged = attributes;
+          if (level === "error" && hint && Object.hasOwn(hint, "originalException")) {
+            try {
+              const extracted = extractErrorAttributes(hint.originalException);
+              if (isIgnoredError(validated.ignoreErrors, extracted.message, extracted.attributes)) return;
+              // The type only: a rejection message, stack or cause can quote the URL.
+              const type = extracted.attributes._error_type;
+              if (type) merged = { ...attributes, _error_type: type };
+            } catch {
+              // A hostile rejection value may not suppress the request event.
+            }
+          }
           // The hint stays transient: the rejection never enters the event.
-          log(level, "sdk:network_request", attributes, undefined, hint ?? {});
+          log(level, "sdk:network_request", merged, undefined, hint ?? {});
         },
       }),
     );
@@ -432,6 +463,7 @@ function uninstallObservers(): void {
  */
 function disableClient(options?: TransportStopOptions): void {
   capturedErrors = new WeakSet<Error>();
+  networkSample = null;
   quietDisabled = true;
   initializing = false;
   const previousTransport = transport;
@@ -495,6 +527,7 @@ function equivalentConfiguration(left: ValidatedConfig, right: ValidatedConfig):
 
 function initializeClient(validated: ValidatedConfig): void {
   capturedErrors = new WeakSet<Error>();
+  networkSample = null;
   initializing = true;
   quietDisabled = false;
   config = validated;

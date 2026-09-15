@@ -438,7 +438,7 @@ describe("Pulse", () => {
       if (url.endsWith("/cancelled")) return Promise.reject(init?.signal?.reason);
       return Promise.resolve(new Response("{}", { status: 200 }));
     });
-    Pulse.configure({ ...config, networkTracking: true,
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 },
       beforeSend(event, hint) { seen.push([event, hint]); return event; } });
 
     await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
@@ -456,10 +456,134 @@ describe("Pulse", () => {
   });
 
   it("does not apply ignoreErrors to lower-level network events", async () => {
-    Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["sdk:network_request"] });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 }, ignoreErrors: ["sdk:network_request"] });
     await fetch("https://api.example.com/profile");
     await Pulse.flush();
     expect(sentEvents().filter((event) => event.message === "sdk:network_request")).toHaveLength(1);
+  });
+
+  describe("failed network requests", () => {
+    const failure = new TypeError("Failed to fetch");
+
+    /** Reject `/failed`, answer everything else — including ingest — with 200. */
+    function failOnce(reason: unknown = failure): void {
+      fetchMock.mockImplementation((url: string) =>
+        url.endsWith("/failed")
+          ? Promise.reject(reason)
+          : Promise.resolve(new Response("{}", { status: 200 })));
+    }
+
+    function networkEvents(): LogEvent[] {
+      return sentEvents().filter((event) => event.message === "sdk:network_request");
+    }
+
+    it("drops a rejection matched by an ignoreErrors rule", async () => {
+      failOnce();
+      Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["Failed to fetch"] });
+
+      await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
+      await Pulse.flush();
+
+      expect(networkEvents()).toEqual([]);
+    });
+
+    it("stamps the rejection type without putting its message on the wire", async () => {
+      failOnce();
+      Pulse.configure({ ...config, networkTracking: true });
+
+      await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
+      await Pulse.flush();
+
+      const network = networkEvents();
+      expect(network).toHaveLength(1);
+      expect(network[0]?.level).toBe("error");
+      expect(network[0]?.custom_attributes?._error_type).toBe("TypeError");
+      expect(JSON.stringify(network)).not.toContain("Failed to fetch");
+      expect(network[0]?.custom_attributes?._error_stack).toBeUndefined();
+    });
+
+    it("still records the request when the rejection value is hostile", async () => {
+      const hostile = new Error("unreadable");
+      const explode = (): never => { throw new Error("hostile accessor"); };
+      Object.defineProperty(hostile, "name", { get: explode });
+      Object.defineProperty(hostile, "message", { get: explode });
+      failOnce(hostile);
+      Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["unreadable"] });
+
+      await expect(fetch("https://api.example.com/failed")).rejects.toBe(hostile);
+      await Pulse.flush();
+
+      const network = networkEvents();
+      expect(network).toHaveLength(1);
+      expect(network[0]?.level).toBe("error");
+      expect(network[0]?.custom_attributes?._error_type).toBeUndefined();
+    });
+  });
+
+  describe("network event sampling", () => {
+    function networkLevels(): string[] {
+      return sentEvents().filter((event) => event.message === "sdk:network_request")
+        .map((event) => event.level);
+    }
+
+    async function fetchEachOutcome(): Promise<void> {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.endsWith("/missing")) return Promise.resolve(new Response("no", { status: 404 }));
+        if (url.endsWith("/failed")) return Promise.reject(new TypeError("Failed to fetch"));
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      });
+      await fetch("https://api.example.com/ok");
+      await fetch("https://api.example.com/missing");
+      await expect(fetch("https://api.example.com/failed")).rejects.toThrow("Failed to fetch");
+    }
+
+    it("sends only failures by default", async () => {
+      Pulse.configure({ ...config, networkTracking: true });
+      await fetchEachOutcome();
+      await Pulse.flush();
+
+      expect(networkLevels()).toEqual(["warn", "error"]);
+    });
+
+    it("sends every tier at a sample rate of 1", async () => {
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
+      await fetchEachOutcome();
+      await Pulse.flush();
+
+      expect(networkLevels()).toEqual(["debug", "warn", "error"]);
+    });
+
+    it.each([[0.4, ["debug", "debug"]], [0.9, []]])(
+      "decides the debug tier once per session for a roll of %j", async (roll, kept) => {
+        vi.spyOn(Math, "random").mockReturnValue(roll);
+        Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 } });
+
+        await fetch("https://api.example.com/one");
+        await fetch("https://api.example.com/two");
+        await Pulse.flush();
+
+        expect(networkLevels()).toEqual(kept);
+      });
+
+    it("re-decides the debug tier when the session rotates", async () => {
+      vi.useFakeTimers();
+      const roll = vi.spyOn(Math, "random").mockReturnValue(0.9);
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 }, sessionTimeoutMs: 1000 });
+      const firstSession = Pulse.sessionId;
+
+      await fetch("https://api.example.com/one");
+      // Rotate the session, then let the next request take a fresh decision.
+      vi.advanceTimersByTime(2000);
+      roll.mockReturnValue(0.1);
+      Pulse.info("still_here");
+      await fetch("https://api.example.com/two");
+      await Pulse.flush();
+
+      expect(Pulse.sessionId).not.toBe(firstSession);
+      const network = sentEvents().filter((event) => event.message === "sdk:network_request");
+      expect(network.map((event) => [event.level, event.session_id]))
+        .toEqual([["debug", Pulse.sessionId]]);
+    });
   });
 
   it.each(["disable", "disable-and-init", "shutdown-and-init", "configure"])(
@@ -739,7 +863,7 @@ describe("Pulse", () => {
     let observedUrl: string | undefined;
     Pulse.configure({
       ...config,
-      networkTracking: true,
+      networkTracking: { sampleRate: 1 },
       beforeSend(event) {
         if (event.custom_attributes?._http_url) {
           observedUrl = event.custom_attributes._http_url;
@@ -1313,7 +1437,7 @@ describe("Pulse", () => {
   });
 
   it("records app fetch calls but not its own ingest traffic", async () => {
-    Pulse.configure({ ...config, networkTracking: true });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
     await fetch("https://api.example.com/orders?token=secret");
     await Pulse.flush();
 
@@ -1344,9 +1468,9 @@ describe("Pulse", () => {
   });
 
   it("replaces the pipeline when configure runs again without shutdown", async () => {
-    Pulse.configure({ ...config, networkTracking: true });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
     const firstSession = Pulse.sessionId;
-    Pulse.configure({ ...config, networkTracking: true });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
 
     expect(Pulse.sessionId).toBe(firstSession);
 

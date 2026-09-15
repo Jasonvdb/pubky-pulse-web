@@ -27,6 +27,11 @@ export interface ValidatedConfig {
   ignoreErrors?: Array<string | RegExp>;
   networkTracking: boolean;
   networkUrlMode?: "path" | "origin";
+  /**
+   * Flattened `networkTracking.sampleRate`, for the same reason `deviceInfo`
+   * is flattened below: a plain number compares by `===`.
+   */
+  networkSampleRate: number;
   propagateSessionTo: string[];
   flushIntervalMs: number;
   flushThreshold: number;
@@ -127,6 +132,13 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
   if (networkUrlMode !== "path" && networkUrlMode !== "origin") {
     throw new Error("Pubky Pulse: networkTracking.urlMode must be path or origin");
   }
+  // Default 0: successful requests are high-volume chatter, so opting into
+  // network tracking opts into failures only until a rate is asked for.
+  const sampleRate = typeof network === "object" ? network.sampleRate : undefined;
+  if (sampleRate !== undefined &&
+      (typeof sampleRate !== "number" || !Number.isFinite(sampleRate) || sampleRate < 0 || sampleRate > 1)) {
+    throw new Error("Pubky Pulse: networkTracking.sampleRate must be a number between 0 and 1");
+  }
 
   const device = config.deviceInfo;
   if (device !== undefined && typeof device !== "boolean" &&
@@ -169,6 +181,7 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     ignoreErrors: snapshotIgnoreErrors(config.ignoreErrors),
     networkTracking: typeof network === "object" ? true : network ?? false,
     networkUrlMode,
+    networkSampleRate: sampleRate ?? 0,
     propagateSessionTo: stringArray(config.propagateSessionTo, "propagateSessionTo") ?? [],
     flushIntervalMs,
     flushThreshold,

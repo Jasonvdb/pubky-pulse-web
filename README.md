@@ -659,17 +659,31 @@ Pulse.init({
 });
 ```
 
-`networkTracking` defaults to `false`. `true` or `{ urlMode: "path" }` retains the existing
-behavior: credentials, query and fragment are stripped but paths remain. `{ urlMode: "origin" }`
+`networkTracking` defaults to `false`. `true` and `{ urlMode: "path" }` sanitize the URL the same
+way: credentials, query and fragment are stripped but paths remain. `{ urlMode: "origin" }`
 keeps only protocol, hostname and port for HTTP(S), resolving relative URLs against the page.
 Malformed or non-HTTP(S) URLs omit `_http_url`; the raw value is never used as an origin fallback.
 The mode applies before `beforeSend`, buffering, console or offline persistence, including failures.
+Turning tracking on does not report every request: the successful ones are sampled by `sampleRate`,
+which defaults to `0`, so `true` on its own reports failures only.
 
-The `sdk:network_request` event reports available method, status and duration: debug for 2xx/3xx, warn for
-other responses, error with status `0` when the request fails — a network failure, a timeout, or an
-abort with a custom reason — and debug with status `0` when the request is intentionally cancelled
-and rejects with a default `AbortError`. The failure event's `beforeSend` hint carries the original
-rejection as `originalException`, so apps can classify further. SDK endpoint requests remain excluded.
+The `sdk:network_request` event reports available method, status and duration at one of three levels:
+
+- **debug** — a 2xx/3xx response, or status `0` for a request the app intentionally cancelled, which
+  rejects with a default `AbortError`. This tier is sampled: `sampleRate` is the fraction of sessions
+  that report it, decided once per session so a sampled session keeps a complete request timeline.
+- **warn** — a 4xx/5xx response, or status `0` for a rejection while `navigator.onLine` is `false`.
+  A failure with no connection describes the user's network rather than your app, so it is reported
+  as a fact about the network instead of opening an issue.
+- **error** — status `0` for a rejection while the browser reports itself online: a network failure,
+  a timeout, or an abort with a custom reason.
+
+`warn` and `error` events are never sampled. Error-level events are filtered by `ignoreErrors`,
+matched against the rejection's own message and `Type: message`, and carry `_error_type` — the
+rejection's `name` or constructor, `TypeError` say. Nothing else from the rejection reaches the
+event: its message, stack and causes can quote the request URL. The failure event's `beforeSend`
+hint carries the original rejection as `originalException`, so apps can classify further. SDK
+endpoint requests remain excluded.
 The application's request URL, body and headers are unchanged except for explicitly requested
 session propagation; response and rejection values retain their identity and normal fetch behavior.
 Origin hostnames may themselves contain identifiers. This is not a general PII guarantee: app
@@ -756,7 +770,7 @@ can also discard telemetry. Increasing `maxBufferSize` does not increase these b
 | `screenNameForPath` | `(pathname: string) => string` | Raw pathname | Map automatic screen names; a thrown error or blank/non-string result ends the previous screen and clears default attribution. |
 | `ignoreErrors` | `(string \| RegExp)[]` | `[]` | Filter exception/error logger messages before hooks and output. |
 | `beforeSend` | `(event: LogEvent, hint: PulseEventHint) => LogEvent \| null` | Not set | Transform or drop enriched events before output, buffering, and attachment scheduling. Synchronous only; failures drop silently. |
-| `networkTracking` | `boolean \| { urlMode?: "path" \| "origin" }` | `false` | Emit an event per `fetch`; true and an empty object preserve sanitized paths. |
+| `networkTracking` | `boolean \| { urlMode?: "path" \| "origin"; sampleRate?: number }` | `false` | Emit events for `fetch` calls; true and an empty object preserve sanitized paths. `sampleRate` (0–1, default `0`) is the fraction of sessions reporting successful requests, so `true` alone reports only failures. |
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |
 | `flushThreshold` | `number` | `20` | Buffered events that trigger an immediate flush. |

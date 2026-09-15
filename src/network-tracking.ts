@@ -1,4 +1,5 @@
 import { nowMs } from "./clock";
+import { isOnline } from "./device-info";
 import type { PulseEventHint, PulseLogLevel } from "./types";
 
 /** Header the app's own backend reads to join its logs to this session. */
@@ -314,12 +315,20 @@ function levelForStatus(status: number): PulseLogLevel {
  * reason `controller.abort()` supplies, so it is a breadcrumb rather than a
  * failure. Anything else — a `TypeError` from the network, a `TimeoutError`
  * from `AbortSignal.timeout()`, a custom abort reason — is indistinguishable
- * from a real problem and stays an error. `signal.aborted` alone is not
- * evidence: the request may have failed before anyone aborted it.
+ * from a real problem. `signal.aborted` alone is not evidence: the request may
+ * have failed before anyone aborted it.
+ *
+ * Unless the browser reports itself offline. Then the failure is a fact about
+ * the user's network rather than about the application, and every disconnected
+ * tab would otherwise open an issue nobody can fix, so it is only a warning.
  */
 function levelForRejection(error: unknown): PulseLogLevel {
-  const name = typeof error === "object" && error !== null ? (error as { name?: unknown }).name : undefined;
-  return name === "AbortError" ? "debug" : "error";
+  let name: unknown;
+  try {
+    if (typeof error === "object" && error !== null) name = (error as { name?: unknown }).name;
+  } catch { /* A hostile accessor may not decide the level, nor suppress the event. */ }
+  if (name === "AbortError") return "debug";
+  return isOnline() ? "error" : "warn";
 }
 
 /**

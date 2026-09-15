@@ -157,6 +157,7 @@ describe("validateConfiguration", () => {
       captureUnhandled: true,
       trackPageViews: true,
       networkTracking: false,
+      networkSampleRate: 0,
       propagateSessionTo: [],
       flushIntervalMs: 5000,
       flushThreshold: 20,
@@ -253,6 +254,23 @@ describe("isDev default", () => {
   });
 });
 
+
+describe("networkTracking sampling", () => {
+  it.each([0, 0.25, 1])("accepts a sample rate of %j", (sampleRate) => {
+    expect(validateConfiguration({ ...base, networkTracking: { sampleRate } }))
+      .toMatchObject({ networkTracking: true, networkSampleRate: sampleRate });
+  });
+
+  it.each([true, { urlMode: "origin" as const }])("samples nothing by default for %j", (networkTracking) => {
+    expect(validateConfiguration({ ...base, networkTracking }).networkSampleRate).toBe(0);
+  });
+
+  it.each([-0.1, 1.5, NaN, Infinity, "1", null])("rejects a sample rate of %j", (sampleRate) => {
+    expect(() =>
+      validateConfiguration({ ...base, networkTracking: { sampleRate: sampleRate as number } }),
+    ).toThrow("Pubky Pulse: networkTracking.sampleRate must be a number between 0 and 1");
+  });
+});
 
 describe("ignoreErrors configuration", () => {
   it.each([null, "AbortError", {}, [42], [null], Array(1)])("rejects invalid rules %j", (ignoreErrors) => {
