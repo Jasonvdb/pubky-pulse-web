@@ -585,6 +585,66 @@ describe("Pulse", () => {
       expect(network.map((event) => [event.level, event.session_id]))
         .toEqual([["debug", Pulse.sessionId]]);
     });
+
+    /** Session ids carried by one lifecycle message, in the order they were sent. */
+    function lifecycleIds(message: string): Array<string | undefined> {
+      return sentEvents().filter((event) => event.message === message)
+        .map((event) => event.session_id);
+    }
+
+    it("decides for the session a request crossing the idle boundary lands in", async () => {
+      vi.useFakeTimers();
+      const roll = vi.spyOn(Math, "random").mockReturnValue(0.9);
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 }, sessionTimeoutMs: 1000 });
+      const firstSession = Pulse.sessionId;
+
+      // The first session rolls a drop; the crossing request must not inherit it.
+      await fetch("https://api.example.com/first");
+
+      // Issued while the first session is alive, settling only after it expired.
+      let finish!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve; }));
+      const crossing = fetch("https://api.example.com/crossing");
+      roll.mockReturnValue(0.1);
+      vi.advanceTimersByTime(2000);
+      finish(new Response("{}", { status: 200 }));
+      await crossing;
+      await fetch("https://api.example.com/after");
+      await Pulse.flush();
+
+      const secondSession = Pulse.sessionId;
+      expect(secondSession).not.toBe(firstSession);
+      const network = sentEvents().filter((event) => event.message === "sdk:network_request");
+      // The crossing request follows the new session's roll, like the one after it.
+      expect(network.map((event) => [event.level, event.custom_attributes?._http_url, event.session_id]))
+        .toEqual([
+          ["debug", "https://api.example.com/crossing", secondSession],
+          ["debug", "https://api.example.com/after", secondSession],
+        ]);
+      expect(lifecycleIds("sdk:session_ended")).toEqual([firstSession]);
+      expect(lifecycleIds("sdk:session_started")).toEqual([firstSession, secondSession]);
+    });
+
+    it("counts a dropped debug request as session activity", async () => {
+      vi.useFakeTimers();
+      vi.spyOn(Math, "random").mockReturnValue(0.9);
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 }, sessionTimeoutMs: 1000 });
+      const firstSession = Pulse.sessionId;
+
+      vi.advanceTimersByTime(800);
+      await fetch("https://api.example.com/one");
+      vi.advanceTimersByTime(800);
+      await fetch("https://api.example.com/two");
+      // Both requests were dropped, but each still kept the session alive.
+      Pulse.info("still_here");
+      await Pulse.flush();
+
+      expect(Pulse.sessionId).toBe(firstSession);
+      expect(networkLevels()).toEqual([]);
+      expect(appEvents().map((event) => event.session_id)).toEqual([firstSession]);
+      expect(lifecycleIds("sdk:session_ended")).toEqual([]);
+      expect(lifecycleIds("sdk:session_started")).toEqual([firstSession]);
+    });
   });
 
   it.each(["disable", "disable-and-init", "shutdown-and-init", "configure"])(

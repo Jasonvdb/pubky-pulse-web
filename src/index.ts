@@ -374,11 +374,28 @@ function captureException(
   }
 }
 
-/** Sample the debug tier of `sdk:network_request` by session, not by request. */
+/**
+ * Sample the debug tier of `sdk:network_request` by session, not by request.
+ *
+ * A tracked request is app activity whether or not it is reported, so the
+ * session is touched before any decision: session lifetimes stay identical to
+ * the pre-sampling 100% behaviour, and a request that crosses the idle
+ * boundary rotates first, so it is judged by the session it will actually land
+ * in rather than by the expiring one. `log()` touches again immediately after,
+ * which is then a no-op as far as rotation is concerned.
+ */
 function keepSampledNetworkEvent(rate: number): boolean {
+  // Guarded exactly as `log()` guards its own touch; otherwise it refuses the event anyway.
+  if (!session || processingEvent || initializing || quietDisabled || logging || recordingEvent || diagnosing) return false;
+  let sessionId: string;
+  try {
+    // Rotation records `sdk:session_ended`/`sdk:session_started` through `recordEvent`.
+    sessionId = session.touch();
+  } catch {
+    return false;
+  }
   if (rate >= 1) return true;
-  const sessionId = session?.id;
-  if (rate <= 0 || !sessionId) return false;
+  if (rate <= 0) return false;
   if (networkSample?.sessionId !== sessionId) {
     networkSample = { sessionId, keep: Math.random() < rate };
   }
