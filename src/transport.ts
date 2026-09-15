@@ -68,7 +68,9 @@ export interface TransportStopOptions {
    * Drop the drained-but-unacknowledged replay instead of returning it to the
    * offline queue. The restore runs through an async cross-tab lock, so a
    * synchronous purge right after `stop()` would lose the race to it and the
-   * events it just deleted would reappear.
+   * events it just deleted would reappear. The discard persists for the life
+   * of the stopped transport, so a flush already mid-drain when `stop()` ran
+   * cannot re-park its events once its continuation resumes either.
    */
   discardReplay?: boolean;
 }
@@ -113,6 +115,12 @@ export class Transport {
   /** Persisted events removed for replay, retained until delivery is confirmed. */
   private readonly replayed = new Set<LogEvent>();
   /**
+   * True once a `stop({ discardReplay: true })` asked for the replay to be
+   * dropped. It stays true for the life of the transport so a drain that
+   * resolved just before the stop cannot park its events after the purge.
+   */
+  private discardReplay = false;
+  /**
    * The batch `sendBatch` is currently working through, including the seconds
    * it spends asleep in the retry ladder. It lives here so the unload flush can
    * take it with everything else instead of letting the page carry it away.
@@ -146,8 +154,13 @@ export class Transport {
     }, config.flushIntervalMs);
   }
 
-  /** Stop immediately without flushing, replaying, or deleting persisted data. */
+  /**
+   * Stop immediately without flushing, replaying, or deleting persisted data.
+   * `discardReplay` is recorded on the instance before anything else, so it
+   * also covers a replay a mid-drain flush only adds after this returns.
+   */
   stop(options?: TransportStopOptions): void {
+    if (options?.discardReplay === true) this.discardReplay = true;
     this.stopped = true;
     if (this.timer !== null) {
       try { clearInterval(this.timer); } catch { /* A retained interval becomes inert after stop. */ }
@@ -170,11 +183,21 @@ export class Transport {
     // Fresh in-memory telemetry is deliberately discarded. A reset is the one
     // caller that wants the replay gone too, and cannot wait for the restore's
     // lock to settle before it purges storage.
-    if (options?.discardReplay) this.replayed.clear();
-    else this.restoreReplay();
+    this.restoreReplay();
   }
 
+  /**
+   * Hand the retained replay back to the offline queue, or drop it once a
+   * `stop({ discardReplay: true })` has been seen. The discard is sticky for
+   * the life of the stopped transport, so every later call — including the one
+   * from a flush continuation that was mid-drain during the stop — discards
+   * too, and a reset's purge cannot be undone behind its back.
+   */
   private restoreReplay(): void {
+    if (this.discardReplay) {
+      this.replayed.clear();
+      return;
+    }
     if (this.replayed.size === 0) return;
     const events = [...this.replayed];
     this.replayed.clear();
