@@ -235,6 +235,71 @@ describe("Transport", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each([
+    { mode: "restores", options: undefined as { discardReplay?: boolean } | undefined, left: ["event-0"] },
+    { mode: "discards", options: { discardReplay: true }, left: [] as string[] },
+  ])("$mode drained replay events on stop, before the cross-tab lock settles", async ({ options, left }) => {
+    testNavigator.locks = new TestLockManager();
+    await queue.append([makeEvent(0)]);
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      const signal = init.signal as AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const tx = createTransport();
+    const flushing = tx.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    tx.stop(options);
+    // A reset purges storage right here, with no turn in which to await the
+    // restore's lock, so the queue must be empty in both modes at this point.
+    expect(queue.read()).toEqual([]);
+
+    await flushing;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(left);
+  });
+
+  it.each([
+    { mode: "restores", options: undefined as { discardReplay?: boolean } | undefined, left: ["event-0"], appends: 1 },
+    { mode: "discards", options: { discardReplay: true }, left: [] as string[], appends: 0 },
+  ])("$mode replay a stop raced past, between the drain and the flush continuation", async ({ options, left, appends }) => {
+    testNavigator.locks = new TestLockManager();
+    await queue.append([makeEvent(0)]);
+    const tx = createTransport();
+    // The real drain deletes the events from storage inside the lock; what a
+    // reset races is the continuation that resumes once it resolves.
+    const drained = await queue.drain();
+    expect(drained.map((event) => event.client_event_id)).toEqual(["event-0"]);
+    expect(queue.read()).toEqual([]);
+
+    let resolveDrain!: (events: LogEvent[]) => void;
+    const pending = new Promise<LogEvent[]>((resolve) => { resolveDrain = resolve; });
+    const drainSpy = vi.spyOn(queue, "drain").mockReturnValue(pending);
+    const appendSpy = vi.spyOn(queue, "append");
+    // Registered before the flush, so the stop runs ahead of the continuation.
+    const stopping = pending.then(() => { tx.stop(options); });
+
+    const flushing = tx.flush();
+    resolveDrain(drained);
+    await stopping;
+    await flushing;
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(drainSpy).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(left);
+    expect(appendSpy).toHaveBeenCalledTimes(appends);
+
+    // Nothing is left retained for a later stop to hand back either.
+    tx.stop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(appendSpy).toHaveBeenCalledTimes(appends);
+    expect(queue.read().map((event) => event.client_event_id)).toEqual(left);
+  });
+
   it("cancels a retry delay and does not park fresh telemetry on stop", async () => {
     fetchMock.mockResolvedValue(new Response("", { status: 503 }));
     const tx = createTransport();

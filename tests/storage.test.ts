@@ -98,6 +98,56 @@ describe("SafeStorage", () => {
     });
   });
 
+  it("clears every SDK key and leaves the host app's alone", () => {
+    const store = new SafeStorage("local");
+    store.set("anonymous_id", "abc");
+    store.set("offline_queue:spill:1", "[]");
+    testLocalStorage.setItem("app.theme", "dark");
+
+    store.clear();
+
+    expect(store.keys("")).toEqual([]);
+    expect(store.get("anonymous_id")).toBeNull();
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+  });
+
+  it("clears the memory fallback when storage is blocked", () => {
+    withoutLocalStorage(() => {
+      const store = new SafeStorage("local");
+      store.set("anonymous_id", "abc");
+
+      store.clear();
+
+      expect(store.keys("")).toEqual([]);
+      expect(store.get("anonymous_id")).toBeNull();
+    });
+  });
+
+  it("holds the epoch steady across reads, writes and removals", () => {
+    const store = new SafeStorage("local");
+    const start = store.epoch;
+
+    store.get("anonymous_id");
+    store.set("anonymous_id", "abc");
+    store.get("anonymous_id");
+    store.keys("");
+    store.remove("anonymous_id");
+
+    expect(store.epoch).toBe(start);
+  });
+
+  it("advances the epoch once per clear, even with nothing stored", () => {
+    const store = new SafeStorage("local");
+    const start = store.epoch;
+
+    store.clear();
+    expect(store.epoch).toBe(start + 1);
+
+    store.set("anonymous_id", "abc");
+    store.clear();
+    expect(store.epoch).toBe(start + 2);
+  });
+
   it("recognises the browser spellings of a quota failure", () => {
     expect(isQuotaExceededError(new DOMException("x", "QuotaExceededError"))).toBe(true);
     expect(isQuotaExceededError({ code: 22 })).toBe(true);

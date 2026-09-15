@@ -157,15 +157,60 @@ describe("validateConfiguration", () => {
       captureUnhandled: true,
       trackPageViews: true,
       networkTracking: false,
+      networkSampleRate: 0,
       propagateSessionTo: [],
       flushIntervalMs: 5000,
       flushThreshold: 20,
       maxBufferSize: 10000,
       sessionTimeoutMs: 1_800_000,
+      deviceInfoOs: true,
+      deviceInfoBrowser: true,
+      deviceInfoLanguage: true,
     });
     expect(config.supportedLanguages).toBeUndefined();
     expect(config.screenNameForPath).toBeUndefined();
     expect(config.beforeSend).toBeUndefined();
+  });
+
+  it("collects every device field by default and for deviceInfo: true", () => {
+    for (const deviceInfo of [undefined, true, {}]) {
+      expect(validateConfiguration({ ...base, deviceInfo })).toMatchObject({
+        deviceInfoOs: true, deviceInfoBrowser: true, deviceInfoLanguage: true,
+      });
+    }
+  });
+
+  it("turns every device field off for deviceInfo: false", () => {
+    expect(validateConfiguration({ ...base, deviceInfo: false })).toMatchObject({
+      deviceInfoOs: false, deviceInfoBrowser: false, deviceInfoLanguage: false,
+    });
+  });
+
+  it.each(["os", "browser", "language"] as const)("turns off only the %s field", (flag) => {
+    const config = validateConfiguration({ ...base, deviceInfo: { [flag]: false } });
+    expect(config.deviceInfoOs).toBe(flag !== "os");
+    expect(config.deviceInfoBrowser).toBe(flag !== "browser");
+    expect(config.deviceInfoLanguage).toBe(flag !== "language");
+  });
+
+  // An options object reads as "adjust these", so an unlisted flag stays on
+  // rather than inheriting the `false` a sibling asked for.
+  it("keeps unlisted flags on when one is enabled explicitly", () => {
+    expect(validateConfiguration({ ...base, deviceInfo: { os: true } })).toMatchObject({
+      deviceInfoOs: true, deviceInfoBrowser: true, deviceInfoLanguage: true,
+    });
+  });
+
+  it.each([null, [], "none", 0, 1])("rejects a non-boolean, non-object deviceInfo: %j", (value) => {
+    expect(() => validateConfiguration({ ...base, deviceInfo: value as never })).toThrow(
+      "Pubky Pulse: deviceInfo must be a boolean or options object",
+    );
+  });
+
+  it.each(["os", "browser", "language"] as const)("rejects a non-boolean %s flag", (flag) => {
+    expect(() =>
+      validateConfiguration({ ...base, deviceInfo: { [flag]: "yes" } as never }),
+    ).toThrow(`Pubky Pulse: deviceInfo.${flag} must be a boolean`);
   });
 
   it("preserves beforeSend without invoking it during validation", () => {
@@ -209,6 +254,23 @@ describe("isDev default", () => {
   });
 });
 
+
+describe("networkTracking sampling", () => {
+  it.each([0, 0.25, 1])("accepts a sample rate of %j", (sampleRate) => {
+    expect(validateConfiguration({ ...base, networkTracking: { sampleRate } }))
+      .toMatchObject({ networkTracking: true, networkSampleRate: sampleRate });
+  });
+
+  it.each([true, { urlMode: "origin" as const }])("samples nothing by default for %j", (networkTracking) => {
+    expect(validateConfiguration({ ...base, networkTracking }).networkSampleRate).toBe(0);
+  });
+
+  it.each([-0.1, 1.5, NaN, Infinity, "1", null])("rejects a sample rate of %j", (sampleRate) => {
+    expect(() =>
+      validateConfiguration({ ...base, networkTracking: { sampleRate: sampleRate as number } }),
+    ).toThrow("Pubky Pulse: networkTracking.sampleRate must be a number between 0 and 1");
+  });
+});
 
 describe("ignoreErrors configuration", () => {
   it.each([null, "AbortError", {}, [42], [null], Array(1)])("rejects invalid rules %j", (ignoreErrors) => {

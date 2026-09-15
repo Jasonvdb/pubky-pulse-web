@@ -27,11 +27,24 @@ export interface ValidatedConfig {
   ignoreErrors?: Array<string | RegExp>;
   networkTracking: boolean;
   networkUrlMode?: "path" | "origin";
+  /**
+   * Flattened `networkTracking.sampleRate`, for the same reason `deviceInfo`
+   * is flattened below: a plain number compares by `===`.
+   */
+  networkSampleRate: number;
   propagateSessionTo: string[];
   flushIntervalMs: number;
   flushThreshold: number;
   maxBufferSize: number;
   sessionTimeoutMs: number;
+  /**
+   * Flattened `deviceInfo`, not a nested object: `equivalentConfiguration`
+   * compares every ValidatedConfig field with `===`, so a fresh object literal
+   * on each `init` would never look unchanged.
+   */
+  deviceInfoOs: boolean;
+  deviceInfoBrowser: boolean;
+  deviceInfoLanguage: boolean;
   supportedLanguages?: string[];
 }
 
@@ -119,6 +132,28 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
   if (networkUrlMode !== "path" && networkUrlMode !== "origin") {
     throw new Error("Pubky Pulse: networkTracking.urlMode must be path or origin");
   }
+  // Default 0: successful requests are high-volume chatter, so opting into
+  // network tracking opts into failures only until a rate is asked for.
+  const sampleRate = typeof network === "object" ? network.sampleRate : undefined;
+  if (sampleRate !== undefined &&
+      (typeof sampleRate !== "number" || !Number.isFinite(sampleRate) || sampleRate < 0 || sampleRate > 1)) {
+    throw new Error("Pubky Pulse: networkTracking.sampleRate must be a number between 0 and 1");
+  }
+
+  const device = config.deviceInfo;
+  if (device !== undefined && typeof device !== "boolean" &&
+      (!device || typeof device !== "object" || Array.isArray(device))) {
+    throw new Error("Pubky Pulse: deviceInfo must be a boolean or options object");
+  }
+  const deviceOptions = typeof device === "object" ? device : {};
+  const deviceDefault = typeof device === "boolean" ? device : true;
+  const deviceFlag = (name: "os" | "browser" | "language"): boolean => {
+    const value = deviceOptions[name];
+    if (value !== undefined && typeof value !== "boolean") {
+      throw new Error(`Pubky Pulse: deviceInfo.${name} must be a boolean`);
+    }
+    return value ?? deviceDefault;
+  };
 
   const flushIntervalMs = positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000);
   if (flushIntervalMs > 2 ** 31 - 1) {
@@ -146,11 +181,15 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     ignoreErrors: snapshotIgnoreErrors(config.ignoreErrors),
     networkTracking: typeof network === "object" ? true : network ?? false,
     networkUrlMode,
+    networkSampleRate: sampleRate ?? 0,
     propagateSessionTo: stringArray(config.propagateSessionTo, "propagateSessionTo") ?? [],
     flushIntervalMs,
     flushThreshold,
     maxBufferSize,
     sessionTimeoutMs: positiveInteger(config.sessionTimeoutMs, "sessionTimeoutMs", 1_800_000),
+    deviceInfoOs: deviceFlag("os"),
+    deviceInfoBrowser: deviceFlag("browser"),
+    deviceInfoLanguage: deviceFlag("language"),
     supportedLanguages: stringArray(config.supportedLanguages, "supportedLanguages"),
   };
 }

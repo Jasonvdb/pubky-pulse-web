@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { collectDeviceInfo } from "../src/device-info";
+import { collectDeviceInfo, type DeviceInfoFlags } from "../src/device-info";
 import { resetTestEnvironment, testNavigator } from "./setup";
 
 const DEFAULT_USER_AGENT = testNavigator.userAgent;
+
+/** What `deviceInfo` defaults to: every browser-derived field collected. */
+const ALL: DeviceInfoFlags = { os: true, browser: true, language: true };
 
 /**
  * `collectDeviceInfo()` reads `globalThis.navigator`, so each row swaps the
@@ -75,7 +78,7 @@ describe("collectDeviceInfo", () => {
 
   it.each(USER_AGENTS)("parses the $label user agent", ({ ua, osVersion, deviceModel }) => {
     testNavigator.userAgent = ua;
-    const info = collectDeviceInfo();
+    const info = collectDeviceInfo(ALL);
 
     expect(info.osVersion).toBe(osVersion);
     expect(info.deviceModel).toBe(deviceModel);
@@ -84,18 +87,41 @@ describe("collectDeviceInfo", () => {
   });
 
   it("reports the browser locale", () => {
-    const info = collectDeviceInfo();
+    const info = collectDeviceInfo(ALL);
     expect(info.locale).toBe("en-GB");
     expect(info.preferredLanguage).toBe("en-GB");
   });
 
   it("omits the supported languages unless they are configured", () => {
-    const info = collectDeviceInfo();
+    const info = collectDeviceInfo(ALL);
     expect(info.supportedLanguages).toBeUndefined();
     expect("supportedLanguages" in info).toBe(false);
   });
 
   it("reports the configured supported languages", () => {
-    expect(collectDeviceInfo(["fr", "de"]).supportedLanguages).toEqual(["fr", "de"]);
+    expect(collectDeviceInfo(ALL, ["fr", "de"]).supportedLanguages).toEqual(["fr", "de"]);
+  });
+
+  it("collects nothing browser-derived when every flag is off", () => {
+    const info = collectDeviceInfo({ os: false, browser: false, language: false });
+    expect(info).toEqual({});
+  });
+
+  it.each([
+    { flag: "os", off: ["osVersion"], on: ["deviceModel", "locale", "preferredLanguage"] },
+    { flag: "browser", off: ["deviceModel"], on: ["osVersion", "locale", "preferredLanguage"] },
+    { flag: "language", off: ["locale", "preferredLanguage"], on: ["osVersion", "deviceModel"] },
+  ] as const)("omits only the $flag fields when $flag is off", ({ flag, off, on }) => {
+    const info = collectDeviceInfo({ ...ALL, [flag]: false });
+
+    for (const key of off) expect(key in info).toBe(false);
+    for (const key of on) expect(info[key]).toBeDefined();
+  });
+
+  // Disabling every browser-derived field must not take the app's own shipped
+  // locales with it: they come from configuration, not from the browser.
+  it("still reports supported languages with every flag off", () => {
+    const info = collectDeviceInfo({ os: false, browser: false, language: false }, ["fr"]);
+    expect(info).toEqual({ supportedLanguages: ["fr"] });
   });
 });

@@ -3,6 +3,7 @@ import { Pulse } from "../src/index";
 import type { IngestRequest, LogEvent, PulseEventHint } from "../src/types";
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
+import { SESSION_ACTIVITY_KEY, SESSION_ID_KEY } from "../src/session";
 import { STORAGE_PREFIX } from "../src/storage";
 import {
   resetTestEnvironment,
@@ -13,6 +14,7 @@ import {
   testLocation,
   testNavigator,
   testWindow,
+  TestLockManager,
 } from "./setup";
 
 const config = {
@@ -105,6 +107,52 @@ describe("Pulse", () => {
     Pulse.info("first-config");
     await Pulse.flush();
     expect(appEvents()[0]?.app_version).toBeUndefined();
+  });
+
+  it("stamps every device field by default", async () => {
+    Pulse.configure(config);
+    Pulse.info("default device info");
+    await Pulse.flush();
+
+    expect(appEvents()[0]).toMatchObject({
+      os_version: "macOS 10.15.7",
+      device_model: "Chrome 120",
+      locale: "en-GB",
+      preferred_language: "en-GB",
+    });
+  });
+
+  it("sends no device or locale fields when deviceInfo is false", async () => {
+    Pulse.configure({ ...config, deviceInfo: false, supportedLanguages: ["en"] });
+    Pulse.info("no device info");
+    await Pulse.flush();
+
+    const event = appEvents()[0]!;
+    for (const field of ["os_version", "device_model", "locale", "preferred_language"]) {
+      expect(event).not.toHaveProperty(field);
+    }
+    // The app's own shipped locales are configured, not browser-derived.
+    expect(event.supported_languages).toEqual(["en"]);
+  });
+
+  it("drops only the locale fields when deviceInfo.language is off", async () => {
+    Pulse.configure({ ...config, deviceInfo: { language: false } });
+    Pulse.info("no locale");
+    await Pulse.flush();
+
+    const event = appEvents()[0]!;
+    expect(event).not.toHaveProperty("locale");
+    expect(event).not.toHaveProperty("preferred_language");
+    expect(event.os_version).toBe("macOS 10.15.7");
+    expect(event.device_model).toBe("Chrome 120");
+  });
+
+  // `deviceInfo` is flattened onto the validated config, so a fresh object
+  // literal on the second init still compares as the same configuration.
+  it("treats a repeated deviceInfo object as unchanged configuration", () => {
+    const options = { ...config, deviceInfo: { language: false } };
+    expect(Pulse.init(options).reason).toBe("initialized");
+    expect(Pulse.init({ ...config, deviceInfo: { language: false } }).reason).toBe("unchanged");
   });
 
   it("leaves SSR inert and permits later browser initialization", () => {
@@ -391,7 +439,7 @@ describe("Pulse", () => {
       if (url.endsWith("/cancelled")) return Promise.reject(init?.signal?.reason);
       return Promise.resolve(new Response("{}", { status: 200 }));
     });
-    Pulse.configure({ ...config, networkTracking: true,
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 },
       beforeSend(event, hint) { seen.push([event, hint]); return event; } });
 
     await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
@@ -409,10 +457,194 @@ describe("Pulse", () => {
   });
 
   it("does not apply ignoreErrors to lower-level network events", async () => {
-    Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["sdk:network_request"] });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 }, ignoreErrors: ["sdk:network_request"] });
     await fetch("https://api.example.com/profile");
     await Pulse.flush();
     expect(sentEvents().filter((event) => event.message === "sdk:network_request")).toHaveLength(1);
+  });
+
+  describe("failed network requests", () => {
+    const failure = new TypeError("Failed to fetch");
+
+    /** Reject `/failed`, answer everything else — including ingest — with 200. */
+    function failOnce(reason: unknown = failure): void {
+      fetchMock.mockImplementation((url: string) =>
+        url.endsWith("/failed")
+          ? Promise.reject(reason)
+          : Promise.resolve(new Response("{}", { status: 200 })));
+    }
+
+    function networkEvents(): LogEvent[] {
+      return sentEvents().filter((event) => event.message === "sdk:network_request");
+    }
+
+    it("drops a rejection matched by an ignoreErrors rule", async () => {
+      failOnce();
+      Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["Failed to fetch"] });
+
+      await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
+      await Pulse.flush();
+
+      expect(networkEvents()).toEqual([]);
+    });
+
+    it("stamps the rejection type without putting its message on the wire", async () => {
+      failOnce();
+      Pulse.configure({ ...config, networkTracking: true });
+
+      await expect(fetch("https://api.example.com/failed")).rejects.toBe(failure);
+      await Pulse.flush();
+
+      const network = networkEvents();
+      expect(network).toHaveLength(1);
+      expect(network[0]?.level).toBe("error");
+      expect(network[0]?.custom_attributes?._error_type).toBe("TypeError");
+      expect(JSON.stringify(network)).not.toContain("Failed to fetch");
+      expect(network[0]?.custom_attributes?._error_stack).toBeUndefined();
+    });
+
+    it("still records the request when the rejection value is hostile", async () => {
+      const hostile = new Error("unreadable");
+      const explode = (): never => { throw new Error("hostile accessor"); };
+      Object.defineProperty(hostile, "name", { get: explode });
+      Object.defineProperty(hostile, "message", { get: explode });
+      failOnce(hostile);
+      Pulse.configure({ ...config, networkTracking: true, ignoreErrors: ["unreadable"] });
+
+      await expect(fetch("https://api.example.com/failed")).rejects.toBe(hostile);
+      await Pulse.flush();
+
+      const network = networkEvents();
+      expect(network).toHaveLength(1);
+      expect(network[0]?.level).toBe("error");
+      expect(network[0]?.custom_attributes?._error_type).toBeUndefined();
+    });
+  });
+
+  describe("network event sampling", () => {
+    function networkLevels(): string[] {
+      return sentEvents().filter((event) => event.message === "sdk:network_request")
+        .map((event) => event.level);
+    }
+
+    async function fetchEachOutcome(): Promise<void> {
+      fetchMock.mockImplementation((url: string) => {
+        if (url.endsWith("/missing")) return Promise.resolve(new Response("no", { status: 404 }));
+        if (url.endsWith("/failed")) return Promise.reject(new TypeError("Failed to fetch"));
+        return Promise.resolve(new Response("{}", { status: 200 }));
+      });
+      await fetch("https://api.example.com/ok");
+      await fetch("https://api.example.com/missing");
+      await expect(fetch("https://api.example.com/failed")).rejects.toThrow("Failed to fetch");
+    }
+
+    it("sends only failures by default", async () => {
+      Pulse.configure({ ...config, networkTracking: true });
+      await fetchEachOutcome();
+      await Pulse.flush();
+
+      expect(networkLevels()).toEqual(["warn", "error"]);
+    });
+
+    it("sends every tier at a sample rate of 1", async () => {
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
+      await fetchEachOutcome();
+      await Pulse.flush();
+
+      expect(networkLevels()).toEqual(["debug", "warn", "error"]);
+    });
+
+    it.each([[0.4, ["debug", "debug"]], [0.9, []]])(
+      "decides the debug tier once per session for a roll of %j", async (roll, kept) => {
+        vi.spyOn(Math, "random").mockReturnValue(roll);
+        Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 } });
+
+        await fetch("https://api.example.com/one");
+        await fetch("https://api.example.com/two");
+        await Pulse.flush();
+
+        expect(networkLevels()).toEqual(kept);
+      });
+
+    it("re-decides the debug tier when the session rotates", async () => {
+      vi.useFakeTimers();
+      const roll = vi.spyOn(Math, "random").mockReturnValue(0.9);
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 }, sessionTimeoutMs: 1000 });
+      const firstSession = Pulse.sessionId;
+
+      await fetch("https://api.example.com/one");
+      // Rotate the session, then let the next request take a fresh decision.
+      vi.advanceTimersByTime(2000);
+      roll.mockReturnValue(0.1);
+      Pulse.info("still_here");
+      await fetch("https://api.example.com/two");
+      await Pulse.flush();
+
+      expect(Pulse.sessionId).not.toBe(firstSession);
+      const network = sentEvents().filter((event) => event.message === "sdk:network_request");
+      expect(network.map((event) => [event.level, event.session_id]))
+        .toEqual([["debug", Pulse.sessionId]]);
+    });
+
+    /** Session ids carried by one lifecycle message, in the order they were sent. */
+    function lifecycleIds(message: string): Array<string | undefined> {
+      return sentEvents().filter((event) => event.message === message)
+        .map((event) => event.session_id);
+    }
+
+    it("decides for the session a request crossing the idle boundary lands in", async () => {
+      vi.useFakeTimers();
+      const roll = vi.spyOn(Math, "random").mockReturnValue(0.9);
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 }, sessionTimeoutMs: 1000 });
+      const firstSession = Pulse.sessionId;
+
+      // The first session rolls a drop; the crossing request must not inherit it.
+      await fetch("https://api.example.com/first");
+
+      // Issued while the first session is alive, settling only after it expired.
+      let finish!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { finish = resolve; }));
+      const crossing = fetch("https://api.example.com/crossing");
+      roll.mockReturnValue(0.1);
+      vi.advanceTimersByTime(2000);
+      finish(new Response("{}", { status: 200 }));
+      await crossing;
+      await fetch("https://api.example.com/after");
+      await Pulse.flush();
+
+      const secondSession = Pulse.sessionId;
+      expect(secondSession).not.toBe(firstSession);
+      const network = sentEvents().filter((event) => event.message === "sdk:network_request");
+      // The crossing request follows the new session's roll, like the one after it.
+      expect(network.map((event) => [event.level, event.custom_attributes?._http_url, event.session_id]))
+        .toEqual([
+          ["debug", "https://api.example.com/crossing", secondSession],
+          ["debug", "https://api.example.com/after", secondSession],
+        ]);
+      expect(lifecycleIds("sdk:session_ended")).toEqual([firstSession]);
+      expect(lifecycleIds("sdk:session_started")).toEqual([firstSession, secondSession]);
+    });
+
+    it("counts a dropped debug request as session activity", async () => {
+      vi.useFakeTimers();
+      vi.spyOn(Math, "random").mockReturnValue(0.9);
+      Pulse.configure({ ...config, networkTracking: { sampleRate: 0.5 }, sessionTimeoutMs: 1000 });
+      const firstSession = Pulse.sessionId;
+
+      vi.advanceTimersByTime(800);
+      await fetch("https://api.example.com/one");
+      vi.advanceTimersByTime(800);
+      await fetch("https://api.example.com/two");
+      // Both requests were dropped, but each still kept the session alive.
+      Pulse.info("still_here");
+      await Pulse.flush();
+
+      expect(Pulse.sessionId).toBe(firstSession);
+      expect(networkLevels()).toEqual([]);
+      expect(appEvents().map((event) => event.session_id)).toEqual([firstSession]);
+      expect(lifecycleIds("sdk:session_ended")).toEqual([]);
+      expect(lifecycleIds("sdk:session_started")).toEqual([firstSession]);
+    });
   });
 
   it.each(["disable", "disable-and-init", "shutdown-and-init", "configure"])(
@@ -692,7 +924,7 @@ describe("Pulse", () => {
     let observedUrl: string | undefined;
     Pulse.configure({
       ...config,
-      networkTracking: true,
+      networkTracking: { sampleRate: 1 },
       beforeSend(event) {
         if (event.custom_attributes?._http_url) {
           observedUrl = event.custom_attributes._http_url;
@@ -900,6 +1132,115 @@ describe("Pulse", () => {
         { anonymous_id: "pulse_anon_saved", user_id: "user-99" },
       ]);
     });
+  });
+
+  it("deletes every persisted browser value on reset and starts clean afterwards", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    await Pulse.setUser("user-7");
+    Pulse.info("before-reset");
+    testNavigator.onLine = false;
+    await Pulse.flush();
+    testWindow.dispatchEvent(new Event("pagehide"));
+    const queueKeys = (): string[] =>
+      testLocalStorage.keys().filter((key) => key.startsWith(`${STORAGE_PREFIX}offline_queue`));
+    expect(queueKeys().length).toBeGreaterThan(0);
+
+    Pulse.reset();
+
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBeNull();
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + USER_ID_KEY)).toBeNull();
+    expect(queueKeys()).toEqual([]);
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBeNull();
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ACTIVITY_KEY)).toBeNull();
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
+
+    testNavigator.onLine = true;
+    fetchMock.mockClear();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    Pulse.info("after-reset");
+    await Pulse.flush();
+    const messages = sentEvents().map((event) => event.message);
+    expect(messages).toContain("after-reset");
+    expect(messages).not.toContain("before-reset");
+  });
+
+  describe.each([
+    { mode: "a reset after a disabling init", reset: true, left: [] as string[] },
+    { mode: "a disabling init on its own", reset: false, left: ["pulse.offline_queue"] },
+  ])("the replay restore that outlives its client: $mode", ({ reset, left }) => {
+    /** A parked event, shaped as the offline queue stores them. */
+    const parked = {
+      client_event_id: "parked-0",
+      session_id: "11111111-1111-4111-8111-111111111111",
+      level: "info",
+      message: "parked",
+      environment: "web",
+      sdk_name: "pubky-pulse-web",
+      sdk_version: "0.1.0",
+      is_dev: true,
+      timestamp: "2026-09-04T00:00:00.000Z",
+    };
+
+    /** Let the lock callbacks and flush continuations all settle. */
+    async function settle(): Promise<void> {
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    }
+
+    it(`leaves ${reset ? "no" : "the"} stored queue behind`, async () => {
+      testNavigator.locks = new TestLockManager();
+      testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parked]));
+      // The request never settles, so the drained events stay held as replay.
+      fetchMock.mockImplementation(() => new Promise<Response>(() => undefined));
+
+      Pulse.init(config);
+      void Pulse.flush();
+      await settle();
+      // The drain emptied storage; the events now live only inside the transport.
+      expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBeNull();
+
+      // Stopping drops the only reference to the transport whose restore is
+      // still queued behind the storage lock; a reset cannot reach it.
+      Pulse.init({ ...config, enabled: false });
+      if (reset) Pulse.reset();
+      await settle();
+
+      expect(testLocalStorage.keys().filter((key) => key.includes("offline_queue"))).toEqual(left);
+      if (reset) {
+        expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBeNull();
+        expect(testLocalStorage.keys()).toEqual([]);
+      } else {
+        expect(JSON.parse(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)!))
+          .toEqual([parked]);
+      }
+    });
+  });
+
+  it("clears identity held only in the storage fallback, so the next init is a new browser", () => {
+    testLocalStorage.throwOnSet = "error";
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    expect(anonymousId).toMatch(/^pulse_anon_/);
+    expect(testLocalStorage.length).toBe(0);
+
+    Pulse.reset();
+    Pulse.init(config);
+
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+  });
+
+  it("resets before any initialization without throwing or touching host keys", () => {
+    testLocalStorage.setItem("app.theme", "dark");
+
+    expect(() => Pulse.reset()).not.toThrow();
+
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
   });
 
   it("reverts to the anonymous id on clearUser", async () => {
@@ -1208,7 +1549,7 @@ describe("Pulse", () => {
   });
 
   it("records app fetch calls but not its own ingest traffic", async () => {
-    Pulse.configure({ ...config, networkTracking: true });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
     await fetch("https://api.example.com/orders?token=secret");
     await Pulse.flush();
 
@@ -1239,9 +1580,9 @@ describe("Pulse", () => {
   });
 
   it("replaces the pipeline when configure runs again without shutdown", async () => {
-    Pulse.configure({ ...config, networkTracking: true });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
     const firstSession = Pulse.sessionId;
-    Pulse.configure({ ...config, networkTracking: true });
+    Pulse.configure({ ...config, networkTracking: { sampleRate: 1 } });
 
     expect(Pulse.sessionId).toBe(firstSession);
 
@@ -1511,9 +1852,21 @@ describe("Pulse feedback, questionnaires and attachments", () => {
     expect(body.session_id).toBe(Pulse.sessionId);
     expect(body.user_id).toBe(Pulse.currentUserId);
     expect(body.environment).toBe("web");
+    expect(body.device_model).toBe("Chrome 120");
+    expect(body.os_version).toBe("macOS 10.15.7");
 
     const audit = sentEvents().find((event) => event.message === "sdk:feedback_submitted");
     expect(audit?.custom_attributes).toEqual({ has_email: "true", has_name: "false" });
+  });
+
+  it("omits the device fields from feedback when deviceInfo is false", async () => {
+    Pulse.configure({ ...config, deviceInfo: false });
+    await Pulse.sendFeedback("no device info on this one");
+
+    const call = fetchMock.mock.calls.find((c) => (c[0] as string).endsWith("/v1/feedback"))!;
+    const body = JSON.parse((call[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("device_model");
+    expect(body).not.toHaveProperty("os_version");
   });
 
   it("submits feedback and questionnaires without a bundle id", async () => {

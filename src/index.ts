@@ -30,8 +30,8 @@ import {
   type QuestionnaireContext,
 } from "./questionnaires";
 import { SessionManager } from "./session";
-import { localStore } from "./storage";
-import { Transport } from "./transport";
+import { localStore, sessionStore } from "./storage";
+import { Transport, type TransportStopOptions } from "./transport";
 import { installUnhandledCapture, type UnhandledKind } from "./unhandled-capture";
 import {
   ENVIRONMENT,
@@ -118,6 +118,12 @@ let logging = false;
 let recordingEvent = false;
 let diagnosing = false;
 let quietDisabled = false;
+/**
+ * Whether this session's debug network events are kept, decided once so a
+ * sampled session carries a complete request timeline rather than a random
+ * scattering of one. Keyed by session id, and re-decided when it changes.
+ */
+let networkSample: { sessionId: string; keep: boolean } | null = null;
 const retiringTransports = new Set<Transport>();
 const retiringAttachments = new Set<AttachmentUploader>();
 /** Uninstallers for everything `configure()` hooked into the page. */
@@ -368,6 +374,34 @@ function captureException(
   }
 }
 
+/**
+ * Sample the debug tier of `sdk:network_request` by session, not by request.
+ *
+ * A tracked request is app activity whether or not it is reported, so the
+ * session is touched before any decision: session lifetimes stay identical to
+ * the pre-sampling 100% behaviour, and a request that crosses the idle
+ * boundary rotates first, so it is judged by the session it will actually land
+ * in rather than by the expiring one. `log()` touches again immediately after,
+ * which is then a no-op as far as rotation is concerned.
+ */
+function keepSampledNetworkEvent(rate: number): boolean {
+  // Guarded exactly as `log()` guards its own touch; otherwise it refuses the event anyway.
+  if (!session || processingEvent || initializing || quietDisabled || logging || recordingEvent || diagnosing) return false;
+  let sessionId: string;
+  try {
+    // Rotation records `sdk:session_ended`/`sdk:session_started` through `recordEvent`.
+    sessionId = session.touch();
+  } catch {
+    return false;
+  }
+  if (rate >= 1) return true;
+  if (rate <= 0) return false;
+  if (networkSample?.sessionId !== sessionId) {
+    networkSample = { sessionId, keep: Math.random() < rate };
+  }
+  return networkSample.keep;
+}
+
 function installObservers(validated: ValidatedConfig): void {
   uninstallers.push(
     installLifecycle({
@@ -400,8 +434,22 @@ function installObservers(validated: ValidatedConfig): void {
         urlMode: validated.networkUrlMode,
         sessionId: () => session?.id ?? undefined,
         onRequest(level, attributes, hint): void {
+          // Only the high-volume debug tier is sampled; failures always ship.
+          if (level === "debug" && !keepSampledNetworkEvent(validated.networkSampleRate)) return;
+          let merged = attributes;
+          if (level === "error" && hint && Object.hasOwn(hint, "originalException")) {
+            try {
+              const extracted = extractErrorAttributes(hint.originalException);
+              if (isIgnoredError(validated.ignoreErrors, extracted.message, extracted.attributes)) return;
+              // The type only: a rejection message, stack or cause can quote the URL.
+              const type = extracted.attributes._error_type;
+              if (type) merged = { ...attributes, _error_type: type };
+            } catch {
+              // A hostile rejection value may not suppress the request event.
+            }
+          }
           // The hint stays transient: the rejection never enters the event.
-          log(level, "sdk:network_request", attributes, undefined, hint ?? {});
+          log(level, "sdk:network_request", merged, undefined, hint ?? {});
         },
       }),
     );
@@ -424,9 +472,15 @@ function uninstallObservers(): void {
   pageTracker = null;
 }
 
-/** Drop this pipeline without flushing or clearing any persisted browser data. */
-function disableClient(): void {
+/**
+ * Drop this pipeline without flushing. Persisted browser data is left alone
+ * unless `discardReplay` says otherwise — see `Pulse.reset`, the only caller
+ * that follows this with a purge and so cannot let a transport hand replayed
+ * events back to the queue.
+ */
+function disableClient(options?: TransportStopOptions): void {
   capturedErrors = new WeakSet<Error>();
+  networkSample = null;
   quietDisabled = true;
   initializing = false;
   const previousTransport = transport;
@@ -438,14 +492,24 @@ function disableClient(): void {
   session = null;
   offlineQueue = null;
   deviceInfo = {};
-  const stop = (resource: { stop(): void } | null): void => {
-    try { resource?.stop(); } catch { /* A broken resource cannot block other cleanup. */ }
+  const stopTransport = (previous: Transport | null): void => {
+    try { previous?.stop(options); } catch { /* A broken resource cannot block other cleanup. */ }
   };
-  stop(previousTransport);
-  stop(previousAttachments);
-  for (const previous of retiringTransports) stop(previous);
-  for (const previous of retiringAttachments) stop(previous);
+  const stopAttachments = (previous: AttachmentUploader | null): void => {
+    try { previous?.stop(); } catch { /* A broken resource cannot block other cleanup. */ }
+  };
+  stopTransport(previousTransport);
+  stopAttachments(previousAttachments);
+  for (const previous of retiringTransports) stopTransport(previous);
+  for (const previous of retiringAttachments) stopAttachments(previous);
   uninstallObservers();
+}
+
+/** Delete every value the SDK keeps in this browser, in both storage areas. */
+function purgeStoredState(): void {
+  for (const store of [localStore, sessionStore]) {
+    try { store.clear(); } catch { /* A hostile storage adapter cannot block the rest of the deletion. */ }
+  }
 }
 
 async function drainClient(previousTransport: Transport | null, previousAttachments: AttachmentUploader | null): Promise<void> {
@@ -480,11 +544,15 @@ function equivalentConfiguration(left: ValidatedConfig, right: ValidatedConfig):
 
 function initializeClient(validated: ValidatedConfig): void {
   capturedErrors = new WeakSet<Error>();
+  networkSample = null;
   initializing = true;
   quietDisabled = false;
   config = validated;
   try {
-    deviceInfo = collectDeviceInfo(validated.supportedLanguages);
+    deviceInfo = collectDeviceInfo(
+      { os: validated.deviceInfoOs, browser: validated.deviceInfoBrowser, language: validated.deviceInfoLanguage },
+      validated.supportedLanguages,
+    );
     offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message));
     transport = new Transport(validated, offlineQueue, debugLog);
     attachments = new AttachmentUploader(validated, debugLog);
@@ -601,6 +669,16 @@ export interface PulseApi {
   dismissQuestionnaires(): Promise<Date>;
   flush(): Promise<void>;
   shutdown(): Promise<void>;
+  /**
+   * The client-side deletion control for consent withdrawal. Disables any
+   * running client, then deletes everything the SDK kept in this browser: the
+   * anonymous id, the user id, the session, and queued events.
+   * `init({ enabled: false })` keeps that storage so a later enabled
+   * initialization can replay it; `reset()` deletes it. A later `init` starts
+   * as a new browser with a fresh anonymous id. Nothing already sent to the
+   * server is recalled, and `clearUser` is not a deletion control.
+   */
+  reset(): void;
   /** Session id for the current page, or undefined before `configure`. */
   readonly sessionId: string | undefined;
   /**
@@ -778,6 +856,12 @@ export const Pulse: PulseApi = {
     deviceInfo = {};
     quietDisabled = false;
     await drainClient(previousTransport, previousAttachments);
+  },
+
+  reset(): void {
+    // Deletion has to happen even if tearing the pipeline down goes wrong.
+    try { disableClient({ discardReplay: true }); } catch { /* Consent withdrawal never throws into the host app. */ }
+    purgeStoredState();
   },
 
   async sendFeedback(

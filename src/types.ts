@@ -90,8 +90,16 @@ export interface PulseConfiguration {
    * before beforeSend. Strings match substrings; RegExp state is isolated.
    */
   ignoreErrors?: Array<string | RegExp>;
-  /** Emit `sdk:network_request` events for `fetch` calls. Default: false. */
-  networkTracking?: boolean | { urlMode?: "path" | "origin" };
+  /**
+   * Emit `sdk:network_request` events for `fetch` calls. Default: false.
+   *
+   * `sampleRate` is the fraction of sessions whose debug-level request events
+   * (2xx/3xx responses and cancellations) are kept, between 0 and 1. Default:
+   * 0, so `true` reports only failures. The decision is made once per session,
+   * so a sampled session carries a complete request timeline; `warn` and
+   * `error` events are always sent.
+   */
+  networkTracking?: boolean | { urlMode?: "path" | "origin"; sampleRate?: number };
   /**
    * URL prefixes that receive the `X-Pulse-Session-Id` header. Matching works
    * even when `networkTracking` is false.
@@ -105,6 +113,13 @@ export interface PulseConfiguration {
   maxBufferSize?: number;
   /** Idle time after which a new session starts. Default: 30 minutes. */
   sessionTimeoutMs?: number;
+  /**
+   * Device and locale fields stamped on every event and on feedback. Default:
+   * all on. `false` sends none of the four: `os` gates `os_version`, `browser`
+   * gates `device_model`, and `language` gates both `locale` and
+   * `preferred_language`. `supportedLanguages` is unaffected.
+   */
+  deviceInfo?: boolean | { os?: boolean; browser?: boolean; language?: boolean };
   /**
    * The locales your app ships. Written through to the app record on the
    * server and used for localization-gap analysis. Default: not sent — set it

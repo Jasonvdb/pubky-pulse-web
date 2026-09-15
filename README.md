@@ -64,7 +64,8 @@ and keep the running client. To change options, use `await Pulse.shutdown()` (wh
 
 `Pulse.init({ enabled: false })` stops an active client and discards its pending in-memory telemetry
 without flushing or parking it. It leaves pre-existing browser storage intact; a later enabled
-initialization can replay that old queue. Already transmitted requests cannot be recalled.
+initialization can replay that old queue. Use `Pulse.reset()` instead when that storage has to go
+away — on a withdrawal of consent, say. Already transmitted requests cannot be recalled.
 Initialization failures roll back installed collectors and return `error`. Invalid configuration
 returns `invalid-configuration`; a supplied invalid endpoint never falls back to the hosted service.
 An invalid reinitialization preserves an already-running valid client. Diagnostics contain no keys,
@@ -473,6 +474,19 @@ Pulse.clearUser({ newAnonymousId: true }); // sign-out on a shared device
 
 Call `setUser` on every page load where you know who the user is; the claim is idempotent.
 
+`clearUser` is a sign-out, not a deletion control: it forgets who the person is and keeps
+collecting. `Pulse.reset()` is the deletion control. It disables the running client and then deletes
+everything the SDK kept in this browser — the anonymous id, the user id, the session, and any queued
+events — so nothing is left to replay:
+
+```ts
+Pulse.reset(); // the person withdrew consent
+```
+
+The next `Pulse.init` starts as a new browser with a fresh anonymous id. Nothing already sent to the
+server is recalled by it; delete that server-side. Calling it before any initialization is a safe
+no-op, and it never throws into your app.
+
 The promise waits for the flush and the claim request attempts. Those retry with exponential
 backoff, so against an endpoint that is failing or hanging the await can take a couple of minutes.
 When the browser is offline nothing is attempted: `setUser` returns straight away and the claim is
@@ -645,17 +659,31 @@ Pulse.init({
 });
 ```
 
-`networkTracking` defaults to `false`. `true` or `{ urlMode: "path" }` retains the existing
-behavior: credentials, query and fragment are stripped but paths remain. `{ urlMode: "origin" }`
+`networkTracking` defaults to `false`. `true` and `{ urlMode: "path" }` sanitize the URL the same
+way: credentials, query and fragment are stripped but paths remain. `{ urlMode: "origin" }`
 keeps only protocol, hostname and port for HTTP(S), resolving relative URLs against the page.
 Malformed or non-HTTP(S) URLs omit `_http_url`; the raw value is never used as an origin fallback.
 The mode applies before `beforeSend`, buffering, console or offline persistence, including failures.
+Turning tracking on does not report every request: the successful ones are sampled by `sampleRate`,
+which defaults to `0`, so `true` on its own reports failures only.
 
-The `sdk:network_request` event reports available method, status and duration: debug for 2xx/3xx, warn for
-other responses, error with status `0` when the request fails — a network failure, a timeout, or an
-abort with a custom reason — and debug with status `0` when the request is intentionally cancelled
-and rejects with a default `AbortError`. The failure event's `beforeSend` hint carries the original
-rejection as `originalException`, so apps can classify further. SDK endpoint requests remain excluded.
+The `sdk:network_request` event reports available method, status and duration at one of three levels:
+
+- **debug** — a 2xx/3xx response, or status `0` for a request the app intentionally cancelled, which
+  rejects with a default `AbortError`. This tier is sampled: `sampleRate` is the fraction of sessions
+  that report it, decided once per session so a sampled session keeps a complete request timeline.
+- **warn** — a 4xx/5xx response, or status `0` for a rejection while `navigator.onLine` is `false`.
+  A failure with no connection describes the user's network rather than your app, so it is reported
+  as a fact about the network instead of opening an issue.
+- **error** — status `0` for a rejection while the browser reports itself online: a network failure,
+  a timeout, or an abort with a custom reason.
+
+`warn` and `error` events are never sampled. Error-level events are filtered by `ignoreErrors`,
+matched against the rejection's own message and `Type: message`, and carry `_error_type` — the
+rejection's `name` or constructor, `TypeError` say. Nothing else from the rejection reaches the
+event: its message, stack and causes can quote the request URL. The failure event's `beforeSend`
+hint carries the original rejection as `originalException`, so apps can classify further. SDK
+endpoint requests remain excluded.
 The application's request URL, body and headers are unchanged except for explicitly requested
 session propagation; response and rejection values retain their identity and normal fetch behavior.
 Origin hostnames may themselves contain identifiers. This is not a general PII guarantee: app
@@ -688,7 +716,11 @@ rarely need to intervene, but both are available:
 ```ts
 await Pulse.flush(); // attempt queued events and wait within the attachment deadline
 await Pulse.shutdown(); // flush, then remove every page hook the SDK installed
+Pulse.reset(); // stop without flushing and delete this browser's stored SDK data
 ```
+
+`shutdown` drains what is pending and leaves the offline queue for the next page load; `reset` is
+the consent-withdrawal path and deletes it. See [Identity](#identity).
 
 When the page is hidden or unloaded the SDK flushes on its own with a `keepalive` request and parks
 whatever does not fit — including the batch that was still waiting out a retry — in an offline queue
@@ -738,13 +770,20 @@ can also discard telemetry. Increasing `maxBufferSize` does not increase these b
 | `screenNameForPath` | `(pathname: string) => string` | Raw pathname | Map automatic screen names; a thrown error or blank/non-string result ends the previous screen and clears default attribution. |
 | `ignoreErrors` | `(string \| RegExp)[]` | `[]` | Filter exception/error logger messages before hooks and output. |
 | `beforeSend` | `(event: LogEvent, hint: PulseEventHint) => LogEvent \| null` | Not set | Transform or drop enriched events before output, buffering, and attachment scheduling. Synchronous only; failures drop silently. |
-| `networkTracking` | `boolean \| { urlMode?: "path" \| "origin" }` | `false` | Emit an event per `fetch`; true and an empty object preserve sanitized paths. |
+| `networkTracking` | `boolean \| { urlMode?: "path" \| "origin"; sampleRate?: number }` | `false` | Emit events for `fetch` calls; true and an empty object preserve sanitized paths. `sampleRate` (0–1, default `0`) is the fraction of sessions reporting successful requests, so `true` alone reports only failures. |
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |
 | `flushThreshold` | `number` | `20` | Buffered events that trigger an immediate flush. |
 | `maxBufferSize` | `number` | `10000` | Buffered event count ceiling; the separate 4 MiB byte cap can drop oldest events sooner. |
 | `sessionTimeoutMs` | `number` | `1800000` | Idle time after which a new session starts. |
+| `deviceInfo` | `boolean \| { os?: boolean; browser?: boolean; language?: boolean }` | `true` | Device and locale fields derived from the browser; `false` sends none of them. |
 | `supportedLanguages` | `string[]` | not sent | The locales your app ships. Written through to the app record on the server and used for localization-gap analysis. Set it explicitly; the SDK never derives it from the browser. |
+
+`deviceInfo` gates what the SDK reads from the browser and stamps on every event and on feedback:
+`os` drops `os_version`, `browser` drops `device_model`, and `language` drops both `locale` and
+`preferred_language`. Turning `language` off also removes the app from the server's locale-demand
+analysis, which is built from those two fields — `supportedLanguages` is configured rather than
+derived, so it is still sent.
 
 Invalid values throw at `configure()` time with a `Pubky Pulse: …` message, so a typo surfaces on
 the first page load. `init()` catches these failures and returns a diagnostic status instead.

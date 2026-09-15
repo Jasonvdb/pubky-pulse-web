@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { validateConfiguration } from "../src/configuration";
-import { collectDeviceInfo } from "../src/device-info";
+import { collectDeviceInfo, type DeviceInfoFlags } from "../src/device-info";
 import {
   buildEvent,
   MAX_ATTRIBUTE_VALUE_LENGTH,
@@ -14,6 +14,8 @@ import { resetTestEnvironment } from "./setup";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const ALL_DEVICE_INFO: DeviceInfoFlags = { os: true, browser: true, language: true };
+
 function context(overrides: Partial<EventContext> = {}): EventContext {
   return {
     config: validateConfiguration({
@@ -23,7 +25,7 @@ function context(overrides: Partial<EventContext> = {}): EventContext {
       appVersion: "1.4.0",
       isDev: false,
     }),
-    deviceInfo: collectDeviceInfo(),
+    deviceInfo: collectDeviceInfo(ALL_DEVICE_INFO),
     sessionId: "11111111-1111-4111-8111-111111111111",
     userId: "pulse_anon_22222222-2222-4222-8222-222222222222",
     ...overrides,
@@ -133,7 +135,7 @@ describe("buildEvent", () => {
   });
 
   it("stamps the supported languages only when the app configures them", () => {
-    const ctx = context({ deviceInfo: collectDeviceInfo(["fr", "de"]) });
+    const ctx = context({ deviceInfo: collectDeviceInfo(ALL_DEVICE_INFO, ["fr", "de"]) });
     expect(buildEvent(ctx, "info", "hello").supported_languages).toEqual(["fr", "de"]);
   });
 
