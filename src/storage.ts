@@ -48,6 +48,7 @@ export class SafeStorage {
   private readonly kind: StorageKind;
   private readonly memory = new Map<string, string>();
   private usingFallback = false;
+  private generation = 0;
 
   constructor(kind: StorageKind) {
     this.kind = kind;
@@ -56,6 +57,16 @@ export class SafeStorage {
   /** True once any access failed and the in-memory map took over. */
   get isFallback(): boolean {
     return this.usingFallback;
+  }
+
+  /**
+   * Bumped by every `clear()`. A holder of long-lived derived state captures
+   * this when it is created and compares it before writing back, so data a
+   * deletion already removed cannot be restored behind that deletion's back;
+   * see `OfflineQueue`.
+   */
+  get epoch(): number {
+    return this.generation;
   }
 
   /**
@@ -136,9 +147,12 @@ export class SafeStorage {
   /**
    * Delete every SDK key, from the backend and the in-memory fallback alike.
    * Host app keys are untouched: only the prefixed namespace is enumerated.
+   * The epoch advances whether or not anything was stored, so a holder created
+   * before the clear is invalidated even when the deletion found nothing.
    */
   clear(): void {
     for (const key of this.keys("")) this.remove(key);
+    this.generation += 1;
   }
 
   remove(key: string): void {

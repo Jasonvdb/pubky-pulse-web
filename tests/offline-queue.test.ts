@@ -291,6 +291,72 @@ describe("OfflineQueue", () => {
     });
   });
 
+  describe("after storage was cleared", () => {
+    let storage: SafeStorage;
+    /** Created before the clear, as a stopped client's queue would have been. */
+    let stale: OfflineQueue;
+
+    beforeEach(() => {
+      storage = new SafeStorage("local");
+      stale = new OfflineQueue(storage);
+      storage.clear();
+    });
+
+    it("appends nothing from a queue created before the clear", async () => {
+      await stale.append(makeEvents(2));
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("spills nothing from a queue created before the clear", () => {
+      stale.spill(makeEvents(2));
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("drains nothing, leaving what another party wrote after the clear", async () => {
+      // A second tab, or the next init, parked events under the same key.
+      testLocalStorage.setItem(QUEUE_KEY, JSON.stringify(makeEvents(2)));
+
+      expect(await stale.drain()).toEqual([]);
+      expect(testLocalStorage.getItem(QUEUE_KEY)).not.toBeNull();
+    });
+
+    it("works normally for a queue created after the clear", async () => {
+      const fresh = new OfflineQueue(storage);
+
+      await fresh.append([makeEvent(0)]);
+      fresh.spill([makeEvent(1)]);
+
+      expect((await fresh.drain()).map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+      ]);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("writes nothing when the clear lands while the append waits for its lock", async () => {
+      const locks = new TestLockManager();
+      testNavigator.locks = locks;
+      const storageUnderRace = new SafeStorage("local");
+      const racing = new OfflineQueue(storageUnderRace);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      void locks.request(LOCK_NAME, () => held);
+
+      const appended = racing.append([makeEvent(0)]);
+      await Promise.resolve();
+      expect(testLocalStorage.getItem(QUEUE_KEY)).toBeNull();
+
+      // The reset purges storage before the queued callback ever runs.
+      storageUnderRace.clear();
+      release();
+      await appended;
+
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+  });
+
   describe("with the Web Locks API", () => {
     let locks: TestLockManager;
 

@@ -14,6 +14,7 @@ import {
   testLocation,
   testNavigator,
   testWindow,
+  TestLockManager,
 } from "./setup";
 
 const config = {
@@ -1105,6 +1106,57 @@ describe("Pulse", () => {
     const messages = sentEvents().map((event) => event.message);
     expect(messages).toContain("after-reset");
     expect(messages).not.toContain("before-reset");
+  });
+
+  describe.each([
+    { mode: "a reset after a disabling init", reset: true, left: [] as string[] },
+    { mode: "a disabling init on its own", reset: false, left: ["pulse.offline_queue"] },
+  ])("the replay restore that outlives its client: $mode", ({ reset, left }) => {
+    /** A parked event, shaped as the offline queue stores them. */
+    const parked = {
+      client_event_id: "parked-0",
+      session_id: "11111111-1111-4111-8111-111111111111",
+      level: "info",
+      message: "parked",
+      environment: "web",
+      sdk_name: "pubky-pulse-web",
+      sdk_version: "0.1.0",
+      is_dev: true,
+      timestamp: "2026-09-04T00:00:00.000Z",
+    };
+
+    /** Let the lock callbacks and flush continuations all settle. */
+    async function settle(): Promise<void> {
+      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    }
+
+    it(`leaves ${reset ? "no" : "the"} stored queue behind`, async () => {
+      testNavigator.locks = new TestLockManager();
+      testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parked]));
+      // The request never settles, so the drained events stay held as replay.
+      fetchMock.mockImplementation(() => new Promise<Response>(() => undefined));
+
+      Pulse.init(config);
+      void Pulse.flush();
+      await settle();
+      // The drain emptied storage; the events now live only inside the transport.
+      expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBeNull();
+
+      // Stopping drops the only reference to the transport whose restore is
+      // still queued behind the storage lock; a reset cannot reach it.
+      Pulse.init({ ...config, enabled: false });
+      if (reset) Pulse.reset();
+      await settle();
+
+      expect(testLocalStorage.keys().filter((key) => key.includes("offline_queue"))).toEqual(left);
+      if (reset) {
+        expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBeNull();
+        expect(testLocalStorage.keys()).toEqual([]);
+      } else {
+        expect(JSON.parse(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)!))
+          .toEqual([parked]);
+      }
+    });
   });
 
   it("clears identity held only in the storage fallback, so the next init is a new browser", () => {

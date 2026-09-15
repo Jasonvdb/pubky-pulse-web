@@ -61,14 +61,31 @@ function lockManager(): LockManagerLike | null {
  * of one key from two tabs loses whatever the loser wrote in between. So
  * `append` and `drain` run inside a Web Lock, and the synchronous unload path,
  * which cannot await one, never touches the shared key at all: it uses `spill`.
+ *
+ * A queue can outlive the client that made it: an unawaited restore append from
+ * a stopped transport, a mid-drain flush continuation, and an unload `spill`
+ * can all still be holding events after their client was dropped. So every
+ * write compares the storage epoch captured here against the live one, and a
+ * `SafeStorage.clear()` — which only `Pulse.reset()` performs — makes every
+ * queue created before it write-dead: none of them can put back the data the
+ * user asked to delete. A queue created after the clear, by the next `init`,
+ * is current and works normally. Reads are left alone.
  */
 export class OfflineQueue {
   private readonly storage: SafeStorage;
   private readonly onDebug: ((message: string) => void) | undefined;
+  /** The storage epoch this queue was created in; see the class comment. */
+  private readonly epoch: number;
 
   constructor(storage: SafeStorage, onDebug?: (message: string) => void) {
     this.storage = storage;
     this.onDebug = onDebug;
+    this.epoch = storage.epoch;
+  }
+
+  /** False once storage was cleared after this queue was created. */
+  private isCurrent(): boolean {
+    return this.storage.epoch === this.epoch;
   }
 
   /**
@@ -88,7 +105,9 @@ export class OfflineQueue {
     events = capped(events);
     if (events.length === 0) return;
     await this.withLock(() => {
-      if (!isActive()) return;
+      // The lock callback runs turns later: the client may have been stopped,
+      // or a reset may have purged storage, since the append was dispatched.
+      if (!isActive() || !this.isCurrent()) return;
       const incoming = events;
       const current = this.readKey(QUEUE_KEY);
       const spills = this.spillKeys().map((key) => this.storedUsage(key));
@@ -110,7 +129,7 @@ export class OfflineQueue {
   /** Read every parked event and clear the queue in one step. */
   async drain(isActive: () => boolean = () => true): Promise<LogEvent[]> {
     return this.withLock(() => {
-      if (!isActive()) return [];
+      if (!isActive() || !this.isCurrent()) return [];
       let events = this.readKey(QUEUE_KEY);
       if (events.length > 0) this.storage.remove(QUEUE_KEY);
       for (const key of this.spillKeys()) {
@@ -128,6 +147,7 @@ export class OfflineQueue {
    * `drain` folds the spill back in and removes it.
    */
   spill(events: LogEvent[]): void {
+    if (!this.isCurrent()) return;
     const incoming = capped(events);
     if (incoming.length === 0) return;
     const budget = this.shedForSpill(incoming);
