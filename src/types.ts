@@ -106,6 +106,13 @@ export interface PulseConfiguration {
   /** Idle time after which a new session starts. Default: 30 minutes. */
   sessionTimeoutMs?: number;
   /**
+   * Device and locale fields stamped on every event and on feedback. Default:
+   * all on. `false` sends none of the four: `os` gates `os_version`, `browser`
+   * gates `device_model`, and `language` gates both `locale` and
+   * `preferred_language`. `supportedLanguages` is unaffected.
+   */
+  deviceInfo?: boolean | { os?: boolean; browser?: boolean; language?: boolean };
+  /**
    * The locales your app ships. Written through to the app record on the
    * server and used for localization-gap analysis. Default: not sent — set it
    * explicitly if you want it reported.

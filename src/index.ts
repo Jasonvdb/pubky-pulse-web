@@ -499,7 +499,10 @@ function initializeClient(validated: ValidatedConfig): void {
   quietDisabled = false;
   config = validated;
   try {
-    deviceInfo = collectDeviceInfo(validated.supportedLanguages);
+    deviceInfo = collectDeviceInfo(
+      { os: validated.deviceInfoOs, browser: validated.deviceInfoBrowser, language: validated.deviceInfoLanguage },
+      validated.supportedLanguages,
+    );
     offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message));
     transport = new Transport(validated, offlineQueue, debugLog);
     attachments = new AttachmentUploader(validated, debugLog);

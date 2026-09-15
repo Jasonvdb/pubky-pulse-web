@@ -108,6 +108,52 @@ describe("Pulse", () => {
     expect(appEvents()[0]?.app_version).toBeUndefined();
   });
 
+  it("stamps every device field by default", async () => {
+    Pulse.configure(config);
+    Pulse.info("default device info");
+    await Pulse.flush();
+
+    expect(appEvents()[0]).toMatchObject({
+      os_version: "macOS 10.15.7",
+      device_model: "Chrome 120",
+      locale: "en-GB",
+      preferred_language: "en-GB",
+    });
+  });
+
+  it("sends no device or locale fields when deviceInfo is false", async () => {
+    Pulse.configure({ ...config, deviceInfo: false, supportedLanguages: ["en"] });
+    Pulse.info("no device info");
+    await Pulse.flush();
+
+    const event = appEvents()[0]!;
+    for (const field of ["os_version", "device_model", "locale", "preferred_language"]) {
+      expect(event).not.toHaveProperty(field);
+    }
+    // The app's own shipped locales are configured, not browser-derived.
+    expect(event.supported_languages).toEqual(["en"]);
+  });
+
+  it("drops only the locale fields when deviceInfo.language is off", async () => {
+    Pulse.configure({ ...config, deviceInfo: { language: false } });
+    Pulse.info("no locale");
+    await Pulse.flush();
+
+    const event = appEvents()[0]!;
+    expect(event).not.toHaveProperty("locale");
+    expect(event).not.toHaveProperty("preferred_language");
+    expect(event.os_version).toBe("macOS 10.15.7");
+    expect(event.device_model).toBe("Chrome 120");
+  });
+
+  // `deviceInfo` is flattened onto the validated config, so a fresh object
+  // literal on the second init still compares as the same configuration.
+  it("treats a repeated deviceInfo object as unchanged configuration", () => {
+    const options = { ...config, deviceInfo: { language: false } };
+    expect(Pulse.init(options).reason).toBe("initialized");
+    expect(Pulse.init({ ...config, deviceInfo: { language: false } }).reason).toBe("unchanged");
+  });
+
   it("leaves SSR inert and permits later browser initialization", () => {
     vi.stubGlobal("window", undefined);
     expect(Pulse.init(config)).toEqual({ status: "disabled", reason: "ssr" });
@@ -1570,9 +1616,21 @@ describe("Pulse feedback, questionnaires and attachments", () => {
     expect(body.session_id).toBe(Pulse.sessionId);
     expect(body.user_id).toBe(Pulse.currentUserId);
     expect(body.environment).toBe("web");
+    expect(body.device_model).toBe("Chrome 120");
+    expect(body.os_version).toBe("macOS 10.15.7");
 
     const audit = sentEvents().find((event) => event.message === "sdk:feedback_submitted");
     expect(audit?.custom_attributes).toEqual({ has_email: "true", has_name: "false" });
+  });
+
+  it("omits the device fields from feedback when deviceInfo is false", async () => {
+    Pulse.configure({ ...config, deviceInfo: false });
+    await Pulse.sendFeedback("no device info on this one");
+
+    const call = fetchMock.mock.calls.find((c) => (c[0] as string).endsWith("/v1/feedback"))!;
+    const body = JSON.parse((call[1] as RequestInit).body as string) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("device_model");
+    expect(body).not.toHaveProperty("os_version");
   });
 
   it("submits feedback and questionnaires without a bundle id", async () => {

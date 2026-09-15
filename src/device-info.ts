@@ -15,6 +15,16 @@ export interface DeviceInfo {
   supportedLanguages?: string[];
 }
 
+/** Resolved `deviceInfo` configuration: which browser-derived fields to collect. */
+export interface DeviceInfoFlags {
+  /** Collect `osVersion`. */
+  os: boolean;
+  /** Collect `deviceModel`. */
+  browser: boolean;
+  /** Collect `locale` and `preferredLanguage`. */
+  language: boolean;
+}
+
 interface NavigatorLike {
   userAgent?: string;
   language?: string;
@@ -64,25 +74,32 @@ function parseBrowser(ua: string): string | undefined {
 }
 
 /**
- * `supportedLanguages` describes the locales the app itself ships and is only
- * reported when the host app configures it. There is deliberately no
- * `navigator.languages` fallback: the server writes this list through to the
- * app record, so a browser-derived default would let each visitor's language
- * preferences overwrite the app's shipped-locale list.
+ * `flags` gates the browser-derived fields; a disabled one is never read, so
+ * the event simply omits it.
+ *
+ * `supportedLanguages` is not gated: it describes the locales the app itself
+ * ships and is only reported when the host app configures it. There is
+ * deliberately no `navigator.languages` fallback: the server writes this list
+ * through to the app record, so a browser-derived default would let each
+ * visitor's language preferences overwrite the app's shipped-locale list.
  */
-export function collectDeviceInfo(supportedLanguages?: string[]): DeviceInfo {
+export function collectDeviceInfo(flags: DeviceInfoFlags, supportedLanguages?: string[]): DeviceInfo {
   const nav = getNavigator();
-  const ua = typeof nav?.userAgent === "string" ? nav.userAgent : "";
-  const language = typeof nav?.language === "string" && nav.language ? nav.language : undefined;
-
   const info: DeviceInfo = {};
-  const osVersion = ua ? parseOsVersion(ua) : undefined;
-  if (osVersion) info.osVersion = osVersion;
-  const deviceModel = ua ? parseBrowser(ua) : undefined;
-  if (deviceModel) info.deviceModel = deviceModel;
-  if (language) {
-    info.locale = language;
-    info.preferredLanguage = language;
+
+  if (flags.os || flags.browser) {
+    const ua = typeof nav?.userAgent === "string" ? nav.userAgent : "";
+    const osVersion = flags.os && ua ? parseOsVersion(ua) : undefined;
+    if (osVersion) info.osVersion = osVersion;
+    const deviceModel = flags.browser && ua ? parseBrowser(ua) : undefined;
+    if (deviceModel) info.deviceModel = deviceModel;
+  }
+  if (flags.language) {
+    const language = typeof nav?.language === "string" && nav.language ? nav.language : undefined;
+    if (language) {
+      info.locale = language;
+      info.preferredLanguage = language;
+    }
   }
   if (supportedLanguages && supportedLanguages.length > 0) {
     info.supportedLanguages = [...supportedLanguages];

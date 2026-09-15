@@ -762,7 +762,14 @@ can also discard telemetry. Increasing `maxBufferSize` does not increase these b
 | `flushThreshold` | `number` | `20` | Buffered events that trigger an immediate flush. |
 | `maxBufferSize` | `number` | `10000` | Buffered event count ceiling; the separate 4 MiB byte cap can drop oldest events sooner. |
 | `sessionTimeoutMs` | `number` | `1800000` | Idle time after which a new session starts. |
+| `deviceInfo` | `boolean \| { os?: boolean; browser?: boolean; language?: boolean }` | `true` | Device and locale fields derived from the browser; `false` sends none of them. |
 | `supportedLanguages` | `string[]` | not sent | The locales your app ships. Written through to the app record on the server and used for localization-gap analysis. Set it explicitly; the SDK never derives it from the browser. |
+
+`deviceInfo` gates what the SDK reads from the browser and stamps on every event and on feedback:
+`os` drops `os_version`, `browser` drops `device_model`, and `language` drops both `locale` and
+`preferred_language`. Turning `language` off also removes the app from the server's locale-demand
+analysis, which is built from those two fields — `supportedLanguages` is configured rather than
+derived, so it is still sent.
 
 Invalid values throw at `configure()` time with a `Pubky Pulse: …` message, so a typo surfaces on
 the first page load. `init()` catches these failures and returns a diagnostic status instead.
