@@ -50,6 +50,7 @@ import {
   type PulseLogOptions,
   type PulseInitOptions,
   type PulseInitResult,
+  type PulseResetOptions,
 } from "./types";
 
 export { DEFAULT_ENDPOINT } from "./configuration";
@@ -98,6 +99,8 @@ export type {
   PulseLogOptions,
   PulseInitOptions,
   PulseInitResult,
+  PulseResetOptions,
+  PulseResetScope,
 } from "./types";
 
 let config: ValidatedConfig | null = null;
@@ -118,6 +121,15 @@ let logging = false;
 let recordingEvent = false;
 let diagnosing = false;
 let quietDisabled = false;
+/**
+ * Set by every `Pulse.reset`, cleared by the next initialization that starts a
+ * session. It makes that initialization refuse the stored session however fresh
+ * it is: the reset deleted this tab's state, and a stored session that survived
+ * the deletion — `sessionStorage.removeItem` can throw while `getItem` keeps
+ * working — would otherwise be resumed under a newly minted anonymous id,
+ * linking an old session to a new identity. Unobservable when storage works.
+ */
+let freshSessionRequired = false;
 /**
  * Whether this session's debug network events are kept, decided once so a
  * sampled session carries a complete request timeline rather than a random
@@ -475,8 +487,8 @@ function uninstallObservers(): void {
 /**
  * Drop this pipeline without flushing. Persisted browser data is left alone
  * unless `discardReplay` says otherwise — see `Pulse.reset`, the only caller
- * that follows this with a purge and so cannot let a transport hand replayed
- * events back to the queue.
+ * that follows this with a deletion, browser-wide or scoped to this tab, and
+ * so cannot let a transport hand replayed events back to the queue.
  */
 function disableClient(options?: TransportStopOptions): void {
   capturedErrors = new WeakSet<Error>();
@@ -568,7 +580,9 @@ function initializeClient(validated: ValidatedConfig): void {
     installObservers(validated);
     identity.load();
     initializing = false;
-    session.start();
+    session.start(Date.now(), { resume: !freshSessionRequired });
+    // Only a start that actually happened may retire the guard.
+    freshSessionRequired = false;
     const screenName = pageTracker?.screenName;
     if (screenName !== undefined) screenCallbacks.onAppeared(screenName);
     unconfiguredWarningShown = false;
@@ -677,8 +691,17 @@ export interface PulseApi {
    * initialization can replay it; `reset()` deletes it. A later `init` starts
    * as a new browser with a fresh anonymous id. Nothing already sent to the
    * server is recalled, and `clearUser` is not a deletion control.
+   *
+   * `reset({ scope: "tab" })` narrows the deletion to this tab: its session is
+   * deleted and its queue writers are retired, while the anonymous id and the
+   * events other tabs parked in the shared offline queue are left
+   * byte-identical. Use it to clean up one stale tab; consent withdrawal wants
+   * the browser-wide default. Anything but the exact string `"tab"`, and any
+   * tab-scoped cleanup this SDK cannot confirm, deletes browser-wide instead.
+   * A later `init` in this tab adopts the shared anonymous id — including one
+   * another tab has replaced meanwhile — and always starts a new session.
    */
-  reset(): void;
+  reset(options?: PulseResetOptions): void;
   /** Session id for the current page, or undefined before `configure`. */
   readonly sessionId: string | undefined;
   /**
@@ -858,9 +881,31 @@ export const Pulse: PulseApi = {
     await drainClient(previousTransport, previousAttachments);
   },
 
-  reset(): void {
+  reset(options?: PulseResetOptions): void {
+    let tabScoped = false;
+    try {
+      // Only the exact string narrows the deletion; a hostile getter throws
+      // into here and takes the browser-wide path, which deletes more.
+      tabScoped = options?.scope === "tab";
+    } catch { /* An unreadable option is not permission to delete less. */ }
+
+    // Both scopes: a browser-wide purge can leave a session behind too.
+    freshSessionRequired = true;
+
     // Deletion has to happen even if tearing the pipeline down goes wrong.
     try { disableClient({ discardReplay: true }); } catch { /* Consent withdrawal never throws into the host app. */ }
+
+    if (tabScoped) {
+      try {
+        // Retire this tab's writers and drop what only it held, then delete
+        // the session, which is per-tab storage already. Nothing shared is
+        // touched — and nothing is reported as deleted that was not.
+        localStore.invalidate();
+        sessionStore.clear();
+        if (sessionStore.confirmCleared()) return;
+      } catch { /* An unconfirmed cleanup falls through to the full deletion. */ }
+    }
+
     purgeStoredState();
   },
 

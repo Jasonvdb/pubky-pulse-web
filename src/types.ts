@@ -141,6 +141,37 @@ export interface PulseInitResult {
     "missing-key" | "ssr" | "invalid-configuration" | "initialization-failed";
 }
 
+/**
+ * How much of the SDK's stored state `Pulse.reset` deletes.
+ *
+ * - `"browser"`, the default, is the consent-withdrawal control: everything
+ *   the SDK kept in this browser profile goes, in both storage areas — the
+ *   anonymous id, the user id, the session, and the offline queue every tab
+ *   on the origin shares.
+ * - `"tab"` deletes only what belongs to this tab: its session, and whatever
+ *   it could not persist and so holds in memory. The anonymous id and the
+ *   events other tabs parked are left byte-identical, and this tab's queue
+ *   writers are retired so nothing they still hold can be written back.
+ */
+export type PulseResetScope = "browser" | "tab";
+
+/** Options for `Pulse.reset`. */
+export interface PulseResetOptions {
+  /**
+   * Default: `"browser"`. Only the exact string `"tab"` narrows the deletion.
+   * An unknown scope, a value that is not an object, an option getter that
+   * throws, or a tab-scoped cleanup the SDK cannot positively confirm all fall
+   * back to the browser-wide deletion: a consent control must fail toward
+   * deleting more, never toward keeping data.
+   *
+   * Limits: "this tab" means this JavaScript realm. A tab-scoped reset reaches
+   * neither another tab's in-memory state nor anything already sent to the
+   * server, and it does not mint a new anonymous id — every tab shares that
+   * one, so only the browser-wide reset replaces it.
+   */
+  scope?: PulseResetScope;
+}
+
 export interface LogEvent {
   client_event_id: string;
   session_id: string;

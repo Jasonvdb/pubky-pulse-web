@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Pulse } from "../src/index";
-import type { IngestRequest, LogEvent, PulseEventHint } from "../src/types";
+import type { IngestRequest, LogEvent, PulseEventHint, PulseResetOptions } from "../src/types";
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
+import { OfflineQueue } from "../src/offline-queue";
 import { SESSION_ACTIVITY_KEY, SESSION_ID_KEY } from "../src/session";
-import { STORAGE_PREFIX } from "../src/storage";
+import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import {
   resetTestEnvironment,
   testDocument,
@@ -51,6 +52,52 @@ function requestPaths(): string[] {
 /** Events the host app logged, without the SDK's own lifecycle chatter. */
 function appEvents(): LogEvent[] {
   return sentEvents().filter((event) => !event.message.startsWith("sdk:"));
+}
+
+/** Let the lock callbacks and flush continuations all settle. */
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+}
+
+/** Every localStorage key with its value, for a byte-identical comparison. */
+function localSnapshot(): Array<[string, string | null]> {
+  return testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)]);
+}
+
+/** Offline queue keys, shared and spilled alike. */
+function queueKeys(): string[] {
+  return testLocalStorage.keys().filter((key) => key.includes("offline_queue"));
+}
+
+/** An event shaped as the offline queue stores them. */
+function parkedEvent(message: string): LogEvent {
+  return {
+    client_event_id: `parked-${message}`,
+    session_id: "11111111-1111-4111-8111-111111111111",
+    level: "info",
+    message,
+    environment: "web",
+    sdk_name: "pubky-pulse-web",
+    sdk_version: "0.1.0",
+    is_dev: true,
+    timestamp: "2026-09-04T00:00:00.000Z",
+  };
+}
+
+/** Make `sessionStorage` itself unreachable, as a blocked browser does. */
+function withoutSessionStorage(run: () => void): void {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage")!;
+  Object.defineProperty(globalThis, "sessionStorage", {
+    get(): Storage {
+      throw new Error("access denied");
+    },
+    configurable: true,
+  });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(globalThis, "sessionStorage", original);
+  }
 }
 
 describe("Pulse", () => {
@@ -1142,8 +1189,6 @@ describe("Pulse", () => {
     testNavigator.onLine = false;
     await Pulse.flush();
     testWindow.dispatchEvent(new Event("pagehide"));
-    const queueKeys = (): string[] =>
-      testLocalStorage.keys().filter((key) => key.startsWith(`${STORAGE_PREFIX}offline_queue`));
     expect(queueKeys().length).toBeGreaterThan(0);
 
     Pulse.reset();
@@ -1168,29 +1213,25 @@ describe("Pulse", () => {
     expect(messages).not.toContain("before-reset");
   });
 
-  describe.each([
-    { mode: "a reset after a disabling init", reset: true, left: [] as string[] },
-    { mode: "a disabling init on its own", reset: false, left: ["pulse.offline_queue"] },
-  ])("the replay restore that outlives its client: $mode", ({ reset, left }) => {
-    /** A parked event, shaped as the offline queue stores them. */
-    const parked = {
-      client_event_id: "parked-0",
-      session_id: "11111111-1111-4111-8111-111111111111",
-      level: "info",
-      message: "parked",
-      environment: "web",
-      sdk_name: "pubky-pulse-web",
-      sdk_version: "0.1.0",
-      is_dev: true,
-      timestamp: "2026-09-04T00:00:00.000Z",
-    };
+  // `args` is what the scenario passes to `Pulse.reset`, or null when it
+  // performs no reset at all. The default and explicit browser rows are the
+  // backward-compatibility proof: a scope argument changes nothing for them.
+  const replayScenarios: Array<{
+    mode: string;
+    args: [] | [PulseResetOptions] | null;
+    left: string[];
+    keepsAnonymousId: boolean;
+  }> = [
+    { mode: "a default reset after a disabling init", args: [], left: [], keepsAnonymousId: false },
+    { mode: "an explicit browser reset after a disabling init", args: [{ scope: "browser" }], left: [], keepsAnonymousId: false },
+    { mode: "a tab reset after a disabling init", args: [{ scope: "tab" }], left: [], keepsAnonymousId: true },
+    { mode: "a disabling init on its own", args: null, left: ["pulse.offline_queue"], keepsAnonymousId: true },
+  ];
 
-    /** Let the lock callbacks and flush continuations all settle. */
-    async function settle(): Promise<void> {
-      for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
-    }
+  describe.each(replayScenarios)("the replay restore that outlives its client: $mode", ({ args, left, keepsAnonymousId }) => {
+    const parked = parkedEvent("parked");
 
-    it(`leaves ${reset ? "no" : "the"} stored queue behind`, async () => {
+    it(`leaves ${left.length === 0 ? "no" : "the"} stored queue behind`, async () => {
       testNavigator.locks = new TestLockManager();
       testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parked]));
       // The request never settles, so the drained events stay held as replay.
@@ -1203,16 +1244,21 @@ describe("Pulse", () => {
       expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBeNull();
 
       // Stopping drops the only reference to the transport whose restore is
-      // still queued behind the storage lock; a reset cannot reach it.
+      // still queued behind the storage lock; a reset cannot reach it. A tab
+      // reset invalidates instead of purging, which retires it just the same.
       Pulse.init({ ...config, enabled: false });
-      if (reset) Pulse.reset();
+      if (args) Pulse.reset(...args);
       await settle();
 
-      expect(testLocalStorage.keys().filter((key) => key.includes("offline_queue"))).toEqual(left);
-      if (reset) {
-        expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBeNull();
-        expect(testLocalStorage.keys()).toEqual([]);
+      expect(queueKeys()).toEqual(left);
+      const anonymousId = testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY);
+      if (keepsAnonymousId) {
+        expect(anonymousId).toMatch(/^pulse_anon_/);
       } else {
+        expect(anonymousId).toBeNull();
+        expect(testLocalStorage.keys()).toEqual([]);
+      }
+      if (left.length > 0) {
         expect(JSON.parse(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)!))
           .toEqual([parked]);
       }
@@ -1241,6 +1287,264 @@ describe("Pulse", () => {
     expect(testLocalStorage.keys()).toEqual(["app.theme"]);
     expect(Pulse.sessionId).toBeUndefined();
     expect(Pulse.currentUserId).toBeUndefined();
+  });
+
+  it("leaves every shared browser value byte-identical on a tab reset", async () => {
+    testLocalStorage.setItem("app.theme", "dark");
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    await Pulse.setUser("user-7");
+    // Stand in for what the other tabs of this browser already parked.
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("shared")]));
+    testLocalStorage.setItem(
+      `${STORAGE_PREFIX}offline_queue:spill:000000001757000:a`,
+      JSON.stringify([parkedEvent("spilled")]),
+    );
+    Pulse.info("before-reset");
+    expect(Pulse.sessionId).toBeDefined();
+    const before = localSnapshot();
+
+    Pulse.reset({ scope: "tab" });
+    await settle();
+
+    expect(localSnapshot()).toEqual(before);
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBe(anonymousId);
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + USER_ID_KEY)).toBe("user-7");
+    expect(testLocalStorage.getItem("app.theme")).toBe("dark");
+    // Only this tab's own storage area is emptied.
+    expect(testSessionStorage.keys()).toEqual([]);
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
+  });
+
+  it("adopts the shared anonymous id and a new session when it initializes after a tab reset", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    const oldSessionId = Pulse.sessionId;
+    Pulse.info("before-reset");
+
+    Pulse.reset({ scope: "tab" });
+
+    // The shared id outlives the reset, and so does the one another tab puts
+    // in its place before this one initializes again.
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBe(anonymousId);
+    testLocalStorage.setItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY, "pulse_anon_from_tab_a");
+
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toBe("pulse_anon_from_tab_a");
+    expect(Pulse.sessionId).not.toBe(oldSessionId);
+
+    Pulse.info("after-reset");
+    await Pulse.flush();
+
+    expect(sentEvents().map((event) => event.message)).toContain("after-reset");
+    expect(sentEvents().map((event) => event.session_id)).not.toContain(oldSessionId);
+  });
+
+  it("neither sends nor parks the events buffered before a tab reset", async () => {
+    Pulse.init(config);
+    Pulse.info("before-reset");
+
+    Pulse.reset({ scope: "tab" });
+    // The unload path was uninstalled with the client, so there is nothing to spill.
+    testWindow.dispatchEvent(new Event("pagehide"));
+    await settle();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(queueKeys()).toEqual([]);
+  });
+
+  it("discards the drained replay on a tab reset without disturbing another tab's parking", async () => {
+    testNavigator.locks = new TestLockManager();
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("drained")]));
+    // The request never settles, so the drained events stay held as replay.
+    fetchMock.mockImplementation(() => new Promise<Response>(() => undefined));
+
+    Pulse.init(config);
+    void Pulse.flush();
+    await settle();
+    expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBeNull();
+
+    // Tab A writes through storage of its own, so it keeps its own epoch.
+    const tabAQueue = new OfflineQueue(new SafeStorage("local"));
+    tabAQueue.spill([parkedEvent("a-before")]);
+    const parkedBefore = localSnapshot();
+
+    Pulse.reset({ scope: "tab" });
+
+    expect(localSnapshot()).toEqual(parkedBefore);
+    tabAQueue.spill([parkedEvent("a-after")]);
+    const parkedAfter = localSnapshot();
+    await settle();
+
+    // Neither the discarded replay nor a late continuation writes anything back.
+    expect(localSnapshot()).toEqual(parkedAfter);
+    expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBeNull();
+  });
+
+  it("leaves the shared queue intact when a tab reset lands before the drain's lock callback", async () => {
+    testNavigator.locks = new TestLockManager();
+    const stored = JSON.stringify([parkedEvent("shared")]);
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, stored);
+
+    Pulse.init(config);
+    // The drain is dispatched but its lock callback has not run yet.
+    void Pulse.flush();
+    Pulse.reset({ scope: "tab" });
+    await settle();
+
+    expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBe(stored);
+  });
+
+  it("drops identity and parked events this tab held only in the memory fallback", async () => {
+    testLocalStorage.throwOnSet = "error";
+    Pulse.init(config);
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    Pulse.info("fallback-only");
+    testNavigator.onLine = false;
+    await Pulse.flush();
+    testWindow.dispatchEvent(new Event("pagehide"));
+    expect(testLocalStorage.length).toBe(0);
+
+    // Another tab, whose writes work, owns the shared anonymous id.
+    testLocalStorage.throwOnSet = false;
+    testLocalStorage.setItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY, "pulse_anon_shared");
+
+    Pulse.reset({ scope: "tab" });
+
+    testNavigator.onLine = true;
+    Pulse.init(config);
+    expect(Pulse.currentUserId).toBe("pulse_anon_shared");
+    await Pulse.flush();
+    await settle();
+
+    expect(sentEvents().map((event) => event.message)).not.toContain("fallback-only");
+  });
+
+  it("purges the whole browser when this tab's session keys cannot be removed", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    const oldSessionId = Pulse.sessionId;
+    testLocalStorage.setItem("app.theme", "dark");
+    testSessionStorage.throwOnRemove = true;
+
+    expect(() => Pulse.reset({ scope: "tab" })).not.toThrow();
+
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+    testSessionStorage.throwOnRemove = false;
+    // The session marker survived the deletion that took the anonymous id.
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe(oldSessionId);
+
+    Pulse.init(config);
+
+    // Resuming it would hang an old session off a newly minted identity.
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    expect(Pulse.sessionId).not.toBe(oldSessionId);
+  });
+
+  it("refuses to resume a session a default reset could not remove", () => {
+    Pulse.init(config);
+    const oldSessionId = Pulse.sessionId;
+    testSessionStorage.throwOnRemove = true;
+
+    Pulse.reset();
+
+    testSessionStorage.throwOnRemove = false;
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe(oldSessionId);
+
+    Pulse.init(config);
+
+    expect(Pulse.sessionId).not.toBe(oldSessionId);
+  });
+
+  it("purges the whole browser when sessionStorage cannot be reached at all", () => {
+    Pulse.init(config);
+    testLocalStorage.setItem("app.theme", "dark");
+
+    withoutSessionStorage(() => {
+      // "Could not look" is not "nothing is there", so the cleanup is unconfirmed.
+      expect(() => Pulse.reset({ scope: "tab" })).not.toThrow();
+    });
+
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+  });
+
+  it.each([
+    { label: "an unknown scope", options: { scope: "everything" } },
+    { label: "a differently cased scope", options: { scope: "Tab" } },
+    { label: "an empty scope", options: { scope: "" } },
+    { label: "options that are not an object", options: "tab" },
+    { label: "null options", options: null },
+    {
+      label: "a scope getter that throws",
+      options: Object.defineProperty({}, "scope", {
+        get(): string {
+          throw new Error("hostile");
+        },
+      }),
+    },
+  ])("purges the whole browser for $label", ({ options }) => {
+    Pulse.init(config);
+    testLocalStorage.setItem("app.theme", "dark");
+
+    expect(() => Pulse.reset(options as PulseResetOptions)).not.toThrow();
+
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+    expect(testSessionStorage.keys()).toEqual([]);
+  });
+
+  it("resets this tab before any initialization without throwing or touching host keys", () => {
+    testLocalStorage.setItem("app.theme", "dark");
+    testSessionStorage.setItem("app.tab", "1");
+
+    expect(() => Pulse.reset({ scope: "tab" })).not.toThrow();
+
+    expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+    expect(testSessionStorage.keys()).toEqual(["app.tab"]);
+    expect(Pulse.sessionId).toBeUndefined();
+    expect(Pulse.currentUserId).toBeUndefined();
+  });
+
+  it("keeps the event another tab recorded under fresh consent when this tab resets", async () => {
+    // Pulse is a module singleton, so tab A is modelled as a second writer in
+    // this realm: its own SafeStorage and OfflineQueue over the same backend.
+    testNavigator.locks = new TestLockManager();
+
+    // Tab B consented, initialized, and buffered an event.
+    Pulse.init(config);
+    const staleSessionId = Pulse.sessionId;
+    Pulse.info("b-stale");
+
+    // Tab A withdrew consent, re-accepted it, and parked an event of its own
+    // on the unload path under the anonymous id the withdrawal minted.
+    for (const key of testLocalStorage.keys()) {
+      if (key.startsWith(STORAGE_PREFIX)) testLocalStorage.removeItem(key);
+    }
+    testLocalStorage.setItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY, "pulse_anon_reconsented");
+    const tabAQueue = new OfflineQueue(new SafeStorage("local"));
+    tabAQueue.spill([parkedEvent("a-consented")]);
+    const parkedByTabA = localSnapshot();
+
+    // Tab B comes back with a stale consent marker and cleans itself up.
+    Pulse.reset({ scope: "tab" });
+    await settle();
+
+    expect(localSnapshot()).toEqual(parkedByTabA);
+    // Tab A is still a live writer: nothing bumped its epoch.
+    tabAQueue.spill([parkedEvent("a-later")]);
+    expect(queueKeys()).toHaveLength(2);
+
+    Pulse.init(config);
+    expect(Pulse.currentUserId).toBe("pulse_anon_reconsented");
+    await Pulse.flush();
+    await settle();
+
+    const messages = sentEvents().map((event) => event.message);
+    expect(messages).toContain("a-consented");
+    expect(messages).toContain("a-later");
+    expect(messages).not.toContain("b-stale");
+    expect(sentEvents().map((event) => event.session_id)).not.toContain(staleSessionId);
   });
 
   it("reverts to the anonymous id on clearUser", async () => {
