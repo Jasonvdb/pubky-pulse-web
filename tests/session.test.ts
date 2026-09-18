@@ -76,6 +76,19 @@ describe("SessionManager", () => {
     expect(storedActivity()).toBe(String(T0 + TIMEOUT_MS - 1));
   });
 
+  it("resumes nothing from the tombstone a refused deletion leaves", () => {
+    // What `Pulse.reset` writes over keys the browser would not remove.
+    testSessionStorage.setItem(STORAGE_PREFIX + SESSION_ID_KEY, "");
+    testSessionStorage.setItem(STORAGE_PREFIX + SESSION_ACTIVITY_KEY, "");
+
+    const manager = makeManager();
+    const id = manager.start(T0);
+
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(manager.isResumed).toBe(false);
+    expect(storedId()).toBe(id);
+  });
+
   it("rotates a resumed session silently when it expires", () => {
     const first = makeManager().start(T0);
     started = [];
@@ -160,6 +173,23 @@ describe("SessionManager", () => {
 
     expect(manager.id).toBe(id);
     expect(started.map((entry) => entry.id)).toEqual([id]);
+  });
+
+  it("mints a new session over the stored one when resume is refused", () => {
+    const first = makeManager().start(T0);
+    started = [];
+
+    const manager = makeManager();
+    const next = manager.start(T0 + 1, { resume: false });
+
+    // The stored session is still fresh; the caller wanted it abandoned anyway.
+    expect(next).not.toBe(first);
+    expect(manager.isResumed).toBe(false);
+    expect(storedId()).toBe(next);
+    expect(storedActivity()).toBe(String(T0 + 1));
+    expect(started.map((entry) => entry.id)).toEqual([next]);
+    // We never saw the refused session start, so we do not end it either.
+    expect(ended).toEqual([]);
   });
 
   it("treats a stored id without an activity stamp as expired", () => {

@@ -65,7 +65,8 @@ and keep the running client. To change options, use `await Pulse.shutdown()` (wh
 `Pulse.init({ enabled: false })` stops an active client and discards its pending in-memory telemetry
 without flushing or parking it. It leaves pre-existing browser storage intact; a later enabled
 initialization can replay that old queue. Use `Pulse.reset()` instead when that storage has to go
-away — on a withdrawal of consent, say. Already transmitted requests cannot be recalled.
+away — on a withdrawal of consent, say — or `Pulse.reset({ scope: "tab" })` when only this tab's
+state has to go and the other tabs keep theirs. Already transmitted requests cannot be recalled.
 Initialization failures roll back installed collectors and return `error`. Invalid configuration
 returns `invalid-configuration`; a supplied invalid endpoint never falls back to the hosted service.
 An invalid reinitialization preserves an already-running valid client. Diagnostics contain no keys,
@@ -483,9 +484,21 @@ events — so nothing is left to replay:
 Pulse.reset(); // the person withdrew consent
 ```
 
-The next `Pulse.init` starts as a new browser with a fresh anonymous id. Nothing already sent to the
+The next `Pulse.init` starts as a new browser with a fresh anonymous id, and with a new session: no
+reset, of either scope, lets the next `init` resume a stored session. Nothing already sent to the
 server is recalled by it; delete that server-side. Calling it before any initialization is a safe
-no-op, and it never throws into your app.
+no-op, and it never throws into your app. For the narrower job of tidying up a single tab, see
+[Cleaning up one stale tab](#cleaning-up-one-stale-tab).
+
+Some browsers refuse the deletion itself — a sandboxed iframe, a privacy mode, a host app that
+replaced `localStorage`, where `removeItem` throws while `getItem` keeps working. A reset that
+cannot confirm both storage areas are empty overwrites every key it can still see, so the old
+values are destroyed even for a later page load, and then trusts nothing this browser has stored
+for the rest of this page: no stored anonymous id is adopted, no stored user id is claimed, no
+stored session is resumed, and no events parked before the reset are replayed. The one residual
+limit is honest to state: on a store that blocks writes as well as removals, the old values are
+still physically there, and only this page's refusal to read them protects you — a reload starts
+trusting storage again.
 
 The promise waits for the flush and the claim request attempts. Those retry with exponential
 backoff, so against an endpoint that is failing or hanging the await can take a couple of minutes.
@@ -495,6 +508,45 @@ retried on the next `configure()`. Don't await it on a sign-in path that has to 
 ```ts
 void Pulse.setUser(userId); // fire and forget; the id is switched when the claim settles
 ```
+
+### Cleaning up one stale tab
+
+`Pulse.reset({ scope: "tab" })` deletes this tab's Pulse state and nothing else. It is for the tab
+that slept through a withdrawal and a fresh acceptance in another tab: consent is accepted now, but
+this tab still holds state from before it. A browser-wide reset there would take the offline queue
+and anonymous id the freshly consented tabs share:
+
+```ts
+if (!consentAccepted()) {
+  Pulse.reset(); // withdrawal: delete everything this browser holds
+} else if (tabConsentMarkerIsStale()) {
+  Pulse.reset({ scope: "tab" }); // this tab's state predates the current consent
+  Pulse.init({ apiKey: import.meta.env.VITE_PULSE_KEY });
+}
+```
+
+A tab reset stops this tab's client without flushing and drops what this tab was holding: its
+buffered events, the batch in flight, and the events it had drained from the shared queue to send.
+It removes the collectors, clears this tab's `sessionStorage` session, and makes this tab's older
+offline-queue writers inert so nothing they still hold is written back. The shared anonymous id,
+the user id and the offline queue are left byte-identical. Pulse stays disabled in this tab until
+you call `init` again; that `init` adopts whichever shared anonymous id is current — including one
+another tab minted meanwhile — and always starts a new session.
+
+What it does not promise:
+
+- **An unconfirmed cleanup deletes more, not less.** If `sessionStorage` cannot be reached or a
+  removal throws, the call falls back to the full browser reset, which can delete other tabs'
+  queued events. So does any scope but the exact string `"tab"`. A deletion control has to fail
+  toward deleting. If the browser refuses that deletion too, it is handled exactly as a refused
+  browser-wide reset: survivors overwritten, nothing stored trusted again on this page.
+- **Events this tab had already parked in the shared queue stay there** and are sent by whichever
+  tab drains them next. The SDK cannot tell them from the other tabs' events. Replayed events never
+  pass through `beforeSend`, so a hook cannot drop them either.
+- **Events this tab had drained from that queue but not yet delivered are dropped with it**, whoever
+  parked them.
+- **It is not a consent withdrawal**, and nothing already sent to the server is recalled. Use
+  `Pulse.reset()` for that, and delete the server-side data separately.
 
 ## User properties
 
@@ -717,10 +769,13 @@ rarely need to intervene, but both are available:
 await Pulse.flush(); // attempt queued events and wait within the attachment deadline
 await Pulse.shutdown(); // flush, then remove every page hook the SDK installed
 Pulse.reset(); // stop without flushing and delete this browser's stored SDK data
+Pulse.reset({ scope: "tab" }); // the same, but only this tab's state
 ```
 
 `shutdown` drains what is pending and leaves the offline queue for the next page load; `reset` is
-the consent-withdrawal path and deletes it. See [Identity](#identity).
+the consent-withdrawal path and deletes it, while `reset({ scope: "tab" })` leaves the shared queue
+for the other tabs. See [Identity](#identity) and
+[Cleaning up one stale tab](#cleaning-up-one-stale-tab).
 
 When the page is hidden or unloaded the SDK flushes on its own with a `keepalive` request and parks
 whatever does not fit — including the batch that was still waiting out a retry — in an offline queue

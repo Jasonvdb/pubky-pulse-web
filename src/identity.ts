@@ -61,9 +61,16 @@ export class IdentityManager {
    * Load the persisted ids. A saved user id means an earlier page already
    * identified this person, so re-run the claim in the background: it is
    * idempotent server-side and covers a claim that never reached the server.
+   *
+   * `trustStored: false` reads neither id and claims nothing, for a page whose
+   * `Pulse.reset` could not confirm that it deleted them: whatever is still
+   * there belongs to the browser the user asked us to forget. An empty value
+   * counts as absent for the same reason — it is the tombstone that reset
+   * writes over a key it could not remove.
    */
-  load(): void {
-    const storedAnon = localStore.get(ANONYMOUS_ID_KEY);
+  load(options?: { trustStored?: boolean }): void {
+    const trustStored = options?.trustStored !== false;
+    const storedAnon = trustStored ? localStore.get(ANONYMOUS_ID_KEY) : null;
     if (storedAnon) {
       this.anonymousId = storedAnon;
     } else {
@@ -71,7 +78,7 @@ export class IdentityManager {
       localStore.set(ANONYMOUS_ID_KEY, this.anonymousId);
     }
 
-    this.savedUserId = localStore.get(USER_ID_KEY) ?? undefined;
+    this.savedUserId = (trustStored ? localStore.get(USER_ID_KEY) : null) || undefined;
     if (this.savedUserId && this.savedUserId !== this.anonymousId) {
       this.generation += 1;
       this.pending = this.runClaim(this.anonymousId, this.savedUserId);

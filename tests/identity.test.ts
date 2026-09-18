@@ -77,6 +77,35 @@ describe("IdentityManager", () => {
     expect(claims).toEqual([["pulse_anon_stored", "user-7"]]);
   });
 
+  it("treats the tombstone a refused deletion leaves as an absent id", async () => {
+    // What `Pulse.reset` writes over a key the browser would not remove.
+    testLocalStorage.setItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY, "");
+    testLocalStorage.setItem(STORAGE_PREFIX + USER_ID_KEY, "");
+
+    const manager = makeManager();
+    manager.load();
+
+    expect(manager.anonymous).toMatch(/^pulse_anon_[0-9a-f-]{36}$/);
+    expect(stored(ANONYMOUS_ID_KEY)).toBe(manager.anonymous);
+    expect(manager.currentId).toBe(manager.anonymous);
+    await manager.settled;
+    expect(claim).not.toHaveBeenCalled();
+  });
+
+  it("adopts and claims nothing stored when the caller distrusts it", async () => {
+    testLocalStorage.setItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY, "pulse_anon_stored");
+    testLocalStorage.setItem(STORAGE_PREFIX + USER_ID_KEY, "user-7");
+
+    const manager = makeManager();
+    manager.load({ trustStored: false });
+
+    expect(manager.anonymous).not.toBe("pulse_anon_stored");
+    expect(manager.currentId).toBe(manager.anonymous);
+    expect(stored(ANONYMOUS_ID_KEY)).toBe(manager.anonymous);
+    await manager.settled;
+    expect(claim).not.toHaveBeenCalled();
+  });
+
   it("claims before switching the active id", async () => {
     const gate = deferred();
     claim = vi.fn((anonymousId: string, userId: string) => {

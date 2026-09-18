@@ -166,6 +166,29 @@ describe("OfflineQueue", () => {
     expect(queue.read()).toEqual([]);
   });
 
+  it("parses no events from the tombstone a refused deletion leaves", async () => {
+    // What `Pulse.reset` writes over keys the browser would not remove.
+    testLocalStorage.setItem(QUEUE_KEY, "");
+    testLocalStorage.setItem(`${SPILL_PREFIX}000000001757000:a`, "");
+
+    expect(queue.read()).toEqual([]);
+    await expect(queue.drain()).resolves.toEqual([]);
+  });
+
+  it("drains, parks and spills nothing at all when it is created inert", async () => {
+    const storage = new SafeStorage("local");
+    await new OfflineQueue(storage).append([makeEvent(0)]);
+    const inert = new OfflineQueue(storage, undefined, { inert: true });
+
+    await inert.append([makeEvent(1)]);
+    inert.spill([makeEvent(2)]);
+
+    expect(spillKeys()).toEqual([]);
+    await expect(inert.drain()).resolves.toEqual([]);
+    // Nothing was read, so nothing was removed either.
+    expect(JSON.parse(testLocalStorage.getItem(QUEUE_KEY)!)).toHaveLength(1);
+  });
+
   describe("spill", () => {
     it("writes a key of its own instead of the shared one", async () => {
       await queue.append([makeEvent(0)]);
@@ -354,6 +377,101 @@ describe("OfflineQueue", () => {
       await appended;
 
       expect(testLocalStorage.keys()).toEqual([]);
+    });
+  });
+
+  describe("after a tab-local invalidation", () => {
+    let storage: SafeStorage;
+    /** This tab's queue, created before the invalidation. */
+    let stale: OfflineQueue;
+    /** Another tab: its own realm, so its own SafeStorage and its own epoch. */
+    let otherTab: OfflineQueue;
+
+    beforeEach(() => {
+      storage = new SafeStorage("local");
+      stale = new OfflineQueue(storage);
+      otherTab = new OfflineQueue(new SafeStorage("local"));
+      storage.invalidate();
+    });
+
+    it("appends nothing from a queue created before the invalidation", async () => {
+      await stale.append(makeEvents(2));
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("spills nothing from a queue created before the invalidation", () => {
+      stale.spill(makeEvents(2));
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("drains nothing, leaving what another party wrote", async () => {
+      // A second tab, or the next init, parked events under the same key.
+      testLocalStorage.setItem(QUEUE_KEY, JSON.stringify(makeEvents(2)));
+
+      expect(await stale.drain()).toEqual([]);
+      expect(testLocalStorage.getItem(QUEUE_KEY)).not.toBeNull();
+    });
+
+    it("leaves another tab's queue over the same backend working", async () => {
+      await otherTab.append([makeEvent(0)]);
+      otherTab.spill([makeEvent(1)]);
+
+      expect((await otherTab.drain()).map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+      ]);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("works normally for a queue created after the invalidation", async () => {
+      // The shared queue is the origin's, not this tab's: it stays drainable.
+      testLocalStorage.setItem(QUEUE_KEY, JSON.stringify([makeEvent(0)]));
+      const fresh = new OfflineQueue(storage);
+
+      await fresh.append([makeEvent(1)]);
+
+      expect((await fresh.drain()).map((event) => event.client_event_id)).toEqual([
+        "event-0",
+        "event-1",
+      ]);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("writes nothing when the invalidation lands while the append waits for its lock", async () => {
+      const locks = new TestLockManager();
+      testNavigator.locks = locks;
+      const storageUnderRace = new SafeStorage("local");
+      const racing = new OfflineQueue(storageUnderRace);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      void locks.request(LOCK_NAME, () => held);
+
+      const appended = racing.append([makeEvent(0)]);
+      await Promise.resolve();
+      expect(testLocalStorage.getItem(QUEUE_KEY)).toBeNull();
+
+      // The tab-scoped reset invalidates before the queued callback ever runs.
+      storageUnderRace.invalidate();
+      release();
+      await appended;
+
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("drops parked events the memory fallback alone was holding", async () => {
+      testLocalStorage.throwOnSet = "error";
+      const memoryOnly = new OfflineQueue(storage);
+      await memoryOnly.append(makeEvents(2));
+      testLocalStorage.throwOnSet = false;
+      expect(memoryOnly.read()).toHaveLength(2);
+
+      storage.invalidate();
+
+      // Nothing reached the backend, so only dropping the fallback keeps the
+      // next init's queue from draining and sending this tab's parked events.
+      expect(await new OfflineQueue(storage).drain()).toEqual([]);
     });
   });
 

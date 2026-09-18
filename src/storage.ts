@@ -60,10 +60,12 @@ export class SafeStorage {
   }
 
   /**
-   * Bumped by every `clear()`. A holder of long-lived derived state captures
-   * this when it is created and compares it before writing back, so data a
-   * deletion already removed cannot be restored behind that deletion's back;
-   * see `OfflineQueue`.
+   * Bumped by every `clear()` and every `invalidate()`. A holder of long-lived
+   * derived state captures this when it is created and compares it before
+   * writing back, so data a deletion already removed cannot be restored behind
+   * that deletion's back; see `OfflineQueue`. It lives in this instance, and
+   * `localStore`/`sessionStore` are module singletons, so the epoch is
+   * per-realm: bumping it retires this tab's holders and never another tab's.
    */
   get epoch(): number {
     return this.generation;
@@ -153,6 +155,42 @@ export class SafeStorage {
   clear(): void {
     for (const key of this.keys("")) this.remove(key);
     this.generation += 1;
+  }
+
+  /**
+   * Retire this realm's stored state without deleting anything shared: drop
+   * the in-memory fallback and advance the epoch, touching no backend at all.
+   * The fallback holds whatever this tab could not persist — parked events, the
+   * anonymous id — and `get`/`keys` prefer it, so dropping it is what keeps the
+   * next holder from finding and reusing this tab's values. Every other tab
+   * reads the backend it left byte-identical, and keeps its own epoch.
+   */
+  invalidate(): void {
+    this.memory.clear();
+    this.generation += 1;
+  }
+
+  /**
+   * True only when nothing of the SDK's is left: the fallback is empty, the
+   * backend resolves, enumerating it does not throw, and it holds no prefixed
+   * key. Goes to the backend directly rather than through `get`/`keys`, which
+   * swallow failures and so report an unreadable store as an empty one; here
+   * "could not look" has to be false, because the caller uses it to decide
+   * whether a deletion can be reported as done.
+   */
+  confirmCleared(): boolean {
+    if (this.memory.size > 0) return false;
+
+    const backend = resolveBackend(this.kind);
+    if (!backend) return false;
+    try {
+      for (let index = 0; index < backend.length; index += 1) {
+        if (backend.key(index)?.startsWith(STORAGE_PREFIX)) return false;
+      }
+    } catch {
+      return false;
+    }
+    return true;
   }
 
   remove(key: string): void {

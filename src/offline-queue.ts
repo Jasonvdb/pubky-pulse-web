@@ -65,27 +65,40 @@ function lockManager(): LockManagerLike | null {
  * A queue can outlive the client that made it: an unawaited restore append from
  * a stopped transport, a mid-drain flush continuation, and an unload `spill`
  * can all still be holding events after their client was dropped. So every
- * write compares the storage epoch captured here against the live one, and a
- * `SafeStorage.clear()` — which only `Pulse.reset()` performs — makes every
- * queue created before it write-dead: none of them can put back the data the
- * user asked to delete. A queue created after the clear, by the next `init`,
- * is current and works normally. Reads are left alone.
+ * write compares the storage epoch captured here against the live one, and both
+ * things that advance it — `SafeStorage.clear()`, the browser-wide deletion
+ * `Pulse.reset()` performs, and `SafeStorage.invalidate()`, which retires this
+ * tab's state alone — make every queue created before them write-dead: none of
+ * them can put back the data the user asked to delete. A queue created
+ * afterwards, by the next `init`, is current and works normally. Reads are left
+ * alone, and another tab's queues have an epoch of their own.
  */
 export class OfflineQueue {
   private readonly storage: SafeStorage;
   private readonly onDebug: ((message: string) => void) | undefined;
   /** The storage epoch this queue was created in; see the class comment. */
   private readonly epoch: number;
+  /** True for a queue born stale; see the `inert` option. */
+  private readonly inert: boolean;
 
-  constructor(storage: SafeStorage, onDebug?: (message: string) => void) {
+  /**
+   * `inert: true` creates the queue already retired, exactly as a `clear()`
+   * retires the queues that predate it: it drains nothing, parks nothing and
+   * spills nothing. It is for the initialization that follows a deletion this
+   * browser refused — whatever is still parked predates the withdrawal and may
+   * not be sent, and nothing new may be written to a store that will not let
+   * us delete it again.
+   */
+  constructor(storage: SafeStorage, onDebug?: (message: string) => void, options?: { inert?: boolean }) {
     this.storage = storage;
     this.onDebug = onDebug;
     this.epoch = storage.epoch;
+    this.inert = options?.inert === true;
   }
 
-  /** False once storage was cleared after this queue was created. */
+  /** False once storage was cleared or invalidated after this queue was created. */
   private isCurrent(): boolean {
-    return this.storage.epoch === this.epoch;
+    return !this.inert && this.storage.epoch === this.epoch;
   }
 
   /**
