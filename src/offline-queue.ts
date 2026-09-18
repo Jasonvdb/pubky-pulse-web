@@ -65,11 +65,13 @@ function lockManager(): LockManagerLike | null {
  * A queue can outlive the client that made it: an unawaited restore append from
  * a stopped transport, a mid-drain flush continuation, and an unload `spill`
  * can all still be holding events after their client was dropped. So every
- * write compares the storage epoch captured here against the live one, and a
- * `SafeStorage.clear()` — which only `Pulse.reset()` performs — makes every
- * queue created before it write-dead: none of them can put back the data the
- * user asked to delete. A queue created after the clear, by the next `init`,
- * is current and works normally. Reads are left alone.
+ * write compares the storage epoch captured here against the live one, and both
+ * things that advance it — `SafeStorage.clear()`, the browser-wide deletion
+ * `Pulse.reset()` performs, and `SafeStorage.invalidate()`, which retires this
+ * tab's state alone — make every queue created before them write-dead: none of
+ * them can put back the data the user asked to delete. A queue created
+ * afterwards, by the next `init`, is current and works normally. Reads are left
+ * alone, and another tab's queues have an epoch of their own.
  */
 export class OfflineQueue {
   private readonly storage: SafeStorage;
@@ -83,7 +85,7 @@ export class OfflineQueue {
     this.epoch = storage.epoch;
   }
 
-  /** False once storage was cleared after this queue was created. */
+  /** False once storage was cleared or invalidated after this queue was created. */
   private isCurrent(): boolean {
     return this.storage.epoch === this.epoch;
   }

@@ -162,6 +162,23 @@ describe("SessionManager", () => {
     expect(started.map((entry) => entry.id)).toEqual([id]);
   });
 
+  it("mints a new session over the stored one when resume is refused", () => {
+    const first = makeManager().start(T0);
+    started = [];
+
+    const manager = makeManager();
+    const next = manager.start(T0 + 1, { resume: false });
+
+    // The stored session is still fresh; the caller wanted it abandoned anyway.
+    expect(next).not.toBe(first);
+    expect(manager.isResumed).toBe(false);
+    expect(storedId()).toBe(next);
+    expect(storedActivity()).toBe(String(T0 + 1));
+    expect(started.map((entry) => entry.id)).toEqual([next]);
+    // We never saw the refused session start, so we do not end it either.
+    expect(ended).toEqual([]);
+  });
+
   it("treats a stored id without an activity stamp as expired", () => {
     testSessionStorage.setItem(STORAGE_PREFIX + SESSION_ID_KEY, "orphaned-id");
 

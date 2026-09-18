@@ -10,6 +10,8 @@ export class MemoryStorage implements Storage {
   private data = new Map<string, string>();
   /** `"quota"` throws QuotaExceededError, `"error"` throws a plain Error. */
   throwOnSet: false | "quota" | "error" = false;
+  /** When set, `removeItem` throws a plain Error and the key stays put. */
+  throwOnRemove = false;
 
   get length(): number {
     return this.data.size;
@@ -34,6 +36,9 @@ export class MemoryStorage implements Storage {
   }
 
   removeItem(key: string): void {
+    if (this.throwOnRemove) {
+      throw new Error("storage unavailable");
+    }
     this.data.delete(key);
   }
 
@@ -163,8 +168,10 @@ define("sessionStorage", testSessionStorage);
 export function resetTestEnvironment(): void {
   testLocalStorage.clear();
   testLocalStorage.throwOnSet = false;
+  testLocalStorage.throwOnRemove = false;
   testSessionStorage.clear();
   testSessionStorage.throwOnSet = false;
+  testSessionStorage.throwOnRemove = false;
   testDocument.visibilityState = "visible";
   testNavigator.language = "en-GB";
   testNavigator.languages = ["en-GB", "en"];

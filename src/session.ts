@@ -79,16 +79,22 @@ export class SessionManager {
    * Adopt the stored session when it is still fresh, otherwise begin a new
    * one. The inherited session is never ended here: whoever started it may
    * still be running in another tab, and we never saw its first event.
+   *
+   * `resume: false` refuses the stored session however fresh it is and begins a
+   * new one over it, for a caller that has just discarded this tab's state and
+   * must not carry the discarded session forward.
    */
-  start(now: number = Date.now()): string {
-    const existing = sessionStore.get(SESSION_ID_KEY);
-    const lastActivity = this.readActivity();
+  start(now: number = Date.now(), options?: { resume?: boolean }): string {
+    if (options?.resume !== false) {
+      const existing = sessionStore.get(SESSION_ID_KEY);
+      const lastActivity = this.readActivity();
 
-    if (existing && lastActivity !== null && now - lastActivity < this.timeoutMs) {
-      this.currentId = existing;
-      this.startedHere = false;
-      this.writeActivity(now);
-      return existing;
+      if (existing && lastActivity !== null && now - lastActivity < this.timeoutMs) {
+        this.currentId = existing;
+        this.startedHere = false;
+        this.writeActivity(now);
+        return existing;
+      }
     }
 
     return this.begin(now, launchDurationMs());
