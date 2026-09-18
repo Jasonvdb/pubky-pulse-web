@@ -76,6 +76,19 @@ describe("SessionManager", () => {
     expect(storedActivity()).toBe(String(T0 + TIMEOUT_MS - 1));
   });
 
+  it("resumes nothing from the tombstone a refused deletion leaves", () => {
+    // What `Pulse.reset` writes over keys the browser would not remove.
+    testSessionStorage.setItem(STORAGE_PREFIX + SESSION_ID_KEY, "");
+    testSessionStorage.setItem(STORAGE_PREFIX + SESSION_ACTIVITY_KEY, "");
+
+    const manager = makeManager();
+    const id = manager.start(T0);
+
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(manager.isResumed).toBe(false);
+    expect(storedId()).toBe(id);
+  });
+
   it("rotates a resumed session silently when it expires", () => {
     const first = makeManager().start(T0);
     started = [];

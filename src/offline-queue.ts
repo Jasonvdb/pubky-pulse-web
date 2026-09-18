@@ -78,16 +78,27 @@ export class OfflineQueue {
   private readonly onDebug: ((message: string) => void) | undefined;
   /** The storage epoch this queue was created in; see the class comment. */
   private readonly epoch: number;
+  /** True for a queue born stale; see the `inert` option. */
+  private readonly inert: boolean;
 
-  constructor(storage: SafeStorage, onDebug?: (message: string) => void) {
+  /**
+   * `inert: true` creates the queue already retired, exactly as a `clear()`
+   * retires the queues that predate it: it drains nothing, parks nothing and
+   * spills nothing. It is for the initialization that follows a deletion this
+   * browser refused — whatever is still parked predates the withdrawal and may
+   * not be sent, and nothing new may be written to a store that will not let
+   * us delete it again.
+   */
+  constructor(storage: SafeStorage, onDebug?: (message: string) => void, options?: { inert?: boolean }) {
     this.storage = storage;
     this.onDebug = onDebug;
     this.epoch = storage.epoch;
+    this.inert = options?.inert === true;
   }
 
   /** False once storage was cleared or invalidated after this queue was created. */
   private isCurrent(): boolean {
-    return this.storage.epoch === this.epoch;
+    return !this.inert && this.storage.epoch === this.epoch;
   }
 
   /**

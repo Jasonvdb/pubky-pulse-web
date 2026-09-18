@@ -4,8 +4,9 @@ import type { IngestRequest, LogEvent, PulseEventHint, PulseResetOptions } from 
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
 import { OfflineQueue } from "../src/offline-queue";
+import { clearResetGuards } from "../src/reset-guard";
 import { SESSION_ACTIVITY_KEY, SESSION_ID_KEY } from "../src/session";
-import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
+import { localStore, sessionStore, SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import {
   resetTestEnvironment,
   testDocument,
@@ -103,6 +104,12 @@ function withoutSessionStorage(run: () => void): void {
 describe("Pulse", () => {
   beforeEach(() => {
     resetTestEnvironment();
+    // `localStore`/`sessionStore` are module singletons: the backing globals
+    // are fresh every test, their in-memory fallbacks are not.
+    localStore.clear();
+    sessionStore.clear();
+    // Page memory a `Pulse.reset` leaves behind, as a fresh page load has it.
+    clearResetGuards();
     resetSlugWarning();
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     fetchMock = vi.fn((_url: string, _init?: RequestInit) =>
@@ -1432,8 +1439,9 @@ describe("Pulse", () => {
 
     expect(testLocalStorage.keys()).toEqual(["app.theme"]);
     testSessionStorage.throwOnRemove = false;
-    // The session marker survived the deletion that took the anonymous id.
-    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe(oldSessionId);
+    // The key survived the deletion that took the anonymous id; its value did
+    // not, because the purge overwrote what it could not remove.
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe("");
 
     Pulse.init(config);
 
@@ -1451,10 +1459,208 @@ describe("Pulse", () => {
     Pulse.reset();
 
     testSessionStorage.throwOnRemove = false;
-    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe(oldSessionId);
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe("");
 
     Pulse.init(config);
 
+    expect(Pulse.sessionId).not.toBe(oldSessionId);
+  });
+
+  it("mints a new identity and replays nothing when localStorage refuses the deletion", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    const oldSessionId = Pulse.sessionId;
+    await Pulse.setUser("user-7");
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("before-reset")]));
+    testLocalStorage.throwOnRemove = true;
+
+    Pulse.reset();
+
+    testLocalStorage.throwOnRemove = false;
+    // The keys outlived the removal; none of them still holds its old value.
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBe("");
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + USER_ID_KEY)).toBe("");
+    expect(testLocalStorage.getItem(`${STORAGE_PREFIX}offline_queue`)).toBe("");
+
+    fetchMock.mockClear();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    expect(Pulse.sessionId).not.toBe(oldSessionId);
+    Pulse.info("after-reset");
+    await Pulse.flush();
+    await settle();
+
+    expect(requestPaths()).not.toContain("/v1/identity/claim");
+    const messages = sentEvents().map((event) => event.message);
+    expect(messages).toContain("after-reset");
+    expect(messages).not.toContain("before-reset");
+  });
+
+  it("distrusts the stored state a deletion could neither remove nor overwrite", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    await Pulse.setUser("user-7");
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("before-reset")]));
+    testLocalStorage.throwOnRemove = true;
+    testLocalStorage.throwOnSet = "error";
+
+    Pulse.reset();
+
+    // Nothing could be deleted and nothing could be written over it, so the
+    // backend still holds every pre-reset value; only the guard protects them.
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBe(anonymousId);
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + USER_ID_KEY)).toBe("user-7");
+
+    fetchMock.mockClear();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    Pulse.info("after-reset");
+    await Pulse.flush();
+    await settle();
+
+    expect(requestPaths()).not.toContain("/v1/identity/claim");
+    expect(sentEvents().map((event) => event.message)).not.toContain("before-reset");
+    testLocalStorage.throwOnRemove = false;
+    testLocalStorage.throwOnSet = false;
+  });
+
+  it("keeps an unconfirmed reset deleted across a page reload", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    const oldSessionId = Pulse.sessionId;
+    await Pulse.setUser("user-7");
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("before-reset")]));
+    testLocalStorage.throwOnRemove = true;
+    testSessionStorage.throwOnRemove = true;
+
+    Pulse.reset();
+
+    testLocalStorage.throwOnRemove = false;
+    testSessionStorage.throwOnRemove = false;
+    // A fresh page keeps nothing but what storage holds: drop the in-page
+    // guards and let the overwritten survivors speak for themselves.
+    clearResetGuards();
+
+    fetchMock.mockClear();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    expect(Pulse.sessionId).not.toBe(oldSessionId);
+    Pulse.info("after-reload");
+    await Pulse.flush();
+    await settle();
+
+    expect(requestPaths()).not.toContain("/v1/identity/claim");
+    const messages = sentEvents().map((event) => event.message);
+    expect(messages).toContain("after-reload");
+    expect(messages).not.toContain("before-reset");
+  });
+
+  it("keeps adopting the shared identity and queue after a confirmed tab reset", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+
+    Pulse.reset({ scope: "tab" });
+
+    // What another tab parked under the shared id stays deliverable.
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("other-tab")]));
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).toBe(anonymousId);
+    await Pulse.flush();
+    await settle();
+
+    expect(sentEvents().map((event) => event.message)).toContain("other-tab");
+  });
+
+  it("distrusts stored state when a tab reset escalates to an unconfirmed purge", async () => {
+    Pulse.init(config);
+    const anonymousId = Pulse.currentUserId;
+    await Pulse.setUser("user-7");
+    testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("before-reset")]));
+    testSessionStorage.throwOnRemove = true;
+    testLocalStorage.throwOnRemove = true;
+
+    Pulse.reset({ scope: "tab" });
+
+    testSessionStorage.throwOnRemove = false;
+    testLocalStorage.throwOnRemove = false;
+    expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBe("");
+    expect(testSessionStorage.getItem(STORAGE_PREFIX + SESSION_ID_KEY)).toBe("");
+
+    fetchMock.mockClear();
+    expect(Pulse.init(config).reason).toBe("initialized");
+    expect(Pulse.currentUserId).not.toBe(anonymousId);
+    Pulse.info("after-reset");
+    await Pulse.flush();
+    await settle();
+
+    expect(requestPaths()).not.toContain("/v1/identity/claim");
+    expect(sentEvents().map((event) => event.message)).not.toContain("before-reset");
+  });
+
+  it("reports an unconfirmed deletion in debug output, and nothing without it", () => {
+    const output = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    Pulse.init(config);
+    testSessionStorage.throwOnRemove = true;
+    Pulse.reset({ scope: "tab" });
+    expect(output).not.toHaveBeenCalled();
+
+    testSessionStorage.throwOnRemove = false;
+    clearResetGuards();
+    Pulse.init({ ...config, debug: true });
+    testSessionStorage.throwOnRemove = true;
+
+    Pulse.reset({ scope: "tab" });
+
+    testSessionStorage.throwOnRemove = false;
+    expect(output.mock.calls.map((call) => String(call[0]))).toEqual([
+      "Pubky Pulse: tab reset could not be confirmed, deleting browser-wide instead",
+      "Pubky Pulse: browser-wide deletion could not be confirmed, overwriting and ignoring what survived",
+    ]);
+  });
+
+  it.each([
+    { label: "a default reset", args: [] as [] },
+    { label: "a tab reset", args: [{ scope: "tab" }] as [PulseResetOptions] },
+  ])("retires the fresh-session guard on the initialization after $label", ({ args }) => {
+    Pulse.init(config);
+
+    Pulse.reset(...args);
+
+    expect(Pulse.init(config).reason).toBe("initialized");
+    const sessionId = Pulse.sessionId;
+    expect(sessionId).toBeDefined();
+
+    // A later initialization is an ordinary one again: it resumes.
+    Pulse.configure(config);
+
+    expect(Pulse.sessionId).toBe(sessionId);
+  });
+
+  it("holds the fresh-session guard through an initialization that failed", () => {
+    Pulse.init(config);
+    const oldSessionId = Pulse.sessionId;
+    testSessionStorage.throwOnRemove = true;
+
+    Pulse.reset();
+
+    testSessionStorage.throwOnRemove = false;
+    // A store that refused the deletion still has the session where the
+    // session manager looks for it.
+    sessionStore.set(SESSION_ID_KEY, oldSessionId!);
+    sessionStore.set(SESSION_ACTIVITY_KEY, String(Date.now()));
+
+    const add = testWindow.addEventListener.bind(testWindow);
+    vi.spyOn(testWindow, "addEventListener").mockImplementation((type, callback, options) => {
+      if (type === "unhandledrejection") throw new Error("blocked listener");
+      add(type, callback, options);
+    });
+    expect(Pulse.init(config)).toEqual({ status: "error", reason: "initialization-failed" });
+    vi.restoreAllMocks();
+
+    expect(Pulse.init(config).reason).toBe("initialized");
     expect(Pulse.sessionId).not.toBe(oldSessionId);
   });
 

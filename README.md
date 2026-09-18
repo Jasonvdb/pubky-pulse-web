@@ -490,6 +490,16 @@ server is recalled by it; delete that server-side. Calling it before any initial
 no-op, and it never throws into your app. For the narrower job of tidying up a single tab, see
 [Cleaning up one stale tab](#cleaning-up-one-stale-tab).
 
+Some browsers refuse the deletion itself — a sandboxed iframe, a privacy mode, a host app that
+replaced `localStorage`, where `removeItem` throws while `getItem` keeps working. A reset that
+cannot confirm both storage areas are empty overwrites every key it can still see, so the old
+values are destroyed even for a later page load, and then trusts nothing this browser has stored
+for the rest of this page: no stored anonymous id is adopted, no stored user id is claimed, no
+stored session is resumed, and no events parked before the reset are replayed. The one residual
+limit is honest to state: on a store that blocks writes as well as removals, the old values are
+still physically there, and only this page's refusal to read them protects you — a reload starts
+trusting storage again.
+
 The promise waits for the flush and the claim request attempts. Those retry with exponential
 backoff, so against an endpoint that is failing or hanging the await can take a couple of minutes.
 When the browser is offline nothing is attempted: `setUser` returns straight away and the claim is
@@ -528,7 +538,8 @@ What it does not promise:
 - **An unconfirmed cleanup deletes more, not less.** If `sessionStorage` cannot be reached or a
   removal throws, the call falls back to the full browser reset, which can delete other tabs'
   queued events. So does any scope but the exact string `"tab"`. A deletion control has to fail
-  toward deleting.
+  toward deleting. If the browser refuses that deletion too, it is handled exactly as a refused
+  browser-wide reset: survivors overwritten, nothing stored trusted again on this page.
 - **Events this tab had already parked in the shared queue stay there** and are sent by whichever
   tab drains them next. The SDK cannot tell them from the other tabs' events. Replayed events never
   pass through `beforeSend`, so a hook cannot drop them either.

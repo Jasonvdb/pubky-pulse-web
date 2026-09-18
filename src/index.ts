@@ -29,6 +29,13 @@ import {
   type PulseQuestionnaireReceipt,
   type QuestionnaireContext,
 } from "./questionnaires";
+import {
+  clearResetGuards,
+  distrustStoredState,
+  freshSessionRequired,
+  requireFreshSession,
+  storedStateDistrusted,
+} from "./reset-guard";
 import { SessionManager } from "./session";
 import { localStore, sessionStore } from "./storage";
 import { Transport, type TransportStopOptions } from "./transport";
@@ -122,15 +129,6 @@ let recordingEvent = false;
 let diagnosing = false;
 let quietDisabled = false;
 /**
- * Set by every `Pulse.reset`, cleared by the next initialization that starts a
- * session. It makes that initialization refuse the stored session however fresh
- * it is: the reset deleted this tab's state, and a stored session that survived
- * the deletion — `sessionStorage.removeItem` can throw while `getItem` keeps
- * working — would otherwise be resumed under a newly minted anonymous id,
- * linking an old session to a new identity. Unobservable when storage works.
- */
-let freshSessionRequired = false;
-/**
  * Whether this session's debug network events are kept, decided once so a
  * sampled session carries a complete request timeline rather than a random
  * scattering of one. Keyed by session id, and re-decided when it changes.
@@ -142,7 +140,17 @@ const retiringAttachments = new Set<AttachmentUploader>();
 const uninstallers: Array<() => void> = [];
 
 function debugLog(message: string, detail?: unknown): void {
-  if (!config?.debug || diagnosing) return;
+  if (!config?.debug) return;
+  emitDebug(message, detail);
+}
+
+/**
+ * `debugLog` for the paths that have to decide for themselves whether debug
+ * output was asked for: `Pulse.reset` reports what its deletion could not do
+ * after `disableClient()` has already dropped the configuration.
+ */
+function emitDebug(message: string, detail?: unknown): void {
+  if (diagnosing) return;
   diagnosing = true;
   try {
     if (detail === undefined) console.error(`Pubky Pulse: ${message}`);
@@ -517,10 +525,39 @@ function disableClient(options?: TransportStopOptions): void {
   uninstallObservers();
 }
 
-/** Delete every value the SDK keeps in this browser, in both storage areas. */
-function purgeStoredState(): void {
+/**
+ * Delete every value the SDK keeps in this browser, in both storage areas.
+ * True only when both stores confirm nothing of the SDK's is left; a store
+ * that refused a removal, or that could not be looked at, reports false.
+ */
+function purgeStoredState(): boolean {
+  let confirmed = true;
   for (const store of [localStore, sessionStore]) {
     try { store.clear(); } catch { /* A hostile storage adapter cannot block the rest of the deletion. */ }
+    try {
+      if (!store.confirmCleared()) confirmed = false;
+    } catch { confirmed = false; }
+  }
+  return confirmed;
+}
+
+/**
+ * Overwrite whatever a refused deletion left behind with a harmless tombstone,
+ * so the old values are destroyed even on a page that reloads: `setItem` is a
+ * different failure mode from `removeItem` and still works on a store that
+ * only blocks removal. Every reader treats the empty string as an absent key —
+ * the identity manager adopts and claims nothing, the session manager resumes
+ * nothing, the offline queue parses no events — and a write the backend
+ * refuses too still lands in the storage fallback, which shadows the surviving
+ * value for the life of this page. Best effort: a store that cannot even be
+ * enumerated leaves survivors this cannot see, which is what the distrust
+ * guard is for.
+ */
+function overwriteStoredSurvivors(): void {
+  for (const store of [localStore, sessionStore]) {
+    try {
+      for (const key of store.keys("")) store.set(key, "");
+    } catch { /* A hostile storage adapter cannot block the rest of the overwrite. */ }
   }
 }
 
@@ -561,11 +598,13 @@ function initializeClient(validated: ValidatedConfig): void {
   quietDisabled = false;
   config = validated;
   try {
+    // A deletion this browser refused leaves stored state nothing may adopt.
+    const distrusted = storedStateDistrusted();
     deviceInfo = collectDeviceInfo(
       { os: validated.deviceInfoOs, browser: validated.deviceInfoBrowser, language: validated.deviceInfoLanguage },
       validated.supportedLanguages,
     );
-    offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message));
+    offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message), { inert: distrusted });
     transport = new Transport(validated, offlineQueue, debugLog);
     attachments = new AttachmentUploader(validated, debugLog);
     const clientTransport = transport;
@@ -578,11 +617,11 @@ function initializeClient(validated: ValidatedConfig): void {
     session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks);
     // Install reversible collectors before creating identity/session data.
     installObservers(validated);
-    identity.load();
+    identity.load({ trustStored: !distrusted });
     initializing = false;
-    session.start(Date.now(), { resume: !freshSessionRequired });
-    // Only a start that actually happened may retire the guard.
-    freshSessionRequired = false;
+    session.start(Date.now(), { resume: !freshSessionRequired() });
+    // Only a start that actually happened may retire the guards.
+    clearResetGuards();
     const screenName = pageTracker?.screenName;
     if (screenName !== undefined) screenCallbacks.onAppeared(screenName);
     unconfiguredWarningShown = false;
@@ -691,6 +730,10 @@ export interface PulseApi {
    * initialization can replay it; `reset()` deletes it. A later `init` starts
    * as a new browser with a fresh anonymous id. Nothing already sent to the
    * server is recalled, and `clearUser` is not a deletion control.
+   *
+   * A browser that refuses the deletion does not get to keep the data: what
+   * survived is overwritten, and nothing stored is adopted, claimed, resumed
+   * or replayed for the rest of this page's life.
    *
    * `reset({ scope: "tab" })` narrows the deletion to this tab: its session is
    * deleted and its queue writers are retired, while the anonymous id and the
@@ -889,8 +932,11 @@ export const Pulse: PulseApi = {
       tabScoped = options?.scope === "tab";
     } catch { /* An unreadable option is not permission to delete less. */ }
 
-    // Both scopes: a browser-wide purge can leave a session behind too.
-    freshSessionRequired = true;
+    // Read before the teardown drops the configuration this reads it from.
+    let debug = false;
+    try { debug = config?.debug === true; } catch { /* Diagnostics are optional. */ }
+
+    requireFreshSession();
 
     // Deletion has to happen even if tearing the pipeline down goes wrong.
     try { disableClient({ discardReplay: true }); } catch { /* Consent withdrawal never throws into the host app. */ }
@@ -904,9 +950,17 @@ export const Pulse: PulseApi = {
         sessionStore.clear();
         if (sessionStore.confirmCleared()) return;
       } catch { /* An unconfirmed cleanup falls through to the full deletion. */ }
+      if (debug) emitDebug("tab reset could not be confirmed, deleting browser-wide instead");
     }
 
-    purgeStoredState();
+    if (!purgeStoredState()) {
+      // The browser kept data the user asked us to delete. Destroy the values
+      // that survived, and trust nothing stored for the rest of this page in
+      // case that overwrite was refused too.
+      overwriteStoredSurvivors();
+      distrustStoredState();
+      if (debug) emitDebug("browser-wide deletion could not be confirmed, overwriting and ignoring what survived");
+    }
   },
 
   async sendFeedback(

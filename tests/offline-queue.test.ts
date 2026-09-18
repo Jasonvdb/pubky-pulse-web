@@ -166,6 +166,29 @@ describe("OfflineQueue", () => {
     expect(queue.read()).toEqual([]);
   });
 
+  it("parses no events from the tombstone a refused deletion leaves", async () => {
+    // What `Pulse.reset` writes over keys the browser would not remove.
+    testLocalStorage.setItem(QUEUE_KEY, "");
+    testLocalStorage.setItem(`${SPILL_PREFIX}000000001757000:a`, "");
+
+    expect(queue.read()).toEqual([]);
+    await expect(queue.drain()).resolves.toEqual([]);
+  });
+
+  it("drains, parks and spills nothing at all when it is created inert", async () => {
+    const storage = new SafeStorage("local");
+    await new OfflineQueue(storage).append([makeEvent(0)]);
+    const inert = new OfflineQueue(storage, undefined, { inert: true });
+
+    await inert.append([makeEvent(1)]);
+    inert.spill([makeEvent(2)]);
+
+    expect(spillKeys()).toEqual([]);
+    await expect(inert.drain()).resolves.toEqual([]);
+    // Nothing was read, so nothing was removed either.
+    expect(JSON.parse(testLocalStorage.getItem(QUEUE_KEY)!)).toHaveLength(1);
+  });
+
   describe("spill", () => {
     it("writes a key of its own instead of the shared one", async () => {
       await queue.append([makeEvent(0)]);
