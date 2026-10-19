@@ -191,7 +191,12 @@ export class AttachmentUploader {
     // A vetoed drain can finish synchronously, so it clears `draining` only
     // after this assignment, and only while it is still the current drain.
     const draining = this.drain().finally(() => {
-      if (this.draining === draining) this.draining = null;
+      if (this.draining !== draining) return;
+      this.draining = null;
+      // An enqueue() that ran while this drain was settling saw it still set
+      // and skipped starting one; restart so that item is not stranded. The
+      // gate is asked once here, so a veto ends the chain instead of looping.
+      if (!this.stopped && this.pending.length > 0 && this.deliveryAllowed()) this.startDrain();
     });
     this.draining = draining;
   }

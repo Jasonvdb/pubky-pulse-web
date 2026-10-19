@@ -25,8 +25,12 @@ export function createDeliveryGate(
     if (checking) return false;
     checking = true;
     try {
-      const allowed = canDeliver() === true;
-      if (!allowed) debug("canDeliver vetoed delivery, holding events");
+      const result: unknown = canDeliver();
+      const allowed = result === true;
+      if (!allowed) {
+        silenceRejection(result);
+        debug("canDeliver vetoed delivery, holding events");
+      }
       return allowed;
     } catch (error) {
       debug("canDeliver threw, holding events", error);
@@ -35,4 +39,14 @@ export function createDeliveryGate(
       checking = false;
     }
   };
+}
+
+/** Keep a vetoing promise's rejection from surfacing as an unhandled rejection. */
+function silenceRejection(result: unknown): void {
+  try {
+    if ((typeof result === "object" || typeof result === "function") && result !== null) {
+      const then = (result as { then?: unknown }).then;
+      if (typeof then === "function") Reflect.apply(then, result, [undefined, () => {}]);
+    }
+  } catch { /* A hostile thenable cannot change the veto. */ }
 }

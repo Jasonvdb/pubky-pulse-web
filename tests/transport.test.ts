@@ -1266,6 +1266,48 @@ describe("Transport", () => {
       expect(vi.getTimerCount()).toBe(1);
     });
 
+    it("withholds the claim when its pre-flush was vetoed, even if the claim itself is allowed", async () => {
+      // Up-front check allows, the pre-flush is vetoed, then the claim's own post would be allowed.
+      const answers = [true, false];
+      canDeliver.mockImplementation(() => answers.shift() ?? true);
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+
+      expect(fetchMock.mock.calls.map((call) => call[0])).not.toContain("https://pulse.example.com/v1/identity/claim");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("withholds the claim when the pre-flush batch itself was vetoed and put back", async () => {
+      // Up-front and flush-start checks allow; the batch's own post is vetoed.
+      const answers = [true, true, false];
+      canDeliver.mockImplementation(() => answers.shift() ?? true);
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+    });
+
+    it("flushes then claims, in order, while delivery is allowed", async () => {
+      allowed = true;
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(true);
+
+      expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+        "https://pulse.example.com/v1/ingest",
+        "https://pulse.example.com/v1/identity/claim",
+      ]);
+      expect(tx.bufferSize).toBe(0);
+    });
+
     it("still submits feedback", async () => {
       fetchMock.mockResolvedValue(
         new Response(JSON.stringify({ id: "fb_1", created_at: "2026-09-04T00:00:00Z" }), { status: 201 }),

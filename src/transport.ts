@@ -115,6 +115,8 @@ export class Transport {
   private readonly eventBytes = new WeakMap<LogEvent, number>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private flushing: Promise<void> | null = null;
+  /** Flush runs a `canDeliver` veto stopped, so every caller awaiting one sees it. */
+  private readonly heldFlushes = new WeakSet<Promise<void>>();
   private lastUnloadFlushAt = 0;
   private stopped = false;
   private readonly requests = new Map<AbortController, ReturnType<typeof setTimeout>>();
@@ -307,12 +309,15 @@ export class Transport {
 
   /**
    * Drain the offline queue and the in-memory buffer. Concurrent callers await
-   * the in-flight pass instead of interleaving batches.
+   * the in-flight pass instead of interleaving batches. A pass a `canDeliver`
+   * veto stopped is recorded in `heldFlushes`.
    */
   flush(): Promise<void> {
     if (this.stopped) return Promise.resolve();
     if (this.flushing) return this.flushing;
-    const run = this.runFlush().catch((error: unknown) => {
+    const run: Promise<void> = this.runFlush().then((held) => {
+      if (held) this.heldFlushes.add(run);
+    }, (error: unknown) => {
       this.onDebug?.("failed to flush events", error);
     }).finally(() => {
       // A flush started from inside `canDeliver` settles while the outer pass
@@ -456,9 +461,13 @@ export class Transport {
    * buffered afterwards is already stamped with the new id by the caller.
    */
   async claimIdentity(anonymousId: string, userId: string): Promise<boolean> {
-    // A vetoed flush and claim both come back unsent, so the identity manager
-    // retries the claim on a later init.
-    await this.flush();
+    // A vetoed flush or claim comes back unsent, so the identity manager
+    // retries the claim on a later init. The claim must never overtake
+    // anonymous events a vetoed pre-flush held back: the server runs it once.
+    if (!this.deliveryAllowed()) return false;
+    const flushed = this.flush();
+    await flushed;
+    if (this.heldFlushes.has(flushed)) return false;
     const outcome = await this.post(
       "/v1/identity/claim",
       { anonymous_id: anonymousId, user_id: userId },
@@ -525,20 +534,21 @@ export class Transport {
     return { id: payload.id, createdAt };
   }
 
-  private async runFlush(): Promise<void> {
+  /** Resolves `true` when a `canDeliver` veto held events back. */
+  private async runFlush(): Promise<boolean> {
     if (!isOnline()) {
       this.onDebug?.("offline, skipping flush");
-      return;
+      return false;
     }
     // Before the drain, so a veto leaves the offline queue and buffer untouched;
     // the interval asks again on its next tick.
-    if (!this.deliveryAllowed()) return;
+    if (!this.deliveryAllowed()) return true;
 
     let parked = await this.queue.drain(() => !this.stopped);
     for (const event of parked) this.replayed.add(event);
     if (this.stopped) {
       this.restoreReplay();
-      return;
+      return false;
     }
     if (parked.length > 0) {
       this.rebufferAhead(parked);
@@ -549,12 +559,12 @@ export class Transport {
     while (!this.stopped && this.buffer.length > 0) {
       const batch = this.takeBuffered(MAX_BATCH_SIZE);
       const outcome = await this.sendBatch(batch);
-      if (this.stopped) return;
+      if (this.stopped) return false;
       if (outcome === "held") {
         // Vetoed mid-flush: keep the batch in memory, in order, for the next
         // tick. An unload flush that already took the batch owns it now.
         if (!this.inFlightTaken) this.rebufferAhead(batch);
-        return;
+        return true;
       }
       if (outcome === "park") {
         // The endpoint is unreachable: park this batch and everything behind
@@ -564,9 +574,10 @@ export class Transport {
         const toPark = this.inFlightTaken ? rest : [...batch, ...rest];
         await this.queue.append(toPark, () => !this.stopped);
         if (!this.stopped) this.forgetReplay(toPark);
-        return;
+        return false;
       }
     }
+    return false;
   }
 
   private async sendBatch(events: LogEvent[]): Promise<BatchOutcome> {

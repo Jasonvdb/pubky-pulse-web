@@ -431,7 +431,8 @@ describe("AttachmentUploader canDeliver gate", () => {
       { data: new Uint8Array([2]), filename: "two.bin" },
     ]);
     await uploader.flush();
-    expect(checks).toBe(2);
+    // The drain's check, the reservation's veto, then the settling drain's one restart check.
+    expect(checks).toBe(3);
     expect(fetchMock).not.toHaveBeenCalled();
 
     allowed = true;
@@ -461,6 +462,32 @@ describe("AttachmentUploader canDeliver gate", () => {
     await uploader.flush();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(await freeRetentionSlots()).toBe(MAX_ATTACHMENT_QUEUE_ITEMS);
+  });
+
+  it("does not strand an item enqueued while a vetoed drain is still settling", async () => {
+    const uploader = new AttachmentUploader(makeConfig(canDeliver), debug);
+
+    // The veto ends this drain synchronously, but it is cleared only in a later microtask.
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
+    allowed = true;
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([2]), filename: "two.bin" }]);
+
+    // No flush(): the settling drain must restart on its own.
+    await vi.waitFor(() => expect(callsTo("uploads.example.com")).toHaveLength(2));
+    expect(reservedFilenames()).toEqual(["one.bin", "two.bin"]);
+  });
+
+  it("does not restart a settling drain while delivery stays vetoed", async () => {
+    let checks = 0;
+    const uploader = new AttachmentUploader(makeConfig(() => { checks += 1; return false; }), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // One check in the drain, one in its settling restart check, then nothing.
+    expect(checks).toBe(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+    uploader.stop();
   });
 
   it("releases held attachments on stop and never sends them", async () => {

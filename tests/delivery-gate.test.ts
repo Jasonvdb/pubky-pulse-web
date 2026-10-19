@@ -52,6 +52,25 @@ describe("createDeliveryGate", () => {
     expect(onDebug).toHaveBeenCalledTimes(1);
   });
 
+  it("vetoes a rejected Promise without leaving an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const listener = (reason: unknown) => { unhandled.push(reason); };
+    process.on("unhandledRejection", listener);
+    try {
+      const gate = createDeliveryGate(() => Promise.reject(new Error("x")) as unknown as boolean);
+      expect(gate()).toBe(false);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", listener);
+    }
+  });
+
+  it("vetoes a thenable whose then throws", () => {
+    const thenable = { then: () => { throw new Error("hostile"); } };
+    expect(createDeliveryGate(() => thenable as unknown as boolean)()).toBe(false);
+  });
+
   it("vetoes a throwing callback and logs the error", () => {
     const error = new Error("consent store unavailable");
     const onDebug = vi.fn();
