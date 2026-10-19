@@ -202,6 +202,42 @@ export class Transport {
   }
 
   /**
+   * The one way events this transport could not send reach the offline queue;
+   * only `restoreReplay` writes there otherwise, and it only hands back what a
+   * drain took out. `canDeliver` is asked again here, because consent can be
+   * withdrawn after the send that failed: a veto never persists. The events go
+   * back ahead of the buffer instead, where replayed ones stay tracked so
+   * `stop()` returns them to storage once, or, with `"discard"` as on
+   * shutdown, are dropped. `"spill"` is the synchronous unload write; it
+   * returns the veto at once. `"append"` waits for the cross-tab lock.
+   * Either way the result is true when the veto held the events back.
+   */
+  private park(events: LogEvent[], how: "spill"): boolean;
+  private park(events: LogEvent[], how: "append", onVeto?: "rebuffer" | "discard"): Promise<boolean>;
+  private park(events: LogEvent[], how: "append" | "spill", onVeto: "rebuffer" | "discard" = "rebuffer"): boolean | Promise<boolean> {
+    const done = (held: boolean): boolean | Promise<boolean> => how === "spill" ? held : Promise.resolve(held);
+    if (this.stopped || events.length === 0) return done(false);
+    if (!this.deliveryAllowed()) {
+      if (onVeto === "discard") {
+        this.onDebug?.(`delivery vetoed, discarding ${events.length} events on shutdown`);
+      } else {
+        this.onDebug?.(`delivery vetoed, keeping ${events.length} events in memory instead of parking them`);
+        this.rebufferAhead(events);
+      }
+      return done(true);
+    }
+    if (how === "spill") {
+      this.queue.spill(events);
+      this.forgetReplay(events);
+      return false;
+    }
+    return this.queue.append(events, () => !this.stopped).then(() => {
+      if (!this.stopped) this.forgetReplay(events);
+      return false;
+    });
+  }
+
+  /**
    * Hand the retained replay back to the offline queue, or drop it once a
    * `stop({ discardReplay: true })` has been seen. The discard is sticky for
    * the life of the stopped transport, so every later call — including the one
@@ -341,12 +377,8 @@ export class Transport {
     try {
       await this.flush();
       // The flush is a no-op while offline, so park what it could not send.
-      const left = this.takeBuffered();
-      if (!this.stopped && left.length > 0) {
-        // Held events are never persisted: stop() below discards them instead.
-        if (this.deliveryAllowed()) await this.queue.append(left, () => !this.stopped);
-        else this.onDebug?.(`delivery vetoed, discarding ${left.length} events on shutdown`);
-      }
+      // Held events are never persisted: stop() below discards them instead.
+      await this.park(this.takeBuffered(), "append", "discard");
     } catch (error) {
       this.onDebug?.("failed to park remaining events", error);
     } finally {
@@ -383,8 +415,7 @@ export class Transport {
     if (!isOnline()) {
       // `visibilitychange` reaches this path on a page that stays alive, so
       // park everything rather than firing a request that cannot succeed.
-      this.queue.spill(pending);
-      this.forgetReplay(pending);
+      this.park(pending, "spill");
       this.onDebug?.("offline, skipping keepalive flush");
       return;
     }
@@ -392,31 +423,24 @@ export class Transport {
     if (now < this.backoffUntil) {
       // The server asked for a delay and a hidden page is no reason to ignore
       // it. Park everything instead; it goes out on the next flush or load.
-      this.queue.spill(pending);
-      this.forgetReplay(pending);
+      this.park(pending, "spill");
       this.onDebug?.("waiting out Retry-After, skipping keepalive flush");
       return;
     }
 
     const { batch, rest } = sliceForKeepalive(pending, this.config.bundleId);
-    if (rest.length > 0) {
-      this.queue.spill(rest);
-      this.forgetReplay(rest);
+    if (this.park(rest, "spill")) {
+      // Vetoed since the check above: hold the batch too, ahead of `rest`.
+      this.rebufferAhead(batch);
+      return;
     }
     if (batch.length === 0) return;
 
     const body: IngestRequest = { bundle_id: this.config.bundleId, events: batch };
+    // Consent may have been withdrawn while the request ran; `park` keeps the
+    // batch in memory then instead of persisting it.
     const repark = (): void => {
-      if (this.stopped) return;
-      // Consent may have been withdrawn while the request ran: never persist
-      // after a veto. Keep the batch in memory instead, as the held flush path
-      // does: replayed events stay tracked, so stop() restores them once.
-      if (!this.deliveryAllowed()) {
-        this.onDebug?.(`delivery vetoed, keeping ${batch.length} keepalive events in memory`);
-        this.rebufferAhead(batch);
-        return;
-      }
-      void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);
+      void this.park(batch, "append").catch(() => undefined);
     };
     try {
       void this.request(`${this.config.endpoint}/v1/ingest`, {
@@ -443,10 +467,7 @@ export class Transport {
     } catch (err) {
       // Still inside the unload turn, so this one has to be the sync path.
       this.onDebug?.("keepalive flush failed", err);
-      if (!this.stopped) {
-        this.queue.spill(batch);
-        this.forgetReplay(batch);
-      }
+      this.park(batch, "spill");
     }
   }
 
@@ -564,12 +585,20 @@ export class Transport {
     // the interval asks again on its next tick.
     if (!this.deliveryAllowed()) return true;
 
-    let parked = await this.queue.drain(() => !this.stopped);
+    // Asked again once the drain holds the lock: waiting on another tab can
+    // outlast the consent the check above saw, and a veto there removes nothing.
+    let vetoedDrain = false;
+    let parked = await this.queue.drain(() => {
+      if (this.stopped) return false;
+      vetoedDrain = !this.deliveryAllowed();
+      return !vetoedDrain;
+    });
     for (const event of parked) this.replayed.add(event);
     if (this.stopped) {
       this.restoreReplay();
       return false;
     }
+    if (vetoedDrain) return true;
     if (parked.length > 0) {
       this.rebufferAhead(parked);
       // A stalled request must not keep discarded replay events alive.
@@ -590,11 +619,10 @@ export class Transport {
         // The endpoint is unreachable: park this batch and everything behind
         // it rather than burning retries on each remaining batch. An unload
         // flush that already took the batch has parked or sent it itself.
+        // A veto since the last attempt keeps them in memory instead.
         const rest = this.takeBuffered();
         const toPark = this.inFlightTaken ? rest : [...batch, ...rest];
-        await this.queue.append(toPark, () => !this.stopped);
-        if (!this.stopped) this.forgetReplay(toPark);
-        return false;
+        return await this.park(toPark, "append");
       }
     }
     return false;
