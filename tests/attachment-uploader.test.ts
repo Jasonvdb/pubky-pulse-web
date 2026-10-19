@@ -496,6 +496,46 @@ describe("AttachmentUploader canDeliver gate", () => {
     uploader.stop();
   });
 
+  it("resumes a held item from resumeHeld() once allowed, asking the gate once per call while vetoed", async () => {
+    let checks = 0;
+    const uploader = gatedUploader(makeConfig(() => { checks += 1; return allowed; }), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "held.bin" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    checks = 0;
+
+    uploader.resumeHeld();
+    uploader.resumeHeld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(checks).toBe(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    allowed = true;
+    uploader.resumeHeld();
+    await vi.waitFor(() => expect(callsTo("uploads.example.com")).toHaveLength(1));
+    // Nothing pending: later calls neither ask the gate nor send anything.
+    checks = 0;
+    uploader.resumeHeld();
+    await uploader.flush();
+    expect(checks).toBe(0);
+    expect(reservedFilenames()).toEqual(["held.bin"]);
+  });
+
+  it("does nothing from resumeHeld() after stop", async () => {
+    let checks = 0;
+    const uploader = gatedUploader(makeConfig(() => { checks += 1; return allowed; }), debug);
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "held.bin" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    uploader.stop();
+    checks = 0;
+
+    allowed = true;
+    uploader.resumeHeld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(checks).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("releases held attachments on stop and never sends them", async () => {
     const uploader = gatedUploader(makeConfig(canDeliver), debug);
 

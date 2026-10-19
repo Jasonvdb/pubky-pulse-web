@@ -591,8 +591,9 @@ While the callback vetoes:
 - The buffer caps still apply, so the oldest events are dropped once the buffer is full.
 - `Pulse.reset()` deletes the held events.
 - `Pulse.shutdown()` discards the held events instead of storing them.
-- An attachment waits in its queue until delivery is allowed. An attachment vetoed after its
-  reservation reached the server, but before its upload, is abandoned.
+- An attachment waits in its queue until delivery is allowed; the next interval tick or flush then
+  uploads it. An attachment vetoed after its reservation reached the server, but before its upload,
+  is abandoned.
 - `setUser` switches the id but sends no claim. The claim is retried on a later `init`.
 
 ### Several apps on one origin

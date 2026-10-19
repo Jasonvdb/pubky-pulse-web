@@ -2826,6 +2826,80 @@ describe("Pulse feedback, questionnaires and attachments", () => {
     });
   });
 
+  describe("attachments a canDeliver veto held", () => {
+    const intervalMs = 5000;
+    let consent: boolean;
+    let checks: number;
+    const canDeliver = (): boolean => {
+      checks += 1;
+      return consent;
+    };
+    const attachmentCalls = (): number =>
+      fetchMock.mock.calls.filter((call) => (call[0] as string).includes("/v1/ingest/attachment")).length;
+    const uploadCalls = (): number =>
+      fetchMock.mock.calls.filter((call) => (call[0] as string).startsWith("https://uploads.example.com/")).length;
+
+    beforeEach(() => {
+      consent = false;
+      checks = 0;
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("resume on the flush interval once consent returns, without a flush or new enqueue", async () => {
+      Pulse.configure({ ...config, flushIntervalMs: intervalMs, canDeliver });
+      Pulse.error("upload_failed", undefined, {
+        attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // While vetoed, each tick asks once for the event flush and once for the
+      // held attachment, and fetches nothing.
+      checks = 0;
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(checks).toBe(3 * 2);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      consent = true;
+      await vi.advanceTimersByTimeAsync(intervalMs);
+      expect(appEvents().map((event) => event.message)).toContain("upload_failed");
+      expect(attachmentCalls()).toBe(1);
+      expect(uploadCalls()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(attachmentCalls()).toBe(1);
+      expect(uploadCalls()).toBe(1);
+    });
+
+    it("cost one check per tick with no attachments held", async () => {
+      Pulse.configure({ ...config, flushIntervalMs: intervalMs, canDeliver });
+      await vi.advanceTimersByTimeAsync(0);
+      checks = 0;
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(checks).toBe(3);
+    });
+
+    it("are not resumed by the interval after reset", async () => {
+      Pulse.configure({ ...config, flushIntervalMs: intervalMs, canDeliver });
+      Pulse.error("upload_failed", undefined, {
+        attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      Pulse.reset();
+      consent = true;
+      checks = 0;
+
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(checks).toBe(0);
+      expect(attachmentCalls()).toBe(0);
+      expect(uploadCalls()).toBe(0);
+    });
+  });
+
   it("does not schedule attachments when beforeSend drops their event", async () => {
     Pulse.configure({ ...config, beforeSend: () => null });
     Pulse.error("expected", undefined, {

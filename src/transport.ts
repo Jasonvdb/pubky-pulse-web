@@ -147,6 +147,8 @@ export class Transport {
    * sleeping batch straight away over keepalive.
    */
   private backoffUntil = 0;
+  /** Runs after each interval flush starts; see `setIntervalTick`. Cleared by `stop()`. */
+  private intervalTick: (() => void) | null = null;
 
   constructor(
     config: ValidatedConfig,
@@ -166,7 +168,18 @@ export class Transport {
     };
     this.timer = setInterval(() => {
       void this.flush();
+      if (this.stopped) return;
+      try { this.intervalTick?.(); } catch (error) { this.onDebug?.("interval hook failed", error); }
     }, config.flushIntervalMs);
+  }
+
+  /**
+   * Run `handler` on every interval tick, right after the tick's flush starts,
+   * so work held outside this transport (attachments a `canDeliver` veto left
+   * queued) resumes on the same schedule. It never runs after `stop()`.
+   */
+  setIntervalTick(handler: (() => void) | null): void {
+    this.intervalTick = this.stopped ? null : handler;
   }
 
   /**
@@ -177,6 +190,7 @@ export class Transport {
   stop(options?: TransportStopOptions): void {
     if (options?.discardReplay === true) this.discardReplay = true;
     this.stopped = true;
+    this.intervalTick = null;
     if (this.timer !== null) {
       try { clearInterval(this.timer); } catch { /* A retained interval becomes inert after stop. */ }
     }

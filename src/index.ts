@@ -628,7 +628,11 @@ function initializeClient(validated: ValidatedConfig): void {
     );
     const clientTransport = new Transport(validated, offlineQueue, debugLog, deliveryAllowed);
     transport = clientTransport;
-    attachments = new AttachmentUploader(validated, debugLog, deliveryAllowed);
+    const clientAttachments = new AttachmentUploader(validated, debugLog, deliveryAllowed);
+    attachments = clientAttachments;
+    // The interval only flushes events; this resumes attachments a veto held
+    // once consent returns, without waiting for another enqueue or flush.
+    clientTransport.setIntervalTick(() => clientAttachments.resumeHeld());
     identity = new IdentityManager({
       claim: async (anonymousId, userId) => {
         await clientTransport.claimIdentity(anonymousId, userId);

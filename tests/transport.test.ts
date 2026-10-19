@@ -198,6 +198,32 @@ describe("Transport", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("runs the interval tick hook once per interval, and never after stop", async () => {
+    const tx = createTransport({ flushIntervalMs: 5000 });
+    const tick = vi.fn();
+    tx.setIntervalTick(tick);
+
+    await vi.advanceTimersByTimeAsync(5000 * 2);
+    expect(tick).toHaveBeenCalledTimes(2);
+
+    tx.stop();
+    tx.setIntervalTick(tick);
+    await vi.advanceTimersByTimeAsync(5000 * 2);
+    expect(tick).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps flushing on the interval when the tick hook throws", async () => {
+    const tx = createTransport({ flushIntervalMs: 5000 });
+    tx.setIntervalTick(() => { throw new Error("hook failed"); });
+    tx.enqueue(makeEvent(0));
+
+    await vi.advanceTimersByTimeAsync(5000);
+    tx.enqueue(makeEvent(1));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    tx.stop();
+  });
+
   it("does not mutate a queued replay after stop while waiting for a storage lock", async () => {
     await queue.append([makeEvent(0)]);
     testNavigator.locks = new TestLockManager();

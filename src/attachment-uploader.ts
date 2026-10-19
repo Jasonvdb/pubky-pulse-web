@@ -6,8 +6,9 @@
  * The host's `canDeliver` check runs before each item leaves the queue, right
  * before its reservation, and right before its PUT. A veto up to the
  * reservation holds the item at the head of the queue, still counted against
- * the retention caps, until the next `enqueue()` or `flush()` restarts the
- * queue; `stop()` discards it. A veto after the reservation abandons that item:
+ * the retention caps, until the next `enqueue()`, `flush()` or `resumeHeld()`
+ * (the client calls it on every transport interval tick) restarts the queue;
+ * `stop()` discards it. A veto after the reservation abandons that item:
  * the server already knows about the reservation, so holding the bytes would
  * not keep the upload private.
  */
@@ -205,6 +206,17 @@ export class AttachmentUploader {
       if (!this.stopped && this.pending.length > 0 && this.deliveryAllowed()) this.startDrain();
     });
     this.draining = draining;
+  }
+
+  /**
+   * Restart a queue a `canDeliver` veto left holding items. It does nothing
+   * unless items are pending and no drain is running, and asks the gate once,
+   * so a tick while still vetoed costs one check and no request.
+   */
+  resumeHeld(): void {
+    if (this.stopped || this.draining || this.pending.length === 0) return;
+    if (!this.deliveryAllowed()) return;
+    this.startDrain();
   }
 
   private snapshot(clientEventId: string, userId: string | undefined, attachment: PulseAttachment): PendingUpload | null {
