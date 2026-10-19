@@ -37,7 +37,7 @@ import {
   storedStateDistrusted,
 } from "./reset-guard";
 import { SessionManager } from "./session";
-import { localStore, sessionStore } from "./storage";
+import { enumerateNamespaces, isValidStorageNamespace, storesFor, type StorePair } from "./storage";
 import { Transport, type TransportStopOptions } from "./transport";
 import { installUnhandledCapture, type UnhandledKind } from "./unhandled-capture";
 import {
@@ -115,6 +115,8 @@ let transport: Transport | null = null;
 let offlineQueue: OfflineQueue | null = null;
 let deviceInfo: DeviceInfo = {};
 let session: SessionManager | null = null;
+/** The running client's storage namespace's stores; null while none runs. */
+let activeStores: StorePair | null = null;
 let identity: IdentityManager | null = null;
 let unconfiguredWarningShown = false;
 let pageTracker: PageTracker | null = null;
@@ -510,6 +512,7 @@ function disableClient(options?: TransportStopOptions): void {
   attachments = null;
   identity = null;
   session = null;
+  activeStores = null;
   offlineQueue = null;
   deviceInfo = {};
   const stopTransport = (previous: Transport | null): void => {
@@ -526,19 +529,22 @@ function disableClient(options?: TransportStopOptions): void {
 }
 
 /**
- * Delete every value the SDK keeps in this browser, in both storage areas.
- * True only when both stores confirm nothing of the SDK's is left; a store
- * that refused a removal, or that could not be looked at, reports false.
+ * Delete every value the SDK keeps in this browser for each given namespace,
+ * in both storage areas. Returns the pairs whose deletion is unconfirmed: a
+ * store that refused a removal, or that could not be looked at, does not
+ * confirm, and its pair is returned.
  */
-function purgeStoredState(): boolean {
-  let confirmed = true;
-  for (const store of [localStore, sessionStore]) {
-    try { store.clear(); } catch { /* A hostile storage adapter cannot block the rest of the deletion. */ }
-    try {
-      if (!store.confirmCleared()) confirmed = false;
-    } catch { confirmed = false; }
-  }
-  return confirmed;
+function purgeStoredState(pairs: readonly StorePair[]): StorePair[] {
+  return pairs.filter((pair) => {
+    let confirmed = true;
+    for (const store of [pair.local, pair.session]) {
+      try { store.clear(); } catch { /* A hostile storage adapter cannot block the rest of the deletion. */ }
+      try {
+        if (!store.confirmCleared()) confirmed = false;
+      } catch { confirmed = false; }
+    }
+    return !confirmed;
+  });
 }
 
 /**
@@ -553,12 +559,24 @@ function purgeStoredState(): boolean {
  * enumerated leaves survivors this cannot see, which is what the distrust
  * guard is for.
  */
-function overwriteStoredSurvivors(): void {
-  for (const store of [localStore, sessionStore]) {
-    try {
-      for (const key of store.keys("")) store.set(key, "");
-    } catch { /* A hostile storage adapter cannot block the rest of the overwrite. */ }
+function overwriteStoredSurvivors(pairs: readonly StorePair[]): void {
+  for (const pair of pairs) {
+    for (const store of [pair.local, pair.session]) {
+      try {
+        for (const key of store.keys("")) store.set(key, "");
+      } catch { /* A hostile storage adapter cannot block the rest of the overwrite. */ }
+    }
   }
+}
+
+/**
+ * The store pairs a browser-wide deletion that must not delete less covers:
+ * the default namespace and every namespace this browser shows a trace of.
+ * The running client's is among them even when storage shows nothing for it,
+ * because `enumerateNamespaces` also lists every pair this realm has created.
+ */
+function everyStorePair(): StorePair[] {
+  return [undefined, ...enumerateNamespaces()].map((namespace) => storesFor(namespace));
 }
 
 async function drainClient(previousTransport: Transport | null, previousAttachments: AttachmentUploader | null): Promise<void> {
@@ -597,14 +615,17 @@ function initializeClient(validated: ValidatedConfig): void {
   initializing = true;
   quietDisabled = false;
   config = validated;
+  const namespace = validated.storageNamespace;
   try {
+    const stores = storesFor(namespace);
+    activeStores = stores;
     // A deletion this browser refused leaves stored state nothing may adopt.
-    const distrusted = storedStateDistrusted();
+    const distrusted = storedStateDistrusted(namespace);
     deviceInfo = collectDeviceInfo(
       { os: validated.deviceInfoOs, browser: validated.deviceInfoBrowser, language: validated.deviceInfoLanguage },
       validated.supportedLanguages,
     );
-    offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message), { inert: distrusted });
+    offlineQueue = new OfflineQueue(stores.local, (message) => debugLog(message), { inert: distrusted });
     transport = new Transport(validated, offlineQueue, debugLog);
     attachments = new AttachmentUploader(validated, debugLog);
     const clientTransport = transport;
@@ -613,15 +634,16 @@ function initializeClient(validated: ValidatedConfig): void {
         await clientTransport.claimIdentity(anonymousId, userId);
       },
       onDebug: debugLog,
-    });
-    session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks);
+    }, stores.local);
+    session = new SessionManager(validated.sessionTimeoutMs, sessionCallbacks, stores.session);
     // Install reversible collectors before creating identity/session data.
     installObservers(validated);
     identity.load({ trustStored: !distrusted });
     initializing = false;
-    session.start(Date.now(), { resume: !freshSessionRequired() });
-    // Only a start that actually happened may retire the guards.
-    clearResetGuards();
+    session.start(Date.now(), { resume: !freshSessionRequired(namespace) });
+    // Only a start that actually happened may retire the guards, and only
+    // this namespace's: another namespace's reset is not this one's to spend.
+    clearResetGuards(namespace);
     const screenName = pageTracker?.screenName;
     if (screenName !== undefined) screenCallbacks.onAppeared(screenName);
     unconfiguredWarningShown = false;
@@ -743,6 +765,16 @@ export interface PulseApi {
    * tab-scoped cleanup this SDK cannot confirm, deletes browser-wide instead.
    * A later `init` in this tab adopts the shared anonymous id — including one
    * another tab has replaced meanwhile — and always starts a new session.
+   *
+   * Every reset acts on one storage namespace (see
+   * `PulseConfiguration.storageNamespace`): `options.storageNamespace` when
+   * given, otherwise the running client's, otherwise the default one — so a
+   * consent-withdrawal page can reset an app it never initialized. Other
+   * namespaces' stored state and reset guards are left untouched. An invalid
+   * namespace, or any option getter that throws, deletes every namespace this
+   * browser shows a trace of browser-wide, the default and the running
+   * client's included, whatever the scope. Whichever namespace is targeted,
+   * the running client is disabled.
    */
   reset(options?: PulseResetOptions): void;
   /** Session id for the current page, or undefined before `configure`. */
@@ -919,46 +951,61 @@ export const Pulse: PulseApi = {
     config = null;
     session = null;
     identity = null;
+    activeStores = null;
     deviceInfo = {};
     quietDisabled = false;
     await drainClient(previousTransport, previousAttachments);
   },
 
   reset(options?: PulseResetOptions): void {
+    // The namespace to delete, or null for every namespace. Without an option
+    // it is the running client's, so read it before the teardown drops it.
+    let target: StorePair | null = activeStores ?? storesFor(undefined);
     let tabScoped = false;
     try {
-      // Only the exact string narrows the deletion; a hostile getter throws
-      // into here and takes the browser-wide path, which deletes more.
+      const requested = options?.storageNamespace;
+      if (requested !== undefined) {
+        target = isValidStorageNamespace(requested) ? storesFor(requested) : null;
+      }
+      // Only the exact string narrows the deletion.
       tabScoped = options?.scope === "tab";
-    } catch { /* An unreadable option is not permission to delete less. */ }
+    } catch {
+      // A hostile getter throws into here. An unreadable option is not
+      // permission to delete less, so every namespace goes browser-wide.
+      target = null;
+    }
+    const pairs = target ? [target] : everyStorePair();
 
     // Read before the teardown drops the configuration this reads it from.
     let debug = false;
     try { debug = config?.debug === true; } catch { /* Diagnostics are optional. */ }
 
-    requireFreshSession();
+    for (const pair of pairs) requireFreshSession(pair.local.namespace);
 
     // Deletion has to happen even if tearing the pipeline down goes wrong.
+    // Every reset is a consent control, so the running client stops even when
+    // another namespace is the target.
     try { disableClient({ discardReplay: true }); } catch { /* Consent withdrawal never throws into the host app. */ }
 
-    if (tabScoped) {
+    if (tabScoped && target) {
       try {
         // Retire this tab's writers and drop what only it held, then delete
         // the session, which is per-tab storage already. Nothing shared is
         // touched — and nothing is reported as deleted that was not.
-        localStore.invalidate();
-        sessionStore.clear();
-        if (sessionStore.confirmCleared()) return;
+        target.local.invalidate();
+        target.session.clear();
+        if (target.session.confirmCleared()) return;
       } catch { /* An unconfirmed cleanup falls through to the full deletion. */ }
       if (debug) emitDebug("tab reset could not be confirmed, deleting browser-wide instead");
     }
 
-    if (!purgeStoredState()) {
+    const unconfirmed = purgeStoredState(pairs);
+    if (unconfirmed.length > 0) {
       // The browser kept data the user asked us to delete. Destroy the values
-      // that survived, and trust nothing stored for the rest of this page in
-      // case that overwrite was refused too.
-      overwriteStoredSurvivors();
-      distrustStoredState();
+      // that survived, and trust nothing stored in those namespaces for the
+      // rest of this page in case that overwrite was refused too.
+      overwriteStoredSurvivors(unconfirmed);
+      for (const pair of unconfirmed) distrustStoredState(pair.local.namespace);
       if (debug) emitDebug("browser-wide deletion could not be confirmed, overwriting and ignoring what survived");
     }
   },

@@ -126,6 +126,22 @@ export interface PulseConfiguration {
    * explicitly if you want it reported.
    */
   supportedLanguages?: string[];
+  /**
+   * Keeps this app's stored state apart from other apps that use Pubky Pulse
+   * on the same origin, such as an app at `/` and a shop at `/shop`. Default:
+   * none, which keeps every key under `pulse.` exactly as before.
+   *
+   * A name is 1 to 32 lowercase ASCII letters, digits, `_` or `-`, starting
+   * with a letter or digit; anything else, uppercase included, is rejected
+   * rather than normalized. With a name, the anonymous id, user id, session,
+   * offline queue and its Web Lock (`pulse_offline_queue:<name>`) all live
+   * under `pulse:<name>.` keys, and `Pulse.reset` and its reset guards act on
+   * the namespace they target, leaving the others alone.
+   *
+   * It isolates storage only. One client still runs per JavaScript realm, so
+   * apps that must run side by side need separate pages or iframes.
+   */
+  storageNamespace?: string;
 }
 
 /** Safe opt-in initialization; app-owned deployment/test decisions belong in enabled. */
@@ -142,12 +158,13 @@ export interface PulseInitResult {
 }
 
 /**
- * How much of the SDK's stored state `Pulse.reset` deletes.
+ * How much of the SDK's stored state `Pulse.reset` deletes, within the storage
+ * namespace it targets (see `PulseResetOptions.storageNamespace`).
  *
  * - `"browser"`, the default, is the consent-withdrawal control: everything
- *   the SDK kept in this browser profile goes, in both storage areas — the
- *   anonymous id, the user id, the session, and the offline queue every tab
- *   on the origin shares.
+ *   the SDK kept for that namespace in this browser profile goes, in both
+ *   storage areas — the anonymous id, the user id, the session, and the
+ *   offline queue every tab on the origin shares.
  * - `"tab"` deletes only what belongs to this tab: its session, and whatever
  *   it could not persist and so holds in memory. The anonymous id and the
  *   events other tabs parked are left byte-identical, and this tab's queue
@@ -170,6 +187,21 @@ export interface PulseResetOptions {
    * one, so only the browser-wide reset replaces it.
    */
   scope?: PulseResetScope;
+  /**
+   * The storage namespace to delete; see `PulseConfiguration.storageNamespace`.
+   * Default: the running client's namespace when one is configured, otherwise
+   * the default namespace. Naming it lets a consent-withdrawal page reset an
+   * app before, or without, initializing it. Other namespaces are left
+   * byte-identical, and so are their reset guards.
+   *
+   * A value that is not a valid namespace name, or any option getter that
+   * throws, fails toward deleting more: every namespace the SDK can find in this
+   * browser is deleted browser-wide, the default and the running client's
+   * included, whatever `scope` says.
+   *
+   * Every reset disables the running client, whichever namespace it targets.
+   */
+  storageNamespace?: string;
 }
 
 export interface LogEvent {
