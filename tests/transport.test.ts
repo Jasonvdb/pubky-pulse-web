@@ -1217,6 +1217,50 @@ describe("Transport", () => {
       expect(queue.read()).toEqual([]);
     });
 
+    it("keeps a parking batch in memory when consent is withdrawn while the append waits on a lock", async () => {
+      await queue.append([makeEvent(90)]);
+      const locks = new TestLockManager();
+      testNavigator.locks = locks;
+      let release!: () => void;
+      let blocker: Promise<unknown> | null = null;
+      allowed = true;
+      // The send fails offline after the drain released the lock, so the batch
+      // parks; another tab takes the lock first and the append waits behind it.
+      fetchMock.mockImplementationOnce(() => {
+        testNavigator.onLine = false;
+        blocker = locks.request("pulse_offline_queue", () =>
+          new Promise<void>((resolve) => { release = resolve; }));
+        return Promise.reject(new TypeError("network error"));
+      });
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+
+      const written = tx.flushBeforeIdentityWrite();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blocker).not.toBeNull();
+      const stored = testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)]);
+      allowed = false;
+      release();
+      await blocker;
+
+      expect(await written).toBe(false);
+      expect(testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)])).toEqual(stored);
+      expect(queue.read()).toEqual([]);
+      expect(tx.bufferSize).toBe(2);
+
+      testNavigator.onLine = true;
+      allowed = true;
+      await tx.flush();
+      await tx.flush();
+      // The first call is the failed attempt that parked the batch; the
+      // second is the one delivery once consent returns.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(ids(requestBody(fetchMock.mock.calls[0]!).events)).toEqual(["event-90", "event-0"]);
+      expect(ids(requestBody(fetchMock.mock.calls[1]!).events)).toEqual(["event-90", "event-0"]);
+      expect(tx.bufferSize).toBe(0);
+      expect(queue.read()).toEqual([]);
+    });
+
     it("re-applies the buffer caps when a held batch goes back", async () => {
       allowed = true;
       fetchMock.mockResolvedValueOnce(new Response("boom", { status: 503 }));

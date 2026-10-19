@@ -112,15 +112,20 @@ export class OfflineQueue {
     return events;
   }
 
-  /** Park `events` behind whatever is already queued. */
-  async append(events: LogEvent[], isActive: () => boolean = () => true): Promise<void> {
+  /**
+   * Park `events` behind whatever is already queued. Resolves `false` only when
+   * `isActive` turned the append away once the lock was held, so nothing was
+   * written and the caller still owns the events; `true` otherwise.
+   */
+  async append(events: LogEvent[], isActive: () => boolean = () => true): Promise<boolean> {
     // Retain only bounded work while waiting for another tab's lock.
     events = capped(events);
-    if (events.length === 0) return;
-    await this.withLock(() => {
+    if (events.length === 0) return true;
+    return this.withLock(() => {
       // The lock callback runs turns later: the client may have been stopped,
       // or a reset may have purged storage, since the append was dispatched.
-      if (!isActive() || !this.isCurrent()) return;
+      if (!isActive()) return false;
+      if (!this.isCurrent()) return true;
       const incoming = events;
       const current = this.readKey(QUEUE_KEY);
       const spills = this.spillKeys().map((key) => this.storedUsage(key));
@@ -136,6 +141,7 @@ export class OfflineQueue {
         spillCount -= spill.count;
       }
       this.store(QUEUE_KEY, [...current, ...incoming], MAX_OFFLINE_BYTES - spillBytes, MAX_OFFLINE_EVENTS - spillCount);
+      return true;
     });
   }
 

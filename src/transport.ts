@@ -217,24 +217,39 @@ export class Transport {
   private park(events: LogEvent[], how: "append" | "spill", onVeto: "rebuffer" | "discard" = "rebuffer"): boolean | Promise<boolean> {
     const done = (held: boolean): boolean | Promise<boolean> => how === "spill" ? held : Promise.resolve(held);
     if (this.stopped || events.length === 0) return done(false);
-    if (!this.deliveryAllowed()) {
-      if (onVeto === "discard") {
-        this.onDebug?.(`delivery vetoed, discarding ${events.length} events on shutdown`);
-      } else {
-        this.onDebug?.(`delivery vetoed, keeping ${events.length} events in memory instead of parking them`);
-        this.rebufferAhead(events);
-      }
-      return done(true);
-    }
+    if (!this.deliveryAllowed()) return done(this.holdVetoed(events, onVeto));
     if (how === "spill") {
+      // Synchronous: nothing can run between the check above and this write.
       this.queue.spill(events);
       this.forgetReplay(events);
       return false;
     }
-    return this.queue.append(events, () => !this.stopped).then(() => {
-      if (!this.stopped) this.forgetReplay(events);
-      return false;
+    // Asked again once the append holds the lock: waiting on another tab can
+    // outlast the consent the check above saw, and a veto there writes nothing.
+    let vetoed = false;
+    return this.queue.append(events, () => {
+      if (this.stopped) return false;
+      vetoed = !this.deliveryAllowed();
+      return !vetoed;
+    }).then((written) => {
+      if (written) {
+        if (!this.stopped) this.forgetReplay(events);
+        return false;
+      }
+      if (!vetoed || this.stopped) return false;
+      return this.holdVetoed(events, onVeto);
     });
+  }
+
+  /** Keep events a veto turned away from the offline queue in memory, or drop them on shutdown. */
+  private holdVetoed(events: LogEvent[], onVeto: "rebuffer" | "discard"): true {
+    if (onVeto === "discard") {
+      this.onDebug?.(`delivery vetoed, discarding ${events.length} events on shutdown`);
+    } else {
+      this.onDebug?.(`delivery vetoed, keeping ${events.length} events in memory instead of parking them`);
+      this.rebufferAhead(events);
+    }
+    return true;
   }
 
   /**
