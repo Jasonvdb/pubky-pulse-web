@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ANONYMOUS_ID_KEY, IdentityManager, USER_ID_KEY } from "../src/identity";
-import { STORAGE_PREFIX } from "../src/storage";
+import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import { resetTestEnvironment, testLocalStorage } from "./setup";
 
 function stored(key: string): string | null {
@@ -27,11 +27,11 @@ describe("IdentityManager", () => {
   let claim: ReturnType<typeof vi.fn>;
   let debugMessages: string[];
 
-  function makeManager(): IdentityManager {
+  function makeManager(store?: SafeStorage): IdentityManager {
     return new IdentityManager({
       claim: claim as unknown as (anonymousId: string, userId: string) => Promise<void>,
       onDebug: (message) => debugMessages.push(message),
-    });
+    }, store);
   }
 
   beforeEach(() => {
@@ -227,5 +227,27 @@ describe("IdentityManager", () => {
 
     expect(manager.currentId).toBe("user-b");
     expect(claims.map(([, userId]) => userId)).toEqual(["user-a", "user-b"]);
+  });
+
+  it("reads and writes only the injected store", async () => {
+    testLocalStorage.setItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY, "pulse_anon_default");
+    testLocalStorage.setItem(STORAGE_PREFIX + USER_ID_KEY, "default-user");
+    const store = new SafeStorage("local", "shop");
+    const manager = makeManager(store);
+
+    manager.load();
+    expect(manager.anonymous).not.toBe("pulse_anon_default");
+    expect(claims).toEqual([]);
+    expect(store.get(ANONYMOUS_ID_KEY)).toBe(manager.anonymous);
+
+    await manager.setUser("shop-user");
+    expect(store.get(USER_ID_KEY)).toBe("shop-user");
+    manager.clearUser({ newAnonymousId: true });
+    expect(store.get(USER_ID_KEY)).toBeNull();
+    expect(store.get(ANONYMOUS_ID_KEY)).toBe(manager.anonymous);
+
+    expect(stored(ANONYMOUS_ID_KEY)).toBe("pulse_anon_default");
+    expect(stored(USER_ID_KEY)).toBe("default-user");
+    expect(testLocalStorage.getItem(`pulse:shop.${ANONYMOUS_ID_KEY}`)).toBe(manager.anonymous);
   });
 });

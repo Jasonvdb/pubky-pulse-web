@@ -5,7 +5,7 @@ import {
   SESSION_ID_KEY,
   SessionManager,
 } from "../src/session";
-import { STORAGE_PREFIX } from "../src/storage";
+import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import { resetTestEnvironment, testSessionStorage } from "./setup";
 
 const TIMEOUT_MS = 30_000;
@@ -41,11 +41,11 @@ describe("SessionManager", () => {
   let started: Array<{ id: string; launchMs?: number }>;
   let ended: string[];
 
-  function makeManager(timeoutMs = TIMEOUT_MS): SessionManager {
+  function makeManager(timeoutMs = TIMEOUT_MS, store?: SafeStorage): SessionManager {
     return new SessionManager(timeoutMs, {
       onStarted: (id, launchMs) => started.push({ id, launchMs }),
       onEnded: (id) => ended.push(id),
-    });
+    }, store);
   }
 
   beforeEach(() => {
@@ -199,5 +199,22 @@ describe("SessionManager", () => {
 
     expect(id).not.toBe("orphaned-id");
     expect(started.map((entry) => entry.id)).toEqual([id]);
+  });
+
+  it("reads and writes only the injected store", () => {
+    const appId = makeManager().start(T0);
+    const store = new SafeStorage("session", "shop");
+
+    const manager = makeManager(TIMEOUT_MS, store);
+    const shopId = manager.start(T0 + 1);
+    expect(shopId).not.toBe(appId);
+    expect(store.get(SESSION_ID_KEY)).toBe(shopId);
+    expect(store.get(SESSION_ACTIVITY_KEY)).toBe(String(T0 + 1));
+
+    expect(manager.touch(T0 + 2)).toBe(shopId);
+    expect(store.get(SESSION_ACTIVITY_KEY)).toBe(String(T0 + 2));
+    expect(storedId()).toBe(appId);
+    expect(storedActivity()).toBe(String(T0));
+    expect(testSessionStorage.getItem(`pulse:shop.${SESSION_ID_KEY}`)).toBe(shopId);
   });
 });

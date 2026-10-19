@@ -12,8 +12,16 @@ const SPILL_PREFIX = "offline_queue:spill:";
  * year 33658, which is long enough.
  */
 const SPILL_TIMESTAMP_DIGITS = 15;
-/** Web Lock serialising every read-modify-write of the shared queue key. */
+/**
+ * Web Lock serialising every read-modify-write of the shared queue key. Each
+ * named storage namespace has its own queue key and so its own lock,
+ * `pulse_offline_queue:<namespace>`; the default keeps the bare name.
+ */
 const LOCK_NAME = "pulse_offline_queue";
+
+function lockNameFor(namespace: string | undefined): string {
+  return namespace === undefined ? LOCK_NAME : `${LOCK_NAME}:${namespace}`;
+}
 
 /** Hard cap on parked events, across every key; the oldest are dropped first. */
 export const MAX_OFFLINE_EVENTS = 10000;
@@ -75,6 +83,7 @@ function lockManager(): LockManagerLike | null {
  */
 export class OfflineQueue {
   private readonly storage: SafeStorage;
+  private readonly lockName: string;
   private readonly onDebug: ((message: string) => void) | undefined;
   /** The storage epoch this queue was created in; see the class comment. */
   private readonly epoch: number;
@@ -91,6 +100,7 @@ export class OfflineQueue {
    */
   constructor(storage: SafeStorage, onDebug?: (message: string) => void, options?: { inert?: boolean }) {
     this.storage = storage;
+    this.lockName = lockNameFor(storage.namespace);
     this.onDebug = onDebug;
     this.epoch = storage.epoch;
     this.inert = options?.inert === true;
@@ -273,7 +283,7 @@ export class OfflineQueue {
 
     let started = false;
     try {
-      return (await locks.request(LOCK_NAME, async () => {
+      return (await locks.request(this.lockName, async () => {
         started = true;
         return fn();
       })) as T;
