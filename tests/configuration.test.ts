@@ -172,6 +172,37 @@ describe("validateConfiguration", () => {
     expect(config.beforeSend).toBeUndefined();
   });
 
+  it("uses the default storage namespace when none is supplied", () => {
+    expect(validateConfiguration(base).storageNamespace).toBeUndefined();
+    expect(validateConfiguration({ ...base, storageNamespace: undefined }).storageNamespace).toBeUndefined();
+  });
+
+  it.each(["shop", "a", "0", "my_app-2", "x".repeat(32)])("accepts the storage namespace %j", (storageNamespace) => {
+    expect(validateConfiguration({ ...base, storageNamespace }).storageNamespace).toBe(storageNamespace);
+  });
+
+  // Uppercase is rejected, not lowercased, so two spellings never share state;
+  // "." and ":" would let one namespace's key prefix capture another's.
+  it.each(["", "Shop", "SHOP", "a.b", "a:b", " x", "x ", "-x", "_x", "x".repeat(33), "café", null, 42, {}])(
+    "rejects the storage namespace %j", (storageNamespace) => {
+      expect(() => validateConfiguration({ ...base, storageNamespace: storageNamespace as string })).toThrow(
+        "Pubky Pulse: storageNamespace must be 1-32 lowercase letters, digits, _ or -, starting with a letter or digit",
+      );
+    });
+
+  it("reads the storage namespace once", () => {
+    let reads = 0;
+    const config = {
+      ...base,
+      get storageNamespace(): string {
+        reads += 1;
+        return reads === 1 ? "shop" : "Not Valid";
+      },
+    };
+    expect(validateConfiguration(config).storageNamespace).toBe("shop");
+    expect(reads).toBe(1);
+  });
+
   it("collects every device field by default and for deviceInfo: true", () => {
     for (const deviceInfo of [undefined, true, {}]) {
       expect(validateConfiguration({ ...base, deviceInfo })).toMatchObject({

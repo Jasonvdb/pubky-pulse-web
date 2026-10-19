@@ -7,50 +7,58 @@
  * Both guards are page memory, not storage, and both are retired only by an
  * initialization that actually completed — an initialization that threw
  * deleted nothing and adopted nothing, so it may not spend them.
+ *
+ * Both are kept per storage namespace: a reset of one namespace must not make
+ * another namespace's next initialization distrust its own state or abandon
+ * its session. `undefined` is the default namespace throughout, as in
+ * `storage.ts`.
  */
 
 /**
- * Refuse the stored session on the next initialization, however fresh it is.
- * Set by every reset, of either scope. A reset promises this tab's session is
- * gone, and `sessionStorage.removeItem` can throw while `getItem` keeps
- * working, so a session the deletion could not remove would otherwise be
- * resumed and carry activity from before the reset across it.
+ * Namespaces whose stored session the next initialization refuses, however
+ * fresh it is. Set by every reset, of either scope. A reset promises this
+ * tab's session is gone, and `sessionStorage.removeItem` can throw while
+ * `getItem` keeps working, so a session the deletion could not remove would
+ * otherwise be resumed and carry activity from before the reset across it.
  */
-let freshSession = false;
+const freshSession = new Set<string | undefined>();
 
 /**
- * Trust nothing this browser has stored, for the rest of this page's life.
- * Set only where a browser-wide deletion could not be confirmed: what survived
- * it was overwritten best effort, but a store that refuses writes as well as
- * removals keeps its old values, and none of them may be adopted, claimed,
- * resumed or replayed after the user asked for them to be deleted.
+ * Namespaces of which nothing stored is trusted, for the rest of this page's
+ * life. Set only where a browser-wide deletion could not be confirmed: what
+ * survived it was overwritten best effort, but a store that refuses writes as
+ * well as removals keeps its old values, and none of them may be adopted,
+ * claimed, resumed or replayed after the user asked for them to be deleted.
  */
-let distrustStored = false;
+const distrustStored = new Set<string | undefined>();
 
 /** Both scopes: a browser-wide purge can leave a session behind too. */
-export function requireFreshSession(): void {
-  freshSession = true;
+export function requireFreshSession(namespace: string | undefined): void {
+  freshSession.add(namespace);
 }
 
 /** Also requires a fresh session: distrust is the stronger of the two. */
-export function distrustStoredState(): void {
-  freshSession = true;
-  distrustStored = true;
+export function distrustStoredState(namespace: string | undefined): void {
+  freshSession.add(namespace);
+  distrustStored.add(namespace);
 }
 
-export function freshSessionRequired(): boolean {
-  return freshSession;
+export function freshSessionRequired(namespace: string | undefined): boolean {
+  return freshSession.has(namespace);
 }
 
-export function storedStateDistrusted(): boolean {
-  return distrustStored;
+export function storedStateDistrusted(namespace: string | undefined): boolean {
+  return distrustStored.has(namespace);
 }
 
-/**
- * Retire both guards. Called by an initialization that completed, and by tests
- * standing in for a page that has just loaded.
- */
-export function clearResetGuards(): void {
-  freshSession = false;
-  distrustStored = false;
+/** Retire one namespace's guards: called by an initialization of it that completed. */
+export function clearResetGuards(namespace: string | undefined): void {
+  freshSession.delete(namespace);
+  distrustStored.delete(namespace);
+}
+
+/** Retire every namespace's guards, as tests standing in for a page that has just loaded do. */
+export function clearAllResetGuards(): void {
+  freshSession.clear();
+  distrustStored.clear();
 }

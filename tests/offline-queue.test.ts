@@ -521,6 +521,15 @@ describe("OfflineQueue", () => {
       expect(messages).toEqual(["offline queue lock unavailable, writing unlocked"]);
     });
 
+    it("takes a lock of its own for a named storage namespace", async () => {
+      await new OfflineQueue(new SafeStorage("local", "shop")).append([makeEvent(0)]);
+      await queue.append([makeEvent(1)]);
+
+      expect(locks.requested).toEqual([`${LOCK_NAME}:shop`, LOCK_NAME]);
+      expect(testLocalStorage.getItem("pulse:shop.offline_queue")).not.toBeNull();
+      expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-1"]);
+    });
+
     it("does not take the lock for a spill, which has no turn to await it", () => {
       queue.spill([makeEvent(0)]);
       expect(locks.requested).toEqual([]);
