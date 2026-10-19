@@ -2,9 +2,18 @@
  * Out-of-band upload of files attached to an event. Uploads run serially in a
  * background queue so a screenshot never delays the event itself; `flush()`
  * waits for the queue to empty, with a bounded wait for stalled host APIs.
+ *
+ * The host's `canDeliver` check runs before each item leaves the queue, right
+ * before its reservation, and right before its PUT. A veto up to the
+ * reservation holds the item at the head of the queue, still counted against
+ * the retention caps, until the next `enqueue()` or `flush()` restarts the
+ * queue; `stop()` discards it. A veto after the reservation abandons that item:
+ * the server already knows about the reservation, so holding the bytes would
+ * not keep the upload private.
  */
 
 import type { ValidatedConfig } from "./configuration";
+import { createDeliveryGate } from "./delivery-gate";
 import { REQUEST_TIMEOUT_MS } from "./transport";
 import type { PulseAttachment } from "./types";
 
@@ -98,10 +107,13 @@ export class AttachmentUploader {
   private stopped = false;
   private readonly requests = new Map<AbortController, { timer: ReturnType<typeof setTimeout>; owner: PendingUpload }>();
   private wakeDrain: (() => void) | null = null;
+  /** The host's `canDeliver` consent check, asked before each reservation and PUT. */
+  private readonly deliveryAllowed: () => boolean;
 
   constructor(config: ValidatedConfig, onDebug?: (message: string, detail?: unknown) => void) {
     this.config = config;
     this.onDebug = onDebug;
+    this.deliveryAllowed = createDeliveryGate(config.canDeliver, onDebug);
   }
 
   private debug(message: string, detail?: unknown): void {
@@ -168,10 +180,20 @@ export class AttachmentUploader {
           this.debug("skipping invalid attachment", error);
         }
       }
-      if (!this.draining && this.pending.length > 0) this.draining = this.drain();
+      this.startDrain();
     } catch (error) {
       this.debug("could not queue attachments", error);
     }
+  }
+
+  private startDrain(): void {
+    if (this.draining || this.stopped || this.pending.length === 0) return;
+    // A vetoed drain can finish synchronously, so it clears `draining` only
+    // after this assignment, and only while it is still the current drain.
+    const draining = this.drain().finally(() => {
+      if (this.draining === draining) this.draining = null;
+    });
+    this.draining = draining;
   }
 
   private snapshot(clientEventId: string, userId: string | undefined, attachment: PulseAttachment): PendingUpload | null {
@@ -244,6 +266,8 @@ export class AttachmentUploader {
 
   /** Wait for queued work, but return within two minutes even if a host API stalls. */
   async flush(): Promise<void> {
+    // Restart a queue a `canDeliver` veto left holding items.
+    this.startDrain();
     const draining = this.draining;
     if (!draining) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -280,23 +304,28 @@ export class AttachmentUploader {
 
   private async drain(): Promise<void> {
     try {
-      while (!this.stopped) {
-        const item = this.pending.shift();
-        if (!item) break;
+      while (!this.stopped && this.pending.length > 0 && this.deliveryAllowed()) {
+        const item = this.pending.shift()!;
+        let held = false;
         // The reservation belongs to the actual work, never to its timeout.
-        const work = this.uploadOne(item).catch((error: unknown) => {
+        const work = this.uploadOne(item).then((outcome) => {
+          held = outcome === "held" && !this.stopped && !item.cancelled;
+        }, (error: unknown) => {
           this.debug("attachment upload failed", error);
-        }).finally(() => item.release());
+        }).finally(() => {
+          if (held) this.pending.unshift(item);
+          else item.release();
+        });
         await this.waitForWork(item, work);
+        if (held) break;
       }
     } catch (error) {
       this.debug("attachment queue failed", error);
-    } finally {
-      this.draining = null;
     }
   }
 
-  private async uploadOne(item: PendingUpload): Promise<void> {
+  /** Resolves `"held"` when `canDeliver` vetoed the item before its reservation. */
+  private async uploadOne(item: PendingUpload): Promise<"held" | void> {
     const subtle = subtleCrypto();
     if (!subtle || this.stopped || item.cancelled) return;
     const blob = isBlob(item.data) ? item.data : null;
@@ -310,6 +339,7 @@ export class AttachmentUploader {
     }
     const sha256 = await sha256Hex(bytes, subtle);
     if (this.stopped || item.cancelled) return;
+    if (!this.deliveryAllowed()) return "held";
     const reserved = await this.reserve({
       clientEventId: item.clientEventId,
       userId: item.userId,
@@ -319,6 +349,10 @@ export class AttachmentUploader {
       sha256,
     }, item);
     if (this.stopped || item.cancelled || !reserved) return;
+    if (!this.deliveryAllowed()) {
+      this.debug(`canDeliver vetoed the upload of reserved attachment "${item.filename}", abandoning it`);
+      return;
+    }
     await this.putBytes(reserved.upload_url, blob ?? bytes, item.sizeBytes, item.filename, item);
   }
 
