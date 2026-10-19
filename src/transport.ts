@@ -1,5 +1,6 @@
 import { encodeBody, byteLength, type EncodedBody } from "./compression";
 import type { ValidatedConfig } from "./configuration";
+import { createDeliveryGate } from "./delivery-gate";
 import { jsonByteLength, MAX_BUFFER_BYTES, MAX_EVENT_BYTES } from "./event-size";
 import { isOnline } from "./device-info";
 import type { OfflineQueue } from "./offline-queue";
@@ -60,7 +61,11 @@ export function retryDelayMs(attempt: number, retryAfterMs: number | null): numb
   return Math.min(Math.max(retryAfterMs, backoff), MAX_RETRY_AFTER_MS);
 }
 
-type BatchOutcome = "sent" | "dropped" | "park";
+/**
+ * `"held"` means the host's `canDeliver` vetoed the send: the payload stays in
+ * memory for a later attempt and, unlike `"park"`, is never persisted.
+ */
+type BatchOutcome = "sent" | "dropped" | "park" | "held";
 
 /** Options for {@link Transport.stop}. */
 export interface TransportStopOptions {
@@ -103,6 +108,8 @@ export class Transport {
   private readonly config: ValidatedConfig;
   private readonly queue: OfflineQueue;
   private readonly onDebug: ((message: string, detail?: unknown) => void) | undefined;
+  /** The host's `canDeliver` consent check, asked synchronously before every event send. */
+  private readonly deliveryAllowed: () => boolean;
   private buffer: LogEvent[] = [];
   private bufferBytes = 0;
   private readonly eventBytes = new WeakMap<LogEvent, number>();
@@ -149,6 +156,7 @@ export class Transport {
       try { onDebug?.(message, detail); } catch { /* Diagnostics cannot reject background delivery. */ }
       finally { diagnosing = false; }
     };
+    this.deliveryAllowed = createDeliveryGate(config.canDeliver, this.onDebug);
     this.timer = setInterval(() => {
       void this.flush();
     }, config.flushIntervalMs);
@@ -273,6 +281,16 @@ export class Transport {
     this.bufferBytes += size;
   }
 
+  /**
+   * Put `events` back ahead of the buffer through the same caps a fresh event
+   * meets, so the oldest are still the first dropped when the buffer is full.
+   */
+  private rebufferAhead(events: LogEvent[]): void {
+    const fresh = this.takeBuffered();
+    for (const event of events) this.bufferEvent(event);
+    for (const event of fresh) this.bufferEvent(event);
+  }
+
   private takeBuffered(count = this.buffer.length): LogEvent[] {
     const taken = this.buffer.splice(0, count);
     for (const event of taken) this.bufferBytes -= this.eventBytes.get(event) ?? 0;
@@ -297,7 +315,9 @@ export class Transport {
     const run = this.runFlush().catch((error: unknown) => {
       this.onDebug?.("failed to flush events", error);
     }).finally(() => {
-      this.flushing = null;
+      // A flush started from inside `canDeliver` settles while the outer pass
+      // still runs; only the pass that owns `flushing` may clear it.
+      if (this.flushing === run) this.flushing = null;
     });
     this.flushing = run;
     return run;
@@ -312,7 +332,11 @@ export class Transport {
       await this.flush();
       // The flush is a no-op while offline, so park what it could not send.
       const left = this.takeBuffered();
-      if (!this.stopped && left.length > 0) await this.queue.append(left, () => !this.stopped);
+      if (!this.stopped && left.length > 0) {
+        // Held events are never persisted: stop() below discards them instead.
+        if (this.deliveryAllowed()) await this.queue.append(left, () => !this.stopped);
+        else this.onDebug?.(`delivery vetoed, discarding ${left.length} events on shutdown`);
+      }
     } catch (error) {
       this.onDebug?.("failed to park remaining events", error);
     } finally {
@@ -336,6 +360,9 @@ export class Transport {
 
   private runUnloadFlush(): void {
     if (this.stopped) return;
+    // Before the debounce stamp and before anything is taken, so a veto leaves
+    // the buffer, the in-flight batch, and storage exactly as they were.
+    if (!this.deliveryAllowed()) return;
     const now = Date.now();
     if (now - this.lastUnloadFlushAt < UNLOAD_DEBOUNCE_MS) return;
     this.lastUnloadFlushAt = now;
@@ -369,6 +396,15 @@ export class Transport {
     if (batch.length === 0) return;
 
     const body: IngestRequest = { bundle_id: this.config.bundleId, events: batch };
+    const repark = (): void => {
+      if (this.stopped) return;
+      // Consent may have been withdrawn while the request ran: never persist after a veto.
+      if (!this.deliveryAllowed()) {
+        this.onDebug?.(`delivery vetoed, not re-parking ${batch.length} keepalive events`);
+        return;
+      }
+      void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);
+    };
     try {
       void this.request(`${this.config.endpoint}/v1/ingest`, {
         method: "POST",
@@ -384,14 +420,12 @@ export class Transport {
           // drops here exactly as it does in `post()`.
           if (!this.stopped && !response.ok && (response.status >= 500 || response.status === 429)) {
             this.onDebug?.(`keepalive flush failed with ${response.status}`);
-            void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);
+            repark();
           } else if (!this.stopped) {
             this.forgetReplay(batch);
           }
         },
-        () => {
-          if (!this.stopped) void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);
-        },
+        repark,
       ).catch(() => undefined);
     } catch (err) {
       // Still inside the unload turn, so this one has to be the sync path.
@@ -422,6 +456,8 @@ export class Transport {
    * buffered afterwards is already stamped with the new id by the caller.
    */
   async claimIdentity(anonymousId: string, userId: string): Promise<boolean> {
+    // A vetoed claim is retried by the identity manager on a later init.
+    if (!this.deliveryAllowed()) return false;
     await this.flush();
     const outcome = await this.post(
       "/v1/identity/claim",
@@ -494,6 +530,9 @@ export class Transport {
       this.onDebug?.("offline, skipping flush");
       return;
     }
+    // Before the drain, so a veto leaves the offline queue and buffer untouched;
+    // the interval asks again on its next tick.
+    if (!this.deliveryAllowed()) return;
 
     let parked = await this.queue.drain(() => !this.stopped);
     for (const event of parked) this.replayed.add(event);
@@ -502,11 +541,8 @@ export class Transport {
       return;
     }
     if (parked.length > 0) {
-      const fresh = this.takeBuffered();
-      for (const event of parked) this.bufferEvent(event);
-      for (const event of fresh) this.bufferEvent(event);
-      // A stalled request must not keep discarded replay or fresh events alive.
-      fresh.length = 0;
+      this.rebufferAhead(parked);
+      // A stalled request must not keep discarded replay events alive.
       parked = [];
     }
 
@@ -514,6 +550,12 @@ export class Transport {
       const batch = this.takeBuffered(MAX_BATCH_SIZE);
       const outcome = await this.sendBatch(batch);
       if (this.stopped) return;
+      if (outcome === "held") {
+        // Vetoed mid-flush: keep the batch in memory, in order, for the next
+        // tick. An unload flush that already took the batch owns it now.
+        if (!this.inFlightTaken) this.rebufferAhead(batch);
+        return;
+      }
       if (outcome === "park") {
         // The endpoint is unreachable: park this batch and everything behind
         // it rather than burning retries on each remaining batch. An unload
@@ -537,7 +579,7 @@ export class Transport {
     } finally {
       this.inFlight = null;
     }
-    if (outcome !== "park" && !this.stopped) {
+    if (outcome !== "park" && outcome !== "held" && !this.stopped) {
       this.forgetReplay(events);
     }
     if (outcome === "dropped") {
@@ -573,6 +615,8 @@ export class Transport {
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       if (this.stopped) return "dropped";
+      // Asked before every attempt, so also right after each backoff sleep.
+      if (!this.deliveryAllowed()) return "held";
       let retryAfterMs: number | null = null;
       try {
         const response = await this.request(`${this.config.endpoint}${path}`, {
