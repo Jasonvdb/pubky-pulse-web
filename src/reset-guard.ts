@@ -15,23 +15,13 @@
  */
 
 /**
- * The set key standing in for the default namespace. The empty string can
- * never be a valid namespace name, so it cannot collide with one.
- */
-const DEFAULT_GUARD_KEY = "";
-
-function guardKey(namespace: string | undefined): string {
-  return namespace ?? DEFAULT_GUARD_KEY;
-}
-
-/**
  * Namespaces whose stored session the next initialization refuses, however
  * fresh it is. Set by every reset, of either scope. A reset promises this
  * tab's session is gone, and `sessionStorage.removeItem` can throw while
  * `getItem` keeps working, so a session the deletion could not remove would
  * otherwise be resumed and carry activity from before the reset across it.
  */
-const freshSession = new Set<string>();
+const freshSession = new Set<string | undefined>();
 
 /**
  * Namespaces of which nothing stored is trusted, for the rest of this page's
@@ -40,38 +30,35 @@ const freshSession = new Set<string>();
  * well as removals keeps its old values, and none of them may be adopted,
  * claimed, resumed or replayed after the user asked for them to be deleted.
  */
-const distrustStored = new Set<string>();
+const distrustStored = new Set<string | undefined>();
 
 /** Both scopes: a browser-wide purge can leave a session behind too. */
 export function requireFreshSession(namespace: string | undefined): void {
-  freshSession.add(guardKey(namespace));
+  freshSession.add(namespace);
 }
 
 /** Also requires a fresh session: distrust is the stronger of the two. */
 export function distrustStoredState(namespace: string | undefined): void {
-  freshSession.add(guardKey(namespace));
-  distrustStored.add(guardKey(namespace));
+  freshSession.add(namespace);
+  distrustStored.add(namespace);
 }
 
 export function freshSessionRequired(namespace: string | undefined): boolean {
-  return freshSession.has(guardKey(namespace));
+  return freshSession.has(namespace);
 }
 
 export function storedStateDistrusted(namespace: string | undefined): boolean {
-  return distrustStored.has(guardKey(namespace));
+  return distrustStored.has(namespace);
 }
 
-/**
- * Retire one namespace's guards — called by an initialization of that
- * namespace that completed — or, with no argument, every namespace's, as tests
- * standing in for a page that has just loaded do.
- */
-export function clearResetGuards(...namespace: [] | [string | undefined]): void {
-  if (namespace.length === 0) {
-    freshSession.clear();
-    distrustStored.clear();
-    return;
-  }
-  freshSession.delete(guardKey(namespace[0]));
-  distrustStored.delete(guardKey(namespace[0]));
+/** Retire one namespace's guards: called by an initialization of it that completed. */
+export function clearResetGuards(namespace: string | undefined): void {
+  freshSession.delete(namespace);
+  distrustStored.delete(namespace);
+}
+
+/** Retire every namespace's guards, as tests standing in for a page that has just loaded do. */
+export function clearAllResetGuards(): void {
+  freshSession.clear();
+  distrustStored.clear();
 }

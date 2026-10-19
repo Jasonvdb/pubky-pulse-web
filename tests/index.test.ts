@@ -4,9 +4,9 @@ import type { IngestRequest, LogEvent, PulseEventHint, PulseResetOptions } from 
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
 import { OfflineQueue } from "../src/offline-queue";
-import { clearResetGuards } from "../src/reset-guard";
+import { clearAllResetGuards } from "../src/reset-guard";
 import { SESSION_ACTIVITY_KEY, SESSION_ID_KEY } from "../src/session";
-import { enumerateNamespaces, SafeStorage, STORAGE_PREFIX, storesFor } from "../src/storage";
+import { allStorePairs, enumerateNamespaces, SafeStorage, STORAGE_PREFIX, storesFor } from "../src/storage";
 import {
   resetTestEnvironment,
   testDocument,
@@ -106,12 +106,12 @@ describe("Pulse", () => {
     resetTestEnvironment();
     // Every namespace's store pair is a module singleton: the backing globals
     // are fresh every test, their in-memory fallbacks are not.
-    for (const namespace of [undefined, ...enumerateNamespaces()]) {
-      storesFor(namespace).local.clear();
-      storesFor(namespace).session.clear();
+    for (const pair of allStorePairs()) {
+      pair.local.clear();
+      pair.session.clear();
     }
     // Page memory a `Pulse.reset` leaves behind, as a fresh page load has it.
-    clearResetGuards();
+    clearAllResetGuards();
     resetSlugWarning();
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     fetchMock = vi.fn((_url: string, _init?: RequestInit) =>
@@ -1543,7 +1543,7 @@ describe("Pulse", () => {
     testSessionStorage.throwOnRemove = false;
     // A fresh page keeps nothing but what storage holds: drop the in-page
     // guards and let the overwritten survivors speak for themselves.
-    clearResetGuards();
+    clearAllResetGuards();
 
     fetchMock.mockClear();
     expect(Pulse.init(config).reason).toBe("initialized");
@@ -1610,7 +1610,7 @@ describe("Pulse", () => {
     expect(output).not.toHaveBeenCalled();
 
     testSessionStorage.throwOnRemove = false;
-    clearResetGuards();
+    clearAllResetGuards();
     Pulse.init({ ...config, debug: true });
     testSessionStorage.throwOnRemove = true;
 

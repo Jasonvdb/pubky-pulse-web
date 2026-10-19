@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ANONYMOUS_ID_KEY, IdentityManager, USER_ID_KEY } from "../src/identity";
-import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
+import { localStore, SafeStorage, STORAGE_PREFIX } from "../src/storage";
 import { resetTestEnvironment, testLocalStorage } from "./setup";
 
 function stored(key: string): string | null {
@@ -27,7 +27,7 @@ describe("IdentityManager", () => {
   let claim: ReturnType<typeof vi.fn>;
   let debugMessages: string[];
 
-  function makeManager(store?: SafeStorage): IdentityManager {
+  function makeManager(store: SafeStorage = localStore): IdentityManager {
     return new IdentityManager({
       claim: claim as unknown as (anonymousId: string, userId: string) => Promise<void>,
       onDebug: (message) => debugMessages.push(message),

@@ -5,7 +5,7 @@ import {
   SESSION_ID_KEY,
   SessionManager,
 } from "../src/session";
-import { SafeStorage, STORAGE_PREFIX } from "../src/storage";
+import { SafeStorage, sessionStore, STORAGE_PREFIX } from "../src/storage";
 import { resetTestEnvironment, testSessionStorage } from "./setup";
 
 const TIMEOUT_MS = 30_000;
@@ -41,7 +41,7 @@ describe("SessionManager", () => {
   let started: Array<{ id: string; launchMs?: number }>;
   let ended: string[];
 
-  function makeManager(timeoutMs = TIMEOUT_MS, store?: SafeStorage): SessionManager {
+  function makeManager(timeoutMs = TIMEOUT_MS, store: SafeStorage = sessionStore): SessionManager {
     return new SessionManager(timeoutMs, {
       onStarted: (id, launchMs) => started.push({ id, launchMs }),
       onEnded: (id) => ended.push(id),
@@ -159,7 +159,7 @@ describe("SessionManager", () => {
         seen.push(`end:${id}`);
         manager.touch(T0 + TIMEOUT_MS);
       },
-    });
+    }, sessionStore);
 
     const first = manager.start(T0);
     const second = manager.touch(T0 + TIMEOUT_MS);

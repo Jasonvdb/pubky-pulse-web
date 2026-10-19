@@ -86,7 +86,8 @@ function resolveBackend(kind: StorageKind): Storage | null {
 
 export class SafeStorage {
   private readonly kind: StorageKind;
-  private readonly storageNamespace: string | undefined;
+  /** The namespace this store's keys live in; `undefined` for the default. */
+  readonly namespace: string | undefined;
   /** Prepended to every key on the backend; see `storagePrefixFor`. */
   private readonly prefix: string;
   private readonly memory = new Map<string, string>();
@@ -96,12 +97,7 @@ export class SafeStorage {
   constructor(kind: StorageKind, namespace: string | undefined = DEFAULT_STORAGE_NAMESPACE) {
     this.kind = kind;
     this.prefix = storagePrefixFor(namespace);
-    this.storageNamespace = namespace;
-  }
-
-  /** The namespace this store's keys live in; `undefined` for the default. */
-  get namespace(): string | undefined {
-    return this.storageNamespace;
+    this.namespace = namespace;
   }
 
   /** True once any access failed and the in-memory map took over. */
@@ -321,4 +317,14 @@ export function enumerateNamespaces(): string[] {
     }
   }
   return [...found].sort();
+}
+
+/**
+ * The store pairs a browser-wide deletion that must not delete less covers:
+ * the default namespace and every namespace this browser shows a trace of.
+ * A running client's pair is among them even when storage shows nothing for
+ * it, because `enumerateNamespaces` also lists every pair this realm created.
+ */
+export function allStorePairs(): StorePair[] {
+  return [DEFAULT_STORAGE_NAMESPACE, ...enumerateNamespaces()].map((namespace) => storesFor(namespace));
 }

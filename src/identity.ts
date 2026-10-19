@@ -1,5 +1,5 @@
 import { randomUuid } from "./event-builder";
-import { localStore, type SafeStorage } from "./storage";
+import type { SafeStorage } from "./storage";
 
 /** Anonymous id for this browser profile. Survives reloads and tabs. */
 export const ANONYMOUS_ID_KEY = "anonymous_id";
@@ -39,7 +39,7 @@ export class IdentityManager {
   private generation = 0;
 
   /** `store` holds the persisted ids; it defaults to the default namespace's. */
-  constructor(hooks: IdentityHooks, store: SafeStorage = localStore) {
+  constructor(hooks: IdentityHooks, store: SafeStorage) {
     this.hooks = hooks;
     this.store = store;
     this.anonymousId = createAnonymousId();

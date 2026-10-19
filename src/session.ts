@@ -1,5 +1,5 @@
 import { randomUuid } from "./event-builder";
-import { type SafeStorage, sessionStore } from "./storage";
+import type { SafeStorage } from "./storage";
 
 /** Session id for the current tab. `sessionStorage` is per-tab by design. */
 export const SESSION_ID_KEY = "session_id";
@@ -63,7 +63,7 @@ export class SessionManager {
   private rotating = false;
 
   /** `store` holds the session id; it defaults to the default namespace's. */
-  constructor(timeoutMs: number, callbacks: SessionCallbacks, store: SafeStorage = sessionStore) {
+  constructor(timeoutMs: number, callbacks: SessionCallbacks, store: SafeStorage) {
     this.timeoutMs = timeoutMs;
     this.callbacks = callbacks;
     this.store = store;

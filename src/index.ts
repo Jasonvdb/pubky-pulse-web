@@ -37,7 +37,7 @@ import {
   storedStateDistrusted,
 } from "./reset-guard";
 import { SessionManager } from "./session";
-import { enumerateNamespaces, isValidStorageNamespace, storesFor, type StorePair } from "./storage";
+import { allStorePairs, isValidStorageNamespace, storesFor, type StorePair } from "./storage";
 import { Transport, type TransportStopOptions } from "./transport";
 import { installUnhandledCapture, type UnhandledKind } from "./unhandled-capture";
 import {
@@ -569,15 +569,6 @@ function overwriteStoredSurvivors(pairs: readonly StorePair[]): void {
   }
 }
 
-/**
- * The store pairs a browser-wide deletion that must not delete less covers:
- * the default namespace and every namespace this browser shows a trace of.
- * The running client's is among them even when storage shows nothing for it,
- * because `enumerateNamespaces` also lists every pair this realm has created.
- */
-function everyStorePair(): StorePair[] {
-  return [undefined, ...enumerateNamespaces()].map((namespace) => storesFor(namespace));
-}
 
 async function drainClient(previousTransport: Transport | null, previousAttachments: AttachmentUploader | null): Promise<void> {
   if (previousTransport) retiringTransports.add(previousTransport);
@@ -974,7 +965,7 @@ export const Pulse: PulseApi = {
       // permission to delete less, so every namespace goes browser-wide.
       target = null;
     }
-    const pairs = target ? [target] : everyStorePair();
+    const pairs = target ? [target] : allStorePairs();
 
     // Read before the teardown drops the configuration this reads it from.
     let debug = false;
