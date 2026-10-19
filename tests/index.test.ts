@@ -2265,6 +2265,66 @@ describe("Pulse", () => {
   it("still validates the configuration during server rendering", () => {
     expect(() => Pulse.configure({ ...config, apiKey: "nope" })).toThrow(/pulse_client_/);
   });
+
+  describe("canDeliver", () => {
+    // Consent as the host app sees it; another tab can flip it at any time.
+    let consent: boolean;
+    const gated = { ...config, canDeliver: () => consent };
+
+    beforeEach(() => {
+      consent = true;
+    });
+
+    it("holds events after a withdrawal in another tab, and reset deletes them", async () => {
+      vi.useFakeTimers();
+      Pulse.init(gated);
+      Pulse.info("before-withdrawal");
+      consent = false;
+
+      await vi.advanceTimersByTimeAsync(3 * 5000);
+      await Pulse.flush();
+      testDocument.visibilityState = "hidden";
+      testDocument.dispatchEvent(new Event("visibilitychange"));
+      testWindow.dispatchEvent(new Event("pagehide"));
+      await settle();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(queueKeys()).toEqual([]);
+
+      Pulse.reset();
+      consent = true;
+      await vi.advanceTimersByTimeAsync(3 * 5000);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(queueKeys()).toEqual([]);
+
+      // A new client in this tab starts empty: the held events are gone.
+      Pulse.init(gated);
+      Pulse.info("after-reset");
+      await Pulse.flush();
+      const messages = sentEvents().map((event) => event.message);
+      expect(messages).toContain("after-reset");
+      expect(messages).not.toContain("before-withdrawal");
+    });
+
+    it("sends no identity claim or user properties while vetoed", async () => {
+      Pulse.configure(gated);
+      consent = false;
+      await Pulse.setUser("user-9");
+      await Pulse.setUserProperties({ plan: "pro" });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("still sends feedback while vetoed, and holds its audit event", async () => {
+      Pulse.configure(gated);
+      consent = false;
+      fetchMock.mockResolvedValueOnce(new Response(
+        JSON.stringify({ id: "feedback-1", created_at: "2026-10-19T00:00:00.000Z" }),
+        { status: 201 },
+      ));
+      expect((await Pulse.sendFeedback("the checkout button is hidden")).id).toBe("feedback-1");
+      await Pulse.flush();
+      expect(requestPaths()).toEqual(["/v1/feedback"]);
+    });
+  });
 });
 
 describe("Pulse feedback, questionnaires and attachments", () => {
