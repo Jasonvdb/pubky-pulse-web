@@ -2867,8 +2867,10 @@ describe("Pulse feedback, questionnaires and attachments", () => {
       consent = true;
       await vi.advanceTimersByTimeAsync(intervalMs);
       expect(appEvents().map((event) => event.message)).toContain("upload_failed");
+      // Hashing the bytes (crypto.subtle) settles outside the fake clock, so
+      // wait for the resumed upload instead of assuming a number of turns.
+      await vi.waitFor(() => expect(uploadCalls()).toBe(1));
       expect(attachmentCalls()).toBe(1);
-      expect(uploadCalls()).toBe(1);
 
       await vi.advanceTimersByTimeAsync(intervalMs * 3);
       expect(attachmentCalls()).toBe(1);
