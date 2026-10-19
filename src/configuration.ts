@@ -24,6 +24,7 @@ export interface ValidatedConfig {
   trackPageViews: boolean;
   screenNameForPath?: (pathname: string) => string;
   beforeSend?: PulseConfiguration["beforeSend"];
+  canDeliver?: PulseConfiguration["canDeliver"];
   ignoreErrors?: Array<string | RegExp>;
   networkTracking: boolean;
   networkUrlMode?: "path" | "origin";
@@ -122,6 +123,9 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
   if (config.beforeSend !== undefined && typeof config.beforeSend !== "function") {
     throw new Error("Pubky Pulse: beforeSend must be a function");
   }
+  if (config.canDeliver !== undefined && typeof config.canDeliver !== "function") {
+    throw new Error("Pubky Pulse: canDeliver must be a function");
+  }
 
   const network = config.networkTracking;
   if (network !== undefined && typeof network !== "boolean" &&
@@ -178,6 +182,7 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     trackPageViews: config.trackPageViews ?? true,
     screenNameForPath: config.screenNameForPath,
     beforeSend: config.beforeSend,
+    canDeliver: config.canDeliver,
     ignoreErrors: snapshotIgnoreErrors(config.ignoreErrors),
     networkTracking: typeof network === "object" ? true : network ?? false,
     networkUrlMode,
