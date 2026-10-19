@@ -408,9 +408,12 @@ export class Transport {
     const body: IngestRequest = { bundle_id: this.config.bundleId, events: batch };
     const repark = (): void => {
       if (this.stopped) return;
-      // Consent may have been withdrawn while the request ran: never persist after a veto.
+      // Consent may have been withdrawn while the request ran: never persist
+      // after a veto. Keep the batch in memory instead, as the held flush path
+      // does: replayed events stay tracked, so stop() restores them once.
       if (!this.deliveryAllowed()) {
-        this.onDebug?.(`delivery vetoed, not re-parking ${batch.length} keepalive events`);
+        this.onDebug?.(`delivery vetoed, keeping ${batch.length} keepalive events in memory`);
+        this.rebufferAhead(batch);
         return;
       }
       void this.queue.append(batch, () => !this.stopped).then(() => this.forgetReplay(batch)).catch(() => undefined);

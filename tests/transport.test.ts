@@ -1214,31 +1214,78 @@ describe("Transport", () => {
       expect(sentIds()).toEqual(["event-0", "event-1", "event-2"]);
     });
 
-    it("does not re-park a failed keepalive batch once consent is withdrawn", async () => {
+    /** Fail a keepalive unload flush of event-0 and event-1 after consent is withdrawn mid-request. */
+    async function failKeepaliveAfterWithdrawal(failure: "reject" | "5xx"): Promise<Transport> {
+      allowed = true;
+      fetchMock.mockImplementationOnce(() => failure === "reject"
+        ? Promise.reject(new TypeError("network error"))
+        : Promise.resolve(new Response(null, { status: 503 })));
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+      tx.enqueue(makeEvent(1));
+      tx.flushOnUnload();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(0);
+      return tx;
+    }
+
+    it.each(["reject", "5xx"] as const)(
+      "keeps a keepalive batch that fails by %s after withdrawal in memory, never in storage",
+      async (failure) => {
+        const tx = await failKeepaliveAfterWithdrawal(failure);
+
+        expect(testLocalStorage.keys()).toEqual([]);
+        expect(tx.bufferSize).toBe(2);
+
+        tx.enqueue(makeEvent(2));
+        allowed = true;
+        fetchMock.mockResolvedValue(ok());
+        await tx.flush();
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(ids(requestBody(fetchMock.mock.calls[1]!).events)).toEqual(["event-0", "event-1", "event-2"]);
+        expect(tx.bufferSize).toBe(0);
+        expect(testLocalStorage.keys()).toEqual([]);
+      },
+    );
+
+    it("discards a failed keepalive batch once the transport is stopped", async () => {
       allowed = true;
       let fail!: (reason: Error) => void;
-      fetchMock.mockImplementation(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
-      const tx = createGated();
+      fetchMock.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
+      const tx = createGated({ flushIntervalMs: 600_000 });
       tx.enqueue(makeEvent(0));
       tx.flushOnUnload();
-
       allowed = false;
+      tx.stop();
       fail(new TypeError("network error"));
       await vi.advanceTimersByTimeAsync(0);
 
+      expect(tx.bufferSize).toBe(0);
       expect(testLocalStorage.keys()).toEqual([]);
     });
 
-    it("does not re-park a keepalive 5xx once consent is withdrawn", async () => {
+    it("restores a replayed event kept from a failed keepalive exactly once on stop", async () => {
+      await queue.append([makeEvent(90)]);
       allowed = true;
-      fetchMock.mockResolvedValue(new Response(null, { status: 503 }));
-      const tx = createGated();
-      tx.enqueue(makeEvent(0));
-      tx.flushOnUnload();
-      allowed = false;
+      fetchMock
+        .mockResolvedValueOnce(new Response("boom", { status: 503 }))
+        .mockRejectedValueOnce(new TypeError("network error"));
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      const flushed = tx.flush();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(testLocalStorage.keys()).toEqual([]);
+      tx.flushOnUnload();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+      await flushed;
+      expect(tx.bufferSize).toBe(1);
+      expect(queue.read()).toEqual([]);
+
+      tx.stop();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ids(queue.read())).toEqual(["event-90"]);
     });
 
     it("discards leftovers on shutdown instead of persisting them", async () => {
