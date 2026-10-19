@@ -4,22 +4,30 @@ import {
   AttachmentUploader,
   inferContentType,
   MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_QUEUE_ITEMS,
   MAX_UPLOAD_TIMEOUT_MS,
   uploadTimeoutMs,
 } from "../src/attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "../src/configuration";
+import { createDeliveryGate } from "../src/delivery-gate";
 import { REQUEST_TIMEOUT_MS } from "../src/transport";
 import { resetTestEnvironment } from "./setup";
 
 const EVENT_ID = "11111111-1111-4111-8111-111111111111";
 
-function makeConfig(): ValidatedConfig {
+function makeConfig(canDeliver?: () => boolean): ValidatedConfig {
   return validateConfiguration({
     endpoint: "https://pulse.example.com",
     apiKey: "pulse_client_abc",
     bundleId: "com.example.web",
     isDev: false,
+    canDeliver,
   });
+}
+
+/** An uploader asking `config.canDeliver` through the gate `Pulse` builds for each client. */
+function gatedUploader(config: ValidatedConfig, onDebug?: (message: string, detail?: unknown) => void): AttachmentUploader {
+  return new AttachmentUploader(config, onDebug, createDeliveryGate(config.canDeliver, onDebug));
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -358,5 +366,215 @@ describe("AttachmentUploader", () => {
 
     await expect(uploader.flush()).resolves.toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("AttachmentUploader canDeliver gate", () => {
+  let allowed: boolean;
+  const canDeliver = () => allowed;
+
+  beforeEach(() => {
+    resetTestEnvironment();
+    fetchMock = vi.fn();
+    debug = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    respondWithUploadUrls();
+    allowed = false;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** How many attachments an ungated uploader can still retain, given the shared caps. */
+  async function freeRetentionSlots(): Promise<number> {
+    const probe = gatedUploader(makeConfig(), debug);
+    const before = callsTo("/v1/ingest/attachment").length;
+    probe.enqueue(EVENT_ID, undefined, Array.from({ length: MAX_ATTACHMENT_QUEUE_ITEMS }, (_, index) => ({
+      data: new Uint8Array([index + 1]),
+      filename: `probe-${index}.bin`,
+    })));
+    await probe.flush();
+    return callsTo("/v1/ingest/attachment").length - before;
+  }
+
+  function reservedFilenames(): string[] {
+    return callsTo("/v1/ingest/attachment").map(
+      ([, init]) => (JSON.parse(init.body as string) as { original_filename: string }).original_filename,
+    );
+  }
+
+  it("holds a vetoed attachment in the queue, retained, until a later flush delivers it once", async () => {
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([2]), filename: "two.bin" }]);
+    await uploader.flush();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("canDeliver vetoed"), undefined);
+    // Both held items still count against the shared retention cap.
+    expect(await freeRetentionSlots()).toBe(MAX_ATTACHMENT_QUEUE_ITEMS - 2);
+    fetchMock.mockClear();
+
+    allowed = true;
+    await uploader.flush();
+    expect(reservedFilenames()).toEqual(["one.bin", "two.bin"]);
+    expect(callsTo("uploads.example.com")).toHaveLength(2);
+
+    await uploader.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(await freeRetentionSlots()).toBe(MAX_ATTACHMENT_QUEUE_ITEMS);
+  });
+
+  it("puts an item vetoed just before its reservation back at the head of the queue", async () => {
+    let checks = 0;
+    // Allow the item to leave the queue, then veto its reservation.
+    const uploader = gatedUploader(makeConfig(() => (checks += 1) === 1 || allowed), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [
+      { data: new Uint8Array([1]), filename: "one.bin" },
+      { data: new Uint8Array([2]), filename: "two.bin" },
+    ]);
+    await uploader.flush();
+    // The drain's check, the reservation's veto, then the settling drain's one restart check.
+    expect(checks).toBe(3);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    allowed = true;
+    await uploader.flush();
+    expect(reservedFilenames()).toEqual(["one.bin", "two.bin"]);
+    expect(callsTo("uploads.example.com")).toHaveLength(2);
+  });
+
+  it("abandons and releases an item vetoed between its reservation and its PUT", async () => {
+    allowed = true;
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
+    const reserve = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      allowed = false;
+      return reserve(url, init);
+    });
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
+    await uploader.flush();
+
+    expect(callsTo("/v1/ingest/attachment")).toHaveLength(1);
+    expect(callsTo("uploads.example.com")).toHaveLength(0);
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("abandoning"));
+
+    allowed = true;
+    fetchMock.mockImplementation(reserve);
+    await uploader.flush();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(await freeRetentionSlots()).toBe(MAX_ATTACHMENT_QUEUE_ITEMS);
+  });
+
+  it("does not strand an item enqueued while a vetoed drain is still settling", async () => {
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
+
+    // The veto ends this drain synchronously, but it is cleared only in a later microtask.
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
+    allowed = true;
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([2]), filename: "two.bin" }]);
+
+    // No flush(): the settling drain must restart on its own.
+    await vi.waitFor(() => expect(callsTo("uploads.example.com")).toHaveLength(2));
+    expect(reservedFilenames()).toEqual(["one.bin", "two.bin"]);
+  });
+
+  it("does not restart a settling drain while delivery stays vetoed", async () => {
+    let checks = 0;
+    const uploader = gatedUploader(makeConfig(() => { checks += 1; return false; }), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // One check in the drain, one in its settling restart check, then nothing.
+    expect(checks).toBe(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+    uploader.stop();
+  });
+
+  it("resumes a held item from resumeHeld() once allowed, asking the gate once per call while vetoed", async () => {
+    let checks = 0;
+    const uploader = gatedUploader(makeConfig(() => { checks += 1; return allowed; }), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "held.bin" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    checks = 0;
+
+    uploader.resumeHeld();
+    uploader.resumeHeld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(checks).toBe(2);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    allowed = true;
+    uploader.resumeHeld();
+    await vi.waitFor(() => expect(callsTo("uploads.example.com")).toHaveLength(1));
+    // Nothing pending: later calls neither ask the gate nor send anything.
+    checks = 0;
+    uploader.resumeHeld();
+    await uploader.flush();
+    expect(checks).toBe(0);
+    expect(reservedFilenames()).toEqual(["held.bin"]);
+  });
+
+  it("does nothing from resumeHeld() after stop", async () => {
+    let checks = 0;
+    const uploader = gatedUploader(makeConfig(() => { checks += 1; return allowed; }), debug);
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "held.bin" }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    uploader.stop();
+    checks = 0;
+
+    allowed = true;
+    uploader.resumeHeld();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(checks).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("releases held attachments on stop and never sends them", async () => {
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "held.bin" }]);
+    await uploader.flush();
+    uploader.stop();
+
+    allowed = true;
+    await uploader.flush();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await freeRetentionSlots()).toBe(MAX_ATTACHMENT_QUEUE_ITEMS);
+    expect(reservedFilenames()).not.toContain("held.bin");
+  });
+
+  it.each([
+    ["a throw", () => { throw new Error("consent store unavailable"); }],
+    ["1", () => 1],
+    ["'yes'", () => "yes"],
+    ["undefined", () => undefined],
+    ["a Promise", () => Promise.resolve(true)],
+  ])("treats %s from canDeliver as a veto", async (_label, result) => {
+    const uploader = gatedUploader(makeConfig(result as unknown as () => boolean), debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "a.bin" }]);
+    await uploader.flush();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    uploader.stop();
+  });
+
+  it("uploads as before when canDeliver is omitted", async () => {
+    const config = makeConfig();
+    expect(config.canDeliver).toBeUndefined();
+    const uploader = gatedUploader(config, debug);
+
+    uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "a.bin" }]);
+    await uploader.flush();
+
+    expect(reservedFilenames()).toEqual(["a.bin"]);
+    expect(callsTo("uploads.example.com")).toHaveLength(1);
   });
 });

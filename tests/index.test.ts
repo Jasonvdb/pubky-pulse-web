@@ -2457,6 +2457,105 @@ describe("Pulse", () => {
   it("still validates the configuration during server rendering", () => {
     expect(() => Pulse.configure({ ...config, apiKey: "nope" })).toThrow(/pulse_client_/);
   });
+
+  describe("canDeliver", () => {
+    // Consent as the host app sees it; another tab can flip it at any time.
+    let consent: boolean;
+    const gated = { ...config, canDeliver: () => consent };
+
+    beforeEach(() => {
+      consent = true;
+    });
+
+    it("holds events after a withdrawal in another tab, and reset deletes them", async () => {
+      vi.useFakeTimers();
+      Pulse.init(gated);
+      Pulse.info("before-withdrawal");
+      consent = false;
+
+      await vi.advanceTimersByTimeAsync(3 * 5000);
+      await Pulse.flush();
+      testDocument.visibilityState = "hidden";
+      testDocument.dispatchEvent(new Event("visibilitychange"));
+      testWindow.dispatchEvent(new Event("pagehide"));
+      await settle();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(queueKeys()).toEqual([]);
+
+      Pulse.reset();
+      consent = true;
+      await vi.advanceTimersByTimeAsync(3 * 5000);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(queueKeys()).toEqual([]);
+
+      // A new client in this tab starts empty: the held events are gone.
+      Pulse.init(gated);
+      Pulse.info("after-reset");
+      await Pulse.flush();
+      const messages = sentEvents().map((event) => event.message);
+      expect(messages).toContain("after-reset");
+      expect(messages).not.toContain("before-withdrawal");
+    });
+
+    it("sends no identity claim or user properties while vetoed", async () => {
+      Pulse.configure(gated);
+      consent = false;
+      await Pulse.setUser("user-9");
+      await Pulse.setUserProperties({ plan: "pro" });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["the pre-flush is vetoed", [false, true]],
+      ["the pre-flush batch is vetoed after an up-front allow", [true, false, true]],
+    ])("withholds user properties when %s, even if their own post is allowed", async (_label, sequence) => {
+      // Each answer is consumed by the next gate check; once they run out, `consent` decides.
+      const answers: boolean[] = [];
+      Pulse.configure({ ...gated, canDeliver: () => answers.shift() ?? consent });
+      await Pulse.setUser("user-9");
+      await Pulse.flush();
+      fetchMock.mockClear();
+      Pulse.info("pending");
+      answers.push(...sequence);
+      consent = false;
+
+      await Pulse.setUserProperties({ plan: "pro" });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      // The answer left over was meant for the properties post, which never asked.
+      expect(answers).toEqual([true]);
+      // The event was held in memory, not dropped: it goes out once consent returns.
+      consent = true;
+      await Pulse.flush();
+      expect(appEvents().map((event) => event.message)).toContain("pending");
+      expect(identityPosts("/v1/identity/properties")).toEqual([]);
+    });
+
+    it("flushes pending events before posting user properties while allowed", async () => {
+      Pulse.configure(gated);
+      await Pulse.setUser("user-9");
+      await Pulse.flush();
+      fetchMock.mockClear();
+      Pulse.info("pending");
+
+      await Pulse.setUserProperties({ plan: "pro" });
+
+      expect(requestPaths()).toEqual(["/v1/ingest", "/v1/identity/properties"]);
+      expect(appEvents().map((event) => event.message)).toEqual(["pending"]);
+    });
+
+    it("still sends feedback while vetoed, and holds its audit event", async () => {
+      Pulse.configure(gated);
+      consent = false;
+      fetchMock.mockResolvedValueOnce(new Response(
+        JSON.stringify({ id: "feedback-1", created_at: "2026-10-19T00:00:00.000Z" }),
+        { status: 201 },
+      ));
+      expect((await Pulse.sendFeedback("the checkout button is hidden")).id).toBe("feedback-1");
+      await Pulse.flush();
+      expect(requestPaths()).toEqual(["/v1/feedback"]);
+    });
+  });
 });
 
 describe("Pulse feedback, questionnaires and attachments", () => {
@@ -2660,6 +2759,147 @@ describe("Pulse feedback, questionnaires and attachments", () => {
     expect(
       fetchMock.mock.calls.some((c) => (c[0] as string).startsWith("https://uploads.example.com/")),
     ).toBe(true);
+  });
+
+  describe("one delivery gate for events and attachments", () => {
+    // Counts canDeliver calls made while another call is still running. The
+    // gate must veto a nested send itself, without asking the host again.
+    let depth: number;
+    let nested: number;
+    let reenter: (() => void) | null;
+    const canDeliver = (): boolean => {
+      if (depth > 0) nested += 1;
+      depth += 1;
+      try {
+        const run = reenter;
+        reenter = null;
+        run?.();
+        return true;
+      } finally {
+        depth -= 1;
+      }
+    };
+
+    beforeEach(() => {
+      depth = 0;
+      nested = 0;
+      reenter = null;
+    });
+
+    it("vetoes an event flush the callback starts while an attachment upload is asking", async () => {
+      Pulse.configure({ ...config, canDeliver });
+      Pulse.info("pending");
+      let innerFlush: Promise<void> | undefined;
+      reenter = () => { innerFlush = Pulse.flush(); };
+
+      Pulse.error("upload_failed", undefined, {
+        attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+      });
+      expect(innerFlush).toBeDefined();
+      expect(nested).toBe(0);
+      expect(sentEvents()).toEqual([]);
+
+      await innerFlush;
+      await Pulse.flush();
+      expect(nested).toBe(0);
+      expect(appEvents().map((event) => event.message)).toEqual(["pending", "upload_failed"]);
+    });
+
+    it("vetoes an attachment drain the callback starts while an event flush is asking", async () => {
+      Pulse.configure({ ...config, canDeliver });
+      Pulse.info("pending");
+      reenter = () => {
+        Pulse.error("from_callback", undefined, {
+          attachments: [{ data: new Uint8Array([4, 5, 6]), filename: "nested.log" }],
+        });
+      };
+
+      const flushed = Pulse.flush();
+      expect(nested).toBe(0);
+      expect(fetchMock.mock.calls.some((call) => (call[0] as string).includes("/v1/ingest/attachment"))).toBe(false);
+
+      await flushed;
+      await Pulse.flush();
+      expect(nested).toBe(0);
+      // Held, not lost: the drain restarts outside the callback and uploads it.
+      expect(fetchMock.mock.calls.some((call) => (call[0] as string).includes("/v1/ingest/attachment"))).toBe(true);
+    });
+  });
+
+  describe("attachments a canDeliver veto held", () => {
+    const intervalMs = 5000;
+    let consent: boolean;
+    let checks: number;
+    const canDeliver = (): boolean => {
+      checks += 1;
+      return consent;
+    };
+    const attachmentCalls = (): number =>
+      fetchMock.mock.calls.filter((call) => (call[0] as string).includes("/v1/ingest/attachment")).length;
+    const uploadCalls = (): number =>
+      fetchMock.mock.calls.filter((call) => (call[0] as string).startsWith("https://uploads.example.com/")).length;
+
+    beforeEach(() => {
+      consent = false;
+      checks = 0;
+      vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("resume on the flush interval once consent returns, without a flush or new enqueue", async () => {
+      Pulse.configure({ ...config, flushIntervalMs: intervalMs, canDeliver });
+      Pulse.error("upload_failed", undefined, {
+        attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // While vetoed, each tick asks once for the event flush and once for the
+      // held attachment, and fetches nothing.
+      checks = 0;
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(checks).toBe(3 * 2);
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      consent = true;
+      await vi.advanceTimersByTimeAsync(intervalMs);
+      expect(appEvents().map((event) => event.message)).toContain("upload_failed");
+      // Hashing the bytes (crypto.subtle) settles outside the fake clock, so
+      // wait for the resumed upload instead of assuming a number of turns.
+      await vi.waitFor(() => expect(uploadCalls()).toBe(1));
+      expect(attachmentCalls()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(attachmentCalls()).toBe(1);
+      expect(uploadCalls()).toBe(1);
+    });
+
+    it("cost one check per tick with no attachments held", async () => {
+      Pulse.configure({ ...config, flushIntervalMs: intervalMs, canDeliver });
+      await vi.advanceTimersByTimeAsync(0);
+      checks = 0;
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(checks).toBe(3);
+    });
+
+    it("are not resumed by the interval after reset", async () => {
+      Pulse.configure({ ...config, flushIntervalMs: intervalMs, canDeliver });
+      Pulse.error("upload_failed", undefined, {
+        attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      Pulse.reset();
+      consent = true;
+      checks = 0;
+
+      await vi.advanceTimersByTimeAsync(intervalMs * 3);
+      expect(checks).toBe(0);
+      expect(attachmentCalls()).toBe(0);
+      expect(uploadCalls()).toBe(0);
+    });
   });
 
   it("does not schedule attachments when beforeSend drops their event", async () => {

@@ -502,6 +502,28 @@ describe("OfflineQueue", () => {
       expect(locks.requested).toEqual([LOCK_NAME, LOCK_NAME]);
     });
 
+    it("writes nothing and reports false when the predicate turns false while waiting for the lock", async () => {
+      await queue.append([makeEvent(0)]);
+      const stored = testLocalStorage.getItem(QUEUE_KEY);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      void locks.request(LOCK_NAME, () => held);
+
+      let active = true;
+      const appended = queue.append([makeEvent(1)], () => active);
+      await Promise.resolve();
+      active = false;
+      release();
+
+      await expect(appended).resolves.toBe(false);
+      expect(testLocalStorage.getItem(QUEUE_KEY)).toBe(stored);
+      expect(spillKeys()).toEqual([]);
+      await expect(queue.append([makeEvent(2)], () => true)).resolves.toBe(true);
+      expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0", "event-2"]);
+    });
+
     it("takes the lock for a drain as well", async () => {
       await queue.append([makeEvent(0)]);
       locks.requested.length = 0;

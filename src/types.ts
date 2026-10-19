@@ -86,6 +86,16 @@ export interface PulseConfiguration {
    */
   beforeSend?: (event: LogEvent, hint: PulseEventHint) => LogEvent | null;
   /**
+   * Decide, at send time, whether events may leave the page. Called
+   * synchronously right before every network send of events and their
+   * attachments, including on every flush interval tick and threshold flush,
+   * so it must be cheap. Only a literal `true` allows the send: `false`, a
+   * thrown error, a non-boolean, a thenable, or a re-entrant call is a veto.
+   * Held events stay in memory and are not persisted. Omit it to keep the
+   * default behavior. Feedback and questionnaire responses are not gated.
+   */
+  canDeliver?: () => boolean;
+  /**
    * Drop error-level events matching the complete message or `Type: message`
    * before beforeSend. Strings match substrings; RegExp state is isolated.
    */

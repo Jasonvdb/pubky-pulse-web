@@ -170,6 +170,7 @@ describe("validateConfiguration", () => {
     expect(config.supportedLanguages).toBeUndefined();
     expect(config.screenNameForPath).toBeUndefined();
     expect(config.beforeSend).toBeUndefined();
+    expect(config.canDeliver).toBeUndefined();
   });
 
   it("uses the default storage namespace when none is supplied", () => {
@@ -252,6 +253,17 @@ describe("validateConfiguration", () => {
   it.each([null, false, 42, "filter", {}, []])("rejects a non-function beforeSend: %j", (value) => {
     expect(() => validateConfiguration({ ...base, beforeSend: value as never })).toThrow(
       "Pubky Pulse: beforeSend must be a function",
+    );
+  });
+
+  it("preserves canDeliver without invoking it during validation", () => {
+    const canDeliver = () => { throw new Error("capture only"); };
+    expect(validateConfiguration({ ...base, canDeliver }).canDeliver).toBe(canDeliver);
+  });
+
+  it.each([null, true, 42, "yes", {}, []])("rejects a non-function canDeliver: %j", (value) => {
+    expect(() => validateConfiguration({ ...base, canDeliver: value as never })).toThrow(
+      "Pubky Pulse: canDeliver must be a function",
     );
   });
 });

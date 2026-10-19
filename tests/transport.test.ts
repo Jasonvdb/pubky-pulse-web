@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { validateConfiguration, type ValidatedConfig } from "../src/configuration";
+import { createDeliveryGate } from "../src/delivery-gate";
 import { OfflineQueue } from "../src/offline-queue";
 import { SafeStorage } from "../src/storage";
 import {
@@ -7,6 +8,7 @@ import {
   KEEPALIVE_BODY_LIMIT_BYTES,
   MAX_BATCH_SIZE,
   MAX_INGEST_EVENTS,
+  MAX_RETRIES,
   MAX_RETRY_AFTER_MS,
   parseRetryAfter,
   retryDelayMs,
@@ -14,7 +16,7 @@ import {
   Transport,
 } from "../src/transport";
 import type { IngestRequest, LogEvent, PulseConfiguration } from "../src/types";
-import { resetTestEnvironment, testNavigator, TestLockManager } from "./setup";
+import { resetTestEnvironment, testLocalStorage, testNavigator, TestLockManager } from "./setup";
 
 const BUNDLE_ID = "com.example.web";
 
@@ -156,7 +158,8 @@ describe("Transport", () => {
   let transport: Transport | null = null;
 
   function createTransport(overrides: Partial<PulseConfiguration> = {}): Transport {
-    transport = new Transport(makeConfig(overrides), queue);
+    const config = makeConfig(overrides);
+    transport = new Transport(config, queue, undefined, createDeliveryGate(config.canDeliver));
     return transport;
   }
 
@@ -193,6 +196,32 @@ describe("Transport", () => {
     expect(queue.read().map((event) => event.client_event_id)).toEqual(["event-0"]);
     expect(tx.bufferSize).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("runs the interval tick hook once per interval, and never after stop", async () => {
+    const tx = createTransport({ flushIntervalMs: 5000 });
+    const tick = vi.fn();
+    tx.setIntervalTick(tick);
+
+    await vi.advanceTimersByTimeAsync(5000 * 2);
+    expect(tick).toHaveBeenCalledTimes(2);
+
+    tx.stop();
+    tx.setIntervalTick(tick);
+    await vi.advanceTimersByTimeAsync(5000 * 2);
+    expect(tick).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps flushing on the interval when the tick hook throws", async () => {
+    const tx = createTransport({ flushIntervalMs: 5000 });
+    tx.setIntervalTick(() => { throw new Error("hook failed"); });
+    tx.enqueue(makeEvent(0));
+
+    await vi.advanceTimersByTimeAsync(5000);
+    tx.enqueue(makeEvent(1));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    tx.stop();
   });
 
   it("does not mutate a queued replay after stop while waiting for a storage lock", async () => {
@@ -1026,6 +1055,519 @@ describe("Transport", () => {
         user_id: "user-1",
         properties: { plan: "pro" },
       });
+    });
+  });
+  describe("canDeliver", () => {
+    let allowed: boolean;
+    const canDeliver = vi.fn(() => allowed);
+
+    beforeEach(() => {
+      allowed = false;
+      canDeliver.mockClear();
+      canDeliver.mockImplementation(() => allowed);
+    });
+
+    function createGated(overrides: Partial<PulseConfiguration> = {}): Transport {
+      return createTransport({ flushThreshold: 1000, maxBufferSize: 1000, canDeliver, ...overrides });
+    }
+
+    function ids(events: LogEvent[]): string[] {
+      return events.map((event) => event.client_event_id);
+    }
+
+    function sentIds(): string[] {
+      return fetchMock.mock.calls.flatMap((call) => ids(requestBody(call).events));
+    }
+
+    /** Advance through several intervals and prove nothing was sent or scheduled. */
+    async function expectHeldThroughIntervals(timers: number, intervalMs = 5000): Promise<void> {
+      await vi.advanceTimersByTimeAsync(intervalMs * 4);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(timers);
+    }
+
+    it("holds events through interval ticks, then delivers them once when allowed again", async () => {
+      const tx = createGated({ flushIntervalMs: 5000 });
+      for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+      const timers = vi.getTimerCount();
+
+      await expectHeldThroughIntervals(timers);
+      expect(canDeliver).toHaveBeenCalledTimes(4);
+      expect(tx.bufferSize).toBe(3);
+      expect(queue.read()).toEqual([]);
+
+      allowed = true;
+      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(5000 * 3);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(sentIds()).toEqual(["event-0", "event-1", "event-2"]);
+      expect(tx.bufferSize).toBe(0);
+    });
+
+    it("holds a threshold flush", async () => {
+      const tx = createGated({ flushThreshold: 2 });
+      tx.enqueue(makeEvent(0));
+      tx.enqueue(makeEvent(1));
+      tx.enqueue(makeEvent(2));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(canDeliver).toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(3);
+      expect(vi.getTimerCount()).toBe(1);
+    });
+
+    it("holds an explicit flush", async () => {
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+      await tx.flush();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+      expect(queue.read()).toEqual([]);
+      expect(vi.getTimerCount()).toBe(1);
+    });
+
+    it("does not drain the offline queue while vetoed", async () => {
+      await queue.append([makeEvent(90), makeEvent(91)]);
+      const stored = testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)]);
+      const tx = createGated({ flushIntervalMs: 5000 });
+      tx.enqueue(makeEvent(0));
+
+      await tx.flush();
+      await expectHeldThroughIntervals(1);
+
+      expect(ids(queue.read())).toEqual(["event-90", "event-91"]);
+      expect(testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)])).toEqual(stored);
+      expect(tx.bufferSize).toBe(1);
+
+      allowed = true;
+      await tx.flush();
+      expect(sentIds()).toEqual(["event-90", "event-91", "event-0"]);
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("stops a retry ladder when consent is withdrawn mid-flight and keeps the batch in order", async () => {
+      allowed = true;
+      fetchMock.mockResolvedValueOnce(new Response("boom", { status: 503 }));
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      for (let i = 0; i < MAX_BATCH_SIZE + 2; i += 1) tx.enqueue(makeEvent(i));
+
+      const flushed = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+      await flushed;
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // Only the flush interval is left: no backoff sleep, no request timeout.
+      expect(vi.getTimerCount()).toBe(1);
+      expect(queue.read()).toEqual([]);
+      expect(tx.bufferSize).toBe(MAX_BATCH_SIZE + 2);
+
+      allowed = true;
+      await tx.flush();
+      expect(ids(requestBody(fetchMock.mock.calls[1]!).events)).toEqual(
+        Array.from({ length: MAX_BATCH_SIZE }, (_, i) => `event-${i}`),
+      );
+      expect(ids(requestBody(fetchMock.mock.calls[2]!).events)).toEqual([
+        `event-${MAX_BATCH_SIZE}`,
+        `event-${MAX_BATCH_SIZE + 1}`,
+      ]);
+    });
+
+    it.each(["final attempt", "offline mid-ladder"] as const)(
+      "keeps a batch in memory when consent is withdrawn before it would park (%s)",
+      async (when) => {
+        allowed = true;
+        fetchMock.mockImplementation(() => {
+          if (when === "final attempt" && fetchMock.mock.calls.length === MAX_RETRIES + 1) allowed = false;
+          if (when === "offline mid-ladder") {
+            allowed = false;
+            testNavigator.onLine = false;
+          }
+          return Promise.resolve(new Response("boom", { status: 503 }));
+        });
+        const tx = createGated({ flushIntervalMs: 600_000 });
+        tx.enqueue(makeEvent(0));
+
+        const flushed = tx.flush();
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt += 1) {
+          await vi.advanceTimersByTimeAsync(backoffDelayMs(attempt));
+        }
+        await flushed;
+
+        expect(fetchMock).toHaveBeenCalledTimes(when === "final attempt" ? MAX_RETRIES + 1 : 1);
+        expect(testLocalStorage.keys()).toEqual([]);
+        expect(tx.bufferSize).toBe(1);
+
+        testNavigator.onLine = true;
+        allowed = true;
+        fetchMock.mockReset();
+        fetchMock.mockResolvedValue(ok());
+        await tx.flush();
+        expect(sentIds()).toEqual(["event-0"]);
+        expect(tx.bufferSize).toBe(0);
+        expect(testLocalStorage.keys()).toEqual([]);
+      },
+    );
+
+    it("leaves the offline queue untouched when consent is withdrawn while the drain waits on a lock", async () => {
+      await queue.append([makeEvent(90), makeEvent(91)]);
+      const stored = testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)]);
+      testNavigator.locks = new TestLockManager();
+      let release!: () => void;
+      const blocker = testNavigator.locks.request("pulse_offline_queue", () =>
+        new Promise<void>((resolve) => { release = resolve; }));
+      await Promise.resolve();
+      allowed = true;
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+
+      const flushing = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      allowed = false;
+      release();
+      await blocker;
+      await flushing;
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)])).toEqual(stored);
+      expect(tx.bufferSize).toBe(1);
+
+      allowed = true;
+      await tx.flush();
+      expect(sentIds()).toEqual(["event-90", "event-91", "event-0"]);
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("keeps a parking batch in memory when consent is withdrawn while the append waits on a lock", async () => {
+      await queue.append([makeEvent(90)]);
+      const locks = new TestLockManager();
+      testNavigator.locks = locks;
+      let release!: () => void;
+      let blocker: Promise<unknown> | null = null;
+      allowed = true;
+      // The send fails offline after the drain released the lock, so the batch
+      // parks; another tab takes the lock first and the append waits behind it.
+      fetchMock.mockImplementationOnce(() => {
+        testNavigator.onLine = false;
+        blocker = locks.request("pulse_offline_queue", () =>
+          new Promise<void>((resolve) => { release = resolve; }));
+        return Promise.reject(new TypeError("network error"));
+      });
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+
+      const written = tx.flushBeforeIdentityWrite();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(blocker).not.toBeNull();
+      const stored = testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)]);
+      allowed = false;
+      release();
+      await blocker;
+
+      expect(await written).toBe(false);
+      expect(testLocalStorage.keys().map((key) => [key, testLocalStorage.getItem(key)])).toEqual(stored);
+      expect(queue.read()).toEqual([]);
+      expect(tx.bufferSize).toBe(2);
+
+      testNavigator.onLine = true;
+      allowed = true;
+      await tx.flush();
+      await tx.flush();
+      // The first call is the failed attempt that parked the batch; the
+      // second is the one delivery once consent returns.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(ids(requestBody(fetchMock.mock.calls[0]!).events)).toEqual(["event-90", "event-0"]);
+      expect(ids(requestBody(fetchMock.mock.calls[1]!).events)).toEqual(["event-90", "event-0"]);
+      expect(tx.bufferSize).toBe(0);
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("re-applies the buffer caps when a held batch goes back", async () => {
+      allowed = true;
+      fetchMock.mockResolvedValueOnce(new Response("boom", { status: 503 }));
+      const tx = createGated({ flushThreshold: 3, maxBufferSize: 3, flushIntervalMs: 600_000 });
+      for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+
+      const flushed = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      tx.enqueue(makeEvent(3));
+      tx.enqueue(makeEvent(4));
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+      await flushed;
+
+      expect(tx.bufferSize).toBe(3);
+      allowed = true;
+      await tx.flush();
+      expect(ids(requestBody(fetchMock.mock.calls[1]!).events)).toEqual(["event-2", "event-3", "event-4"]);
+    });
+
+    it("leaves a held batch to the unload flush that already took it", async () => {
+      allowed = true;
+      fetchMock
+        .mockResolvedValueOnce(new Response("boom", { status: 503 }))
+        .mockResolvedValueOnce(ok());
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+      const flushed = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+
+      tx.flushOnUnload();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+      await flushed;
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(tx.bufferSize).toBe(0);
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("sends and spills nothing on unload, leaving the buffer intact", async () => {
+      const tx = createGated();
+      for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+
+      tx.flushOnUnload();
+      testNavigator.onLine = false;
+      tx.flushOnUnload();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(testLocalStorage.keys()).toEqual([]);
+      expect(tx.bufferSize).toBe(3);
+
+      // The veto did not stamp the debounce, so consent returning lets the
+      // very next unload go out.
+      testNavigator.onLine = true;
+      allowed = true;
+      tx.flushOnUnload();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(sentIds()).toEqual(["event-0", "event-1", "event-2"]);
+    });
+
+    /** Fail a keepalive unload flush of event-0 and event-1 after consent is withdrawn mid-request. */
+    async function failKeepaliveAfterWithdrawal(failure: "reject" | "5xx"): Promise<Transport> {
+      allowed = true;
+      fetchMock.mockImplementationOnce(() => failure === "reject"
+        ? Promise.reject(new TypeError("network error"))
+        : Promise.resolve(new Response(null, { status: 503 })));
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+      tx.enqueue(makeEvent(1));
+      tx.flushOnUnload();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(0);
+      return tx;
+    }
+
+    it.each(["reject", "5xx"] as const)(
+      "keeps a keepalive batch that fails by %s after withdrawal in memory, never in storage",
+      async (failure) => {
+        const tx = await failKeepaliveAfterWithdrawal(failure);
+
+        expect(testLocalStorage.keys()).toEqual([]);
+        expect(tx.bufferSize).toBe(2);
+
+        tx.enqueue(makeEvent(2));
+        allowed = true;
+        fetchMock.mockResolvedValue(ok());
+        await tx.flush();
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(ids(requestBody(fetchMock.mock.calls[1]!).events)).toEqual(["event-0", "event-1", "event-2"]);
+        expect(tx.bufferSize).toBe(0);
+        expect(testLocalStorage.keys()).toEqual([]);
+      },
+    );
+
+    it("discards a failed keepalive batch once the transport is stopped", async () => {
+      allowed = true;
+      let fail!: (reason: Error) => void;
+      fetchMock.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => { fail = reject; }));
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      tx.enqueue(makeEvent(0));
+      tx.flushOnUnload();
+      allowed = false;
+      tx.stop();
+      fail(new TypeError("network error"));
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(tx.bufferSize).toBe(0);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("restores a replayed event kept from a failed keepalive exactly once on stop", async () => {
+      await queue.append([makeEvent(90)]);
+      allowed = true;
+      fetchMock
+        .mockResolvedValueOnce(new Response("boom", { status: 503 }))
+        .mockRejectedValueOnce(new TypeError("network error"));
+      const tx = createGated({ flushIntervalMs: 600_000 });
+      const flushed = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+
+      tx.flushOnUnload();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      allowed = false;
+      await vi.advanceTimersByTimeAsync(backoffDelayMs(0));
+      await flushed;
+      expect(tx.bufferSize).toBe(1);
+      expect(queue.read()).toEqual([]);
+
+      tx.stop();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ids(queue.read())).toEqual(["event-90"]);
+    });
+
+    it("discards leftovers on shutdown instead of persisting them", async () => {
+      const onDebug = vi.fn();
+      transport = new Transport(makeConfig({ flushThreshold: 1000, canDeliver }), queue, onDebug, createDeliveryGate(canDeliver));
+      const tx = transport;
+      for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
+
+      await tx.shutdown();
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(testLocalStorage.keys()).toEqual([]);
+      expect(tx.bufferSize).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(onDebug).toHaveBeenCalledWith("delivery vetoed, discarding 3 events on shutdown", undefined);
+    });
+
+    it("skips the identity claim and its pre-flush", async () => {
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+      await expect(tx.setUserProperties("user-1", { plan: "pro" })).resolves.toBe(false);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+      expect(vi.getTimerCount()).toBe(1);
+    });
+
+    it("withholds the claim when its pre-flush was vetoed, even if the claim itself is allowed", async () => {
+      // Up-front check allows, the pre-flush is vetoed, then the claim's own post would be allowed.
+      const answers = [true, false];
+      canDeliver.mockImplementation(() => answers.shift() ?? true);
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+
+      expect(fetchMock.mock.calls.map((call) => call[0])).not.toContain("https://pulse.example.com/v1/identity/claim");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+      expect(queue.read()).toEqual([]);
+    });
+
+    it("withholds the claim when the pre-flush batch itself was vetoed and put back", async () => {
+      // Up-front, flush-start and drain checks allow; the batch's own post is vetoed.
+      const answers = [true, true, true, false];
+      canDeliver.mockImplementation(() => answers.shift() ?? true);
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+    });
+
+    it("flushes then claims, in order, while delivery is allowed", async () => {
+      allowed = true;
+      const tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(true);
+
+      expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+        "https://pulse.example.com/v1/ingest",
+        "https://pulse.example.com/v1/identity/claim",
+      ]);
+      expect(tx.bufferSize).toBe(0);
+    });
+
+    it("still submits feedback", async () => {
+      fetchMock.mockResolvedValue(
+        new Response(JSON.stringify({ id: "fb_1", created_at: "2026-09-04T00:00:00Z" }), { status: 201 }),
+      );
+      const tx = createGated();
+      await expect(tx.submitFeedback({
+        message: "feedback", sdk_name: "pubky-pulse-web", sdk_version: "test", environment: "web", is_dev: true,
+      })).resolves.toMatchObject({ id: "fb_1" });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(canDeliver).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a throw", () => { throw new Error("consent store unavailable"); }],
+      ["1", () => 1],
+      ["'yes'", () => "yes"],
+      ["undefined", () => undefined],
+      ["a Promise", () => Promise.resolve(true)],
+    ])("treats %s as a veto on every path", async (_label, answer) => {
+      canDeliver.mockImplementation(answer as unknown as () => boolean);
+      const tx = createGated({ flushIntervalMs: 5000 });
+      tx.enqueue(makeEvent(0));
+
+      await tx.flush();
+      tx.flushOnUnload();
+      await expect(tx.claimIdentity("pulse_anon_1", "user-1")).resolves.toBe(false);
+      await expect(tx.setUserProperties("user-1", { plan: "pro" })).resolves.toBe(false);
+      await expectHeldThroughIntervals(1);
+
+      expect(tx.bufferSize).toBe(1);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("holds sends started from inside the callback itself", async () => {
+      let tx!: Transport;
+      canDeliver.mockImplementation(() => {
+        void tx.flush();
+        tx.flushOnUnload();
+        return allowed;
+      });
+      tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      await tx.flush();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(tx.bufferSize).toBe(1);
+
+      allowed = true;
+      await tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(sentIds()).toEqual(["event-0"]);
+      expect(testLocalStorage.keys()).toEqual([]);
+    });
+
+    it("keeps concurrent flushes coalesced when the callback flushes re-entrantly", async () => {
+      allowed = true;
+      let tx!: Transport;
+      canDeliver.mockImplementation(() => {
+        void tx.flush();
+        return allowed;
+      });
+      let respond!: (response: Response) => void;
+      fetchMock.mockImplementation(() => new Promise<Response>((resolve) => { respond = resolve; }));
+      tx = createGated();
+      tx.enqueue(makeEvent(0));
+
+      const first = tx.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // The nested pass settled already; a second caller must still join the first.
+      expect(tx.flush()).toBe(first);
+      respond(ok());
+      await first;
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
   });
 });

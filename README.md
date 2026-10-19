@@ -552,6 +552,50 @@ What it does not promise:
 - **It is not a consent withdrawal**, and nothing already sent to the server is recalled. Use
   `Pulse.reset()` for that, and delete the server-side data separately.
 
+### Holding delivery until consent is confirmed
+
+A withdrawal in one tab reaches the other tabs only when their `storage` event fires. Until then,
+a tab that has not heard yet can still send on its next flush. `canDeliver` closes that gap: Pulse
+asks it right before every send, so it can read the consent record itself instead of trusting what
+the tab last heard:
+
+```ts
+const consentAccepted = () => localStorage.getItem("consent") === "accepted";
+
+Pulse.init({
+  apiKey: import.meta.env.VITE_PULSE_KEY,
+  canDeliver: () => consentAccepted(),
+});
+
+window.addEventListener("storage", (event) => {
+  if (event.key === "consent" && !consentAccepted()) Pulse.reset();
+});
+```
+
+Define the callback once and pass the same function on every `init`. Like `beforeSend`, a new
+inline function on each call makes a repeated `init` look like a configuration change.
+
+The callback gates every event batch: the interval flush, the threshold flush, `Pulse.flush()`,
+the unload keepalive request, each retry, offline-queue replay, the identity claim made by
+`setUser`, `setUserProperties`, and attachment reservations and uploads. It does not gate feedback
+or questionnaire responses: the person sends those explicitly.
+
+Only a literal `true` allows a send. `false`, a thrown error, any other value, a promise and a call
+made from inside the callback itself all count as a veto. The callback must be synchronous, and it
+must be cheap, because Pulse calls it on every interval tick and on threshold flushes.
+
+While the callback vetoes:
+
+- Events stay in this tab's memory and are not written to the offline queue, not even on unload.
+  When consent comes back, the next flush sends them once.
+- The buffer caps still apply, so the oldest events are dropped once the buffer is full.
+- `Pulse.reset()` deletes the held events.
+- `Pulse.shutdown()` discards the held events instead of storing them.
+- An attachment waits in its queue until delivery is allowed; the next interval tick or flush then
+  uploads it. An attachment vetoed after its reservation reached the server, but before its upload,
+  is abandoned.
+- `setUser` switches the id but sends no claim. The claim is retried on a later `init`.
+
 ### Several apps on one origin
 
 Two apps on one origin share `localStorage`, so by default they share the anonymous id, the offline
@@ -877,6 +921,7 @@ can also discard telemetry. Increasing `maxBufferSize` does not increase these b
 | `screenNameForPath` | `(pathname: string) => string` | Raw pathname | Map automatic screen names; a thrown error or blank/non-string result ends the previous screen and clears default attribution. |
 | `ignoreErrors` | `(string \| RegExp)[]` | `[]` | Filter exception/error logger messages before hooks and output. |
 | `beforeSend` | `(event: LogEvent, hint: PulseEventHint) => LogEvent \| null` | Not set | Transform or drop enriched events before output, buffering, and attachment scheduling. Synchronous only; failures drop silently. |
+| `canDeliver` | `() => boolean` | Not set | Asked right before every send of events and attachments; anything but `true` holds them in memory. Synchronous and cheap; feedback and questionnaires are not gated. See [Holding delivery until consent is confirmed](#holding-delivery-until-consent-is-confirmed). |
 | `networkTracking` | `boolean \| { urlMode?: "path" \| "origin"; sampleRate?: number }` | `false` | Emit events for `fetch` calls; true and an empty object preserve sanitized paths. `sampleRate` (0–1, default `0`) is the fraction of sessions reporting successful requests, so `true` alone reports only failures. |
 | `propagateSessionTo` | `string[]` | `[]` | URL prefixes that receive `X-Pulse-Session-Id`. |
 | `flushIntervalMs` | `number` | `5000` | Milliseconds between automatic flushes. |
