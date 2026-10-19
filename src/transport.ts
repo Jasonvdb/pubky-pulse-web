@@ -456,8 +456,8 @@ export class Transport {
    * buffered afterwards is already stamped with the new id by the caller.
    */
   async claimIdentity(anonymousId: string, userId: string): Promise<boolean> {
-    // A vetoed claim is retried by the identity manager on a later init.
-    if (!this.deliveryAllowed()) return false;
+    // A vetoed flush and claim both come back unsent, so the identity manager
+    // retries the claim on a later init.
     await this.flush();
     const outcome = await this.post(
       "/v1/identity/claim",
