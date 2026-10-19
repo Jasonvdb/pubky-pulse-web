@@ -1,6 +1,5 @@
 import { encodeBody, byteLength, type EncodedBody } from "./compression";
 import type { ValidatedConfig } from "./configuration";
-import { createDeliveryGate } from "./delivery-gate";
 import { jsonByteLength, MAX_BUFFER_BYTES, MAX_EVENT_BYTES } from "./event-size";
 import { isOnline } from "./device-info";
 import type { OfflineQueue } from "./offline-queue";
@@ -107,8 +106,13 @@ export function sliceForKeepalive(
 export class Transport {
   private readonly config: ValidatedConfig;
   private readonly queue: OfflineQueue;
-  private readonly onDebug: ((message: string, detail?: unknown) => void) | undefined;
-  /** The host's `canDeliver` consent check, asked synchronously before every event send. */
+  /** Guarded so diagnostics never re-enter; the client's shared delivery gate reports through it too. */
+  readonly onDebug: ((message: string, detail?: unknown) => void) | undefined;
+  /**
+   * The host's `canDeliver` consent check, asked synchronously before every
+   * event send. One gate is shared with the attachment uploader, so a callback
+   * that re-enters either one while it is being asked is vetoed by both.
+   */
   private readonly deliveryAllowed: () => boolean;
   private buffer: LogEvent[] = [];
   private bufferBytes = 0;
@@ -148,9 +152,11 @@ export class Transport {
     config: ValidatedConfig,
     queue: OfflineQueue,
     onDebug?: (message: string, detail?: unknown) => void,
+    deliveryAllowed: () => boolean = () => true,
   ) {
     this.config = config;
     this.queue = queue;
+    this.deliveryAllowed = deliveryAllowed;
     let diagnosing = false;
     this.onDebug = (message, detail) => {
       if (diagnosing) return;
@@ -158,7 +164,6 @@ export class Transport {
       try { onDebug?.(message, detail); } catch { /* Diagnostics cannot reject background delivery. */ }
       finally { diagnosing = false; }
     };
-    this.deliveryAllowed = createDeliveryGate(config.canDeliver, this.onDebug);
     this.timer = setInterval(() => {
       void this.flush();
     }, config.flushIntervalMs);
@@ -464,10 +469,7 @@ export class Transport {
     // A vetoed flush or claim comes back unsent, so the identity manager
     // retries the claim on a later init. The claim must never overtake
     // anonymous events a vetoed pre-flush held back: the server runs it once.
-    if (!this.deliveryAllowed()) return false;
-    const flushed = this.flush();
-    await flushed;
-    if (this.heldFlushes.has(flushed)) return false;
+    if (!(await this.flushBeforeIdentityWrite())) return false;
     const outcome = await this.post(
       "/v1/identity/claim",
       { anonymous_id: anonymousId, user_id: userId },
@@ -476,7 +478,22 @@ export class Transport {
     return outcome === "sent";
   }
 
-  /** Merge properties onto the user server-side. An empty value deletes a key. */
+  /**
+   * Flush pending events ahead of an identity write so the write never
+   * overtakes them. Resolves `false` when `canDeliver` vetoes up front or held
+   * the awaited flush back; the caller must then leave the write unsent.
+   */
+  async flushBeforeIdentityWrite(): Promise<boolean> {
+    if (!this.deliveryAllowed()) return false;
+    const flushed = this.flush();
+    await flushed;
+    return !this.heldFlushes.has(flushed);
+  }
+
+  /**
+   * Merge properties onto the user server-side. An empty value deletes a key.
+   * The caller flushes first with `flushBeforeIdentityWrite`.
+   */
   async setUserProperties(userId: string, properties: Record<string, string>): Promise<boolean> {
     const outcome = await this.post(
       "/v1/identity/properties",

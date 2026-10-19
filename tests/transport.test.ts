@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { validateConfiguration, type ValidatedConfig } from "../src/configuration";
+import { createDeliveryGate } from "../src/delivery-gate";
 import { OfflineQueue } from "../src/offline-queue";
 import { SafeStorage } from "../src/storage";
 import {
@@ -156,7 +157,8 @@ describe("Transport", () => {
   let transport: Transport | null = null;
 
   function createTransport(overrides: Partial<PulseConfiguration> = {}): Transport {
-    transport = new Transport(makeConfig(overrides), queue);
+    const config = makeConfig(overrides);
+    transport = new Transport(config, queue, undefined, createDeliveryGate(config.canDeliver));
     return transport;
   }
 
@@ -1241,7 +1243,7 @@ describe("Transport", () => {
 
     it("discards leftovers on shutdown instead of persisting them", async () => {
       const onDebug = vi.fn();
-      transport = new Transport(makeConfig({ flushThreshold: 1000, canDeliver }), queue, onDebug);
+      transport = new Transport(makeConfig({ flushThreshold: 1000, canDeliver }), queue, onDebug, createDeliveryGate(canDeliver));
       const tx = transport;
       for (let i = 0; i < 3; i += 1) tx.enqueue(makeEvent(i));
 

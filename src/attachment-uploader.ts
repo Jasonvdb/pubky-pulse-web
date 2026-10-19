@@ -13,7 +13,6 @@
  */
 
 import type { ValidatedConfig } from "./configuration";
-import { createDeliveryGate } from "./delivery-gate";
 import { REQUEST_TIMEOUT_MS } from "./transport";
 import type { PulseAttachment } from "./types";
 
@@ -107,13 +106,20 @@ export class AttachmentUploader {
   private stopped = false;
   private readonly requests = new Map<AbortController, { timer: ReturnType<typeof setTimeout>; owner: PendingUpload }>();
   private wakeDrain: (() => void) | null = null;
-  /** The host's `canDeliver` consent check, asked before each reservation and PUT. */
+  /**
+   * The host's `canDeliver` consent check, asked before each reservation and
+   * PUT. It is the same gate the transport asks, so one re-entrancy guard covers both.
+   */
   private readonly deliveryAllowed: () => boolean;
 
-  constructor(config: ValidatedConfig, onDebug?: (message: string, detail?: unknown) => void) {
+  constructor(
+    config: ValidatedConfig,
+    onDebug?: (message: string, detail?: unknown) => void,
+    deliveryAllowed: () => boolean = () => true,
+  ) {
     this.config = config;
     this.onDebug = onDebug;
-    this.deliveryAllowed = createDeliveryGate(config.canDeliver, onDebug);
+    this.deliveryAllowed = deliveryAllowed;
   }
 
   private debug(message: string, detail?: unknown): void {

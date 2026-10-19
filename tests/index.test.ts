@@ -2313,6 +2313,45 @@ describe("Pulse", () => {
       expect(fetchMock).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ["the pre-flush is vetoed", [false, true]],
+      ["the pre-flush batch is vetoed after an up-front allow", [true, false, true]],
+    ])("withholds user properties when %s, even if their own post is allowed", async (_label, sequence) => {
+      // Each answer is consumed by the next gate check; once they run out, `consent` decides.
+      const answers: boolean[] = [];
+      Pulse.configure({ ...gated, canDeliver: () => answers.shift() ?? consent });
+      await Pulse.setUser("user-9");
+      await Pulse.flush();
+      fetchMock.mockClear();
+      Pulse.info("pending");
+      answers.push(...sequence);
+      consent = false;
+
+      await Pulse.setUserProperties({ plan: "pro" });
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      // The answer left over was meant for the properties post, which never asked.
+      expect(answers).toEqual([true]);
+      // The event was held in memory, not dropped: it goes out once consent returns.
+      consent = true;
+      await Pulse.flush();
+      expect(appEvents().map((event) => event.message)).toContain("pending");
+      expect(identityPosts("/v1/identity/properties")).toEqual([]);
+    });
+
+    it("flushes pending events before posting user properties while allowed", async () => {
+      Pulse.configure(gated);
+      await Pulse.setUser("user-9");
+      await Pulse.flush();
+      fetchMock.mockClear();
+      Pulse.info("pending");
+
+      await Pulse.setUserProperties({ plan: "pro" });
+
+      expect(requestPaths()).toEqual(["/v1/ingest", "/v1/identity/properties"]);
+      expect(appEvents().map((event) => event.message)).toEqual(["pending"]);
+    });
+
     it("still sends feedback while vetoed, and holds its audit event", async () => {
       Pulse.configure(gated);
       consent = false;
@@ -2528,6 +2567,71 @@ describe("Pulse feedback, questionnaires and attachments", () => {
     expect(
       fetchMock.mock.calls.some((c) => (c[0] as string).startsWith("https://uploads.example.com/")),
     ).toBe(true);
+  });
+
+  describe("one delivery gate for events and attachments", () => {
+    // Counts canDeliver calls made while another call is still running. The
+    // gate must veto a nested send itself, without asking the host again.
+    let depth: number;
+    let nested: number;
+    let reenter: (() => void) | null;
+    const canDeliver = (): boolean => {
+      if (depth > 0) nested += 1;
+      depth += 1;
+      try {
+        const run = reenter;
+        reenter = null;
+        run?.();
+        return true;
+      } finally {
+        depth -= 1;
+      }
+    };
+
+    beforeEach(() => {
+      depth = 0;
+      nested = 0;
+      reenter = null;
+    });
+
+    it("vetoes an event flush the callback starts while an attachment upload is asking", async () => {
+      Pulse.configure({ ...config, canDeliver });
+      Pulse.info("pending");
+      let innerFlush: Promise<void> | undefined;
+      reenter = () => { innerFlush = Pulse.flush(); };
+
+      Pulse.error("upload_failed", undefined, {
+        attachments: [{ data: new Uint8Array([1, 2, 3]), filename: "trace.log" }],
+      });
+      expect(innerFlush).toBeDefined();
+      expect(nested).toBe(0);
+      expect(sentEvents()).toEqual([]);
+
+      await innerFlush;
+      await Pulse.flush();
+      expect(nested).toBe(0);
+      expect(appEvents().map((event) => event.message)).toEqual(["pending", "upload_failed"]);
+    });
+
+    it("vetoes an attachment drain the callback starts while an event flush is asking", async () => {
+      Pulse.configure({ ...config, canDeliver });
+      Pulse.info("pending");
+      reenter = () => {
+        Pulse.error("from_callback", undefined, {
+          attachments: [{ data: new Uint8Array([4, 5, 6]), filename: "nested.log" }],
+        });
+      };
+
+      const flushed = Pulse.flush();
+      expect(nested).toBe(0);
+      expect(fetchMock.mock.calls.some((call) => (call[0] as string).includes("/v1/ingest/attachment"))).toBe(false);
+
+      await flushed;
+      await Pulse.flush();
+      expect(nested).toBe(0);
+      // Held, not lost: the drain restarts outside the callback and uploads it.
+      expect(fetchMock.mock.calls.some((call) => (call[0] as string).includes("/v1/ingest/attachment"))).toBe(true);
+    });
   });
 
   it("does not schedule attachments when beforeSend drops their event", async () => {

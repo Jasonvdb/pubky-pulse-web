@@ -1,5 +1,6 @@
 import { AttachmentUploader } from "./attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "./configuration";
+import { createDeliveryGate } from "./delivery-gate";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { extractErrorAttributes } from "./error-extraction";
 import { isIgnoredError } from "./error-filter";
@@ -605,9 +606,17 @@ function initializeClient(validated: ValidatedConfig): void {
       validated.supportedLanguages,
     );
     offlineQueue = new OfflineQueue(localStore, (message) => debugLog(message), { inert: distrusted });
-    transport = new Transport(validated, offlineQueue, debugLog);
-    attachments = new AttachmentUploader(validated, debugLog);
-    const clientTransport = transport;
+    // One gate per client: its re-entrancy guard must span both senders, so a
+    // callback that flushes or logs while either is asking is vetoed by both.
+    // It reports through the transport's guarded debug sink, which exists by
+    // the time the gate is first asked.
+    const deliveryAllowed = createDeliveryGate(
+      validated.canDeliver,
+      (message, detail) => clientTransport.onDebug?.(message, detail),
+    );
+    const clientTransport = new Transport(validated, offlineQueue, debugLog, deliveryAllowed);
+    transport = clientTransport;
+    attachments = new AttachmentUploader(validated, debugLog, deliveryAllowed);
     identity = new IdentityManager({
       claim: async (anonymousId, userId) => {
         await clientTransport.claimIdentity(anonymousId, userId);
@@ -897,7 +906,9 @@ export const Pulse: PulseApi = {
     const clientTransport = transport;
     const userId = identity.currentId;
     try {
-      await clientTransport.flush();
+      // A held pre-flush leaves the write unsent, so it never overtakes the
+      // events the veto kept back.
+      if (!(await clientTransport.flushBeforeIdentityWrite())) return;
       if (transport !== clientTransport) return;
       await clientTransport.setUserProperties(userId, properties);
     } catch { /* Optional identity metadata is best effort. */ }

@@ -9,6 +9,7 @@ import {
   uploadTimeoutMs,
 } from "../src/attachment-uploader";
 import { validateConfiguration, type ValidatedConfig } from "../src/configuration";
+import { createDeliveryGate } from "../src/delivery-gate";
 import { REQUEST_TIMEOUT_MS } from "../src/transport";
 import { resetTestEnvironment } from "./setup";
 
@@ -22,6 +23,11 @@ function makeConfig(canDeliver?: () => boolean): ValidatedConfig {
     isDev: false,
     canDeliver,
   });
+}
+
+/** An uploader asking `config.canDeliver` through the gate `Pulse` builds for each client. */
+function gatedUploader(config: ValidatedConfig, onDebug?: (message: string, detail?: unknown) => void): AttachmentUploader {
+  return new AttachmentUploader(config, onDebug, createDeliveryGate(config.canDeliver, onDebug));
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -382,7 +388,7 @@ describe("AttachmentUploader canDeliver gate", () => {
 
   /** How many attachments an ungated uploader can still retain, given the shared caps. */
   async function freeRetentionSlots(): Promise<number> {
-    const probe = new AttachmentUploader(makeConfig(), debug);
+    const probe = gatedUploader(makeConfig(), debug);
     const before = callsTo("/v1/ingest/attachment").length;
     probe.enqueue(EVENT_ID, undefined, Array.from({ length: MAX_ATTACHMENT_QUEUE_ITEMS }, (_, index) => ({
       data: new Uint8Array([index + 1]),
@@ -399,7 +405,7 @@ describe("AttachmentUploader canDeliver gate", () => {
   }
 
   it("holds a vetoed attachment in the queue, retained, until a later flush delivers it once", async () => {
-    const uploader = new AttachmentUploader(makeConfig(canDeliver), debug);
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
 
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([2]), filename: "two.bin" }]);
@@ -424,7 +430,7 @@ describe("AttachmentUploader canDeliver gate", () => {
   it("puts an item vetoed just before its reservation back at the head of the queue", async () => {
     let checks = 0;
     // Allow the item to leave the queue, then veto its reservation.
-    const uploader = new AttachmentUploader(makeConfig(() => (checks += 1) === 1 || allowed), debug);
+    const uploader = gatedUploader(makeConfig(() => (checks += 1) === 1 || allowed), debug);
 
     uploader.enqueue(EVENT_ID, undefined, [
       { data: new Uint8Array([1]), filename: "one.bin" },
@@ -443,7 +449,7 @@ describe("AttachmentUploader canDeliver gate", () => {
 
   it("abandons and releases an item vetoed between its reservation and its PUT", async () => {
     allowed = true;
-    const uploader = new AttachmentUploader(makeConfig(canDeliver), debug);
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
     const reserve = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((url: string, init: RequestInit) => {
       allowed = false;
@@ -465,7 +471,7 @@ describe("AttachmentUploader canDeliver gate", () => {
   });
 
   it("does not strand an item enqueued while a vetoed drain is still settling", async () => {
-    const uploader = new AttachmentUploader(makeConfig(canDeliver), debug);
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
 
     // The veto ends this drain synchronously, but it is cleared only in a later microtask.
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
@@ -479,7 +485,7 @@ describe("AttachmentUploader canDeliver gate", () => {
 
   it("does not restart a settling drain while delivery stays vetoed", async () => {
     let checks = 0;
-    const uploader = new AttachmentUploader(makeConfig(() => { checks += 1; return false; }), debug);
+    const uploader = gatedUploader(makeConfig(() => { checks += 1; return false; }), debug);
 
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "one.bin" }]);
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -491,7 +497,7 @@ describe("AttachmentUploader canDeliver gate", () => {
   });
 
   it("releases held attachments on stop and never sends them", async () => {
-    const uploader = new AttachmentUploader(makeConfig(canDeliver), debug);
+    const uploader = gatedUploader(makeConfig(canDeliver), debug);
 
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "held.bin" }]);
     await uploader.flush();
@@ -511,7 +517,7 @@ describe("AttachmentUploader canDeliver gate", () => {
     ["undefined", () => undefined],
     ["a Promise", () => Promise.resolve(true)],
   ])("treats %s from canDeliver as a veto", async (_label, result) => {
-    const uploader = new AttachmentUploader(makeConfig(result as unknown as () => boolean), debug);
+    const uploader = gatedUploader(makeConfig(result as unknown as () => boolean), debug);
 
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "a.bin" }]);
     await uploader.flush();
@@ -523,7 +529,7 @@ describe("AttachmentUploader canDeliver gate", () => {
   it("uploads as before when canDeliver is omitted", async () => {
     const config = makeConfig();
     expect(config.canDeliver).toBeUndefined();
-    const uploader = new AttachmentUploader(config, debug);
+    const uploader = gatedUploader(config, debug);
 
     uploader.enqueue(EVENT_ID, undefined, [{ data: new Uint8Array([1]), filename: "a.bin" }]);
     await uploader.flush();
