@@ -1,5 +1,5 @@
 import { randomUuid } from "./event-builder";
-import { sessionStore } from "./storage";
+import type { SafeStorage } from "./storage";
 
 /** Session id for the current tab. `sessionStorage` is per-tab by design. */
 export const SESSION_ID_KEY = "session_id";
@@ -55,15 +55,18 @@ export function launchDurationMs(): number | undefined {
 export class SessionManager {
   private readonly timeoutMs: number;
   private readonly callbacks: SessionCallbacks;
+  private readonly store: SafeStorage;
   private currentId: string | null = null;
   /** Only sessions this page began may emit `sdk:session_ended`. */
   private startedHere = false;
   /** Reentrancy guard: the callbacks log events, which call `touch()`. */
   private rotating = false;
 
-  constructor(timeoutMs: number, callbacks: SessionCallbacks) {
+  /** `store` holds the session id; it defaults to the default namespace's. */
+  constructor(timeoutMs: number, callbacks: SessionCallbacks, store: SafeStorage) {
     this.timeoutMs = timeoutMs;
     this.callbacks = callbacks;
+    this.store = store;
   }
 
   get id(): string | null {
@@ -86,7 +89,7 @@ export class SessionManager {
    */
   start(now: number = Date.now(), options?: { resume?: boolean }): string {
     if (options?.resume !== false) {
-      const existing = sessionStore.get(SESSION_ID_KEY);
+      const existing = this.store.get(SESSION_ID_KEY);
       const lastActivity = this.readActivity();
 
       if (existing && lastActivity !== null && now - lastActivity < this.timeoutMs) {
@@ -125,7 +128,7 @@ export class SessionManager {
     const created = randomUuid();
     this.currentId = created;
     this.startedHere = true;
-    sessionStore.set(SESSION_ID_KEY, created);
+    this.store.set(SESSION_ID_KEY, created);
     this.writeActivity(now);
 
     this.rotating = true;
@@ -140,13 +143,13 @@ export class SessionManager {
   }
 
   private readActivity(): number | null {
-    const raw = sessionStore.get(SESSION_ACTIVITY_KEY);
+    const raw = this.store.get(SESSION_ACTIVITY_KEY);
     if (!raw) return null;
     const parsed = Number.parseInt(raw, 10);
     return Number.isFinite(parsed) ? parsed : null;
   }
 
   private writeActivity(now: number): void {
-    sessionStore.set(SESSION_ACTIVITY_KEY, String(now));
+    this.store.set(SESSION_ACTIVITY_KEY, String(now));
   }
 }

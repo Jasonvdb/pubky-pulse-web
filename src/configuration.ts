@@ -1,4 +1,5 @@
 import { snapshotIgnoreErrors } from "./error-filter";
+import { isValidStorageNamespace } from "./storage";
 import type { PulseConfiguration } from "./types";
 
 const CLIENT_KEY_PREFIX = "pulse_client_";
@@ -47,6 +48,12 @@ export interface ValidatedConfig {
   deviceInfoBrowser: boolean;
   deviceInfoLanguage: boolean;
   supportedLanguages?: string[];
+  /**
+   * A plain string, so `equivalentConfiguration` sees a namespace change and
+   * an `init` with a different one reports `configuration-ignored`.
+   * `undefined` is the default namespace.
+   */
+  storageNamespace?: string;
 }
 
 /**
@@ -159,6 +166,14 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     return value ?? deviceDefault;
   };
 
+  // Read once: a getter could answer the check and the result differently.
+  const storageNamespace = config.storageNamespace;
+  if (storageNamespace !== undefined && !isValidStorageNamespace(storageNamespace)) {
+    throw new Error(
+      "Pubky Pulse: storageNamespace must be 1-32 lowercase letters, digits, _ or -, starting with a letter or digit",
+    );
+  }
+
   const flushIntervalMs = positiveInteger(config.flushIntervalMs, "flushIntervalMs", 5000);
   if (flushIntervalMs > 2 ** 31 - 1) {
     throw new Error("Pubky Pulse: flushIntervalMs must not exceed 2147483647");
@@ -196,5 +211,6 @@ export function validateConfiguration(config: PulseConfiguration): ValidatedConf
     deviceInfoBrowser: deviceFlag("browser"),
     deviceInfoLanguage: deviceFlag("language"),
     supportedLanguages: stringArray(config.supportedLanguages, "supportedLanguages"),
+    storageNamespace,
   };
 }

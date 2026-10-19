@@ -1,5 +1,5 @@
 import { randomUuid } from "./event-builder";
-import { localStore } from "./storage";
+import type { SafeStorage } from "./storage";
 
 /** Anonymous id for this browser profile. Survives reloads and tabs. */
 export const ANONYMOUS_ID_KEY = "anonymous_id";
@@ -27,6 +27,7 @@ export interface IdentityHooks {
  */
 export class IdentityManager {
   private readonly hooks: IdentityHooks;
+  private readonly store: SafeStorage;
   private anonymousId: string;
   private savedUserId: string | undefined;
   private pending: Promise<void> = Promise.resolve();
@@ -37,8 +38,10 @@ export class IdentityManager {
    */
   private generation = 0;
 
-  constructor(hooks: IdentityHooks) {
+  /** `store` holds the persisted ids; it defaults to the default namespace's. */
+  constructor(hooks: IdentityHooks, store: SafeStorage) {
     this.hooks = hooks;
+    this.store = store;
     this.anonymousId = createAnonymousId();
   }
 
@@ -70,15 +73,15 @@ export class IdentityManager {
    */
   load(options?: { trustStored?: boolean }): void {
     const trustStored = options?.trustStored !== false;
-    const storedAnon = trustStored ? localStore.get(ANONYMOUS_ID_KEY) : null;
+    const storedAnon = trustStored ? this.store.get(ANONYMOUS_ID_KEY) : null;
     if (storedAnon) {
       this.anonymousId = storedAnon;
     } else {
       this.anonymousId = createAnonymousId();
-      localStore.set(ANONYMOUS_ID_KEY, this.anonymousId);
+      this.store.set(ANONYMOUS_ID_KEY, this.anonymousId);
     }
 
-    this.savedUserId = (trustStored ? localStore.get(USER_ID_KEY) : null) || undefined;
+    this.savedUserId = (trustStored ? this.store.get(USER_ID_KEY) : null) || undefined;
     if (this.savedUserId && this.savedUserId !== this.anonymousId) {
       this.generation += 1;
       this.pending = this.runClaim(this.anonymousId, this.savedUserId);
@@ -98,7 +101,7 @@ export class IdentityManager {
     }
     if (userId === this.savedUserId) return;
 
-    localStore.set(USER_ID_KEY, userId);
+    this.store.set(USER_ID_KEY, userId);
     const anonymousId = this.anonymousId;
     this.generation += 1;
     const generation = this.generation;
@@ -121,12 +124,12 @@ export class IdentityManager {
    */
   clearUser(options?: { newAnonymousId?: boolean }): void {
     this.generation += 1;
-    localStore.remove(USER_ID_KEY);
+    this.store.remove(USER_ID_KEY);
     this.savedUserId = undefined;
 
     if (options?.newAnonymousId) {
       this.anonymousId = createAnonymousId();
-      localStore.set(ANONYMOUS_ID_KEY, this.anonymousId);
+      this.store.set(ANONYMOUS_ID_KEY, this.anonymousId);
     }
   }
 

@@ -4,9 +4,9 @@ import type { IngestRequest, LogEvent, PulseEventHint, PulseResetOptions } from 
 import { ANONYMOUS_ID_KEY, USER_ID_KEY } from "../src/identity";
 import { resetSlugWarning } from "../src/metrics";
 import { OfflineQueue } from "../src/offline-queue";
-import { clearResetGuards } from "../src/reset-guard";
+import { clearAllResetGuards } from "../src/reset-guard";
 import { SESSION_ACTIVITY_KEY, SESSION_ID_KEY } from "../src/session";
-import { localStore, sessionStore, SafeStorage, STORAGE_PREFIX } from "../src/storage";
+import { allStorePairs, enumerateNamespaces, SafeStorage, STORAGE_PREFIX, storesFor } from "../src/storage";
 import {
   resetTestEnvironment,
   testDocument,
@@ -104,12 +104,14 @@ function withoutSessionStorage(run: () => void): void {
 describe("Pulse", () => {
   beforeEach(() => {
     resetTestEnvironment();
-    // `localStore`/`sessionStore` are module singletons: the backing globals
+    // Every namespace's store pair is a module singleton: the backing globals
     // are fresh every test, their in-memory fallbacks are not.
-    localStore.clear();
-    sessionStore.clear();
+    for (const pair of allStorePairs()) {
+      pair.local.clear();
+      pair.session.clear();
+    }
     // Page memory a `Pulse.reset` leaves behind, as a fresh page load has it.
-    clearResetGuards();
+    clearAllResetGuards();
     resetSlugWarning();
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     fetchMock = vi.fn((_url: string, _init?: RequestInit) =>
@@ -1541,7 +1543,7 @@ describe("Pulse", () => {
     testSessionStorage.throwOnRemove = false;
     // A fresh page keeps nothing but what storage holds: drop the in-page
     // guards and let the overwritten survivors speak for themselves.
-    clearResetGuards();
+    clearAllResetGuards();
 
     fetchMock.mockClear();
     expect(Pulse.init(config).reason).toBe("initialized");
@@ -1608,7 +1610,7 @@ describe("Pulse", () => {
     expect(output).not.toHaveBeenCalled();
 
     testSessionStorage.throwOnRemove = false;
-    clearResetGuards();
+    clearAllResetGuards();
     Pulse.init({ ...config, debug: true });
     testSessionStorage.throwOnRemove = true;
 
@@ -1649,8 +1651,8 @@ describe("Pulse", () => {
     testSessionStorage.throwOnRemove = false;
     // A store that refused the deletion still has the session where the
     // session manager looks for it.
-    sessionStore.set(SESSION_ID_KEY, oldSessionId!);
-    sessionStore.set(SESSION_ACTIVITY_KEY, String(Date.now()));
+    storesFor().session.set(SESSION_ID_KEY, oldSessionId!);
+    storesFor().session.set(SESSION_ACTIVITY_KEY, String(Date.now()));
 
     const add = testWindow.addEventListener.bind(testWindow);
     vi.spyOn(testWindow, "addEventListener").mockImplementation((type, callback, options) => {
@@ -1751,6 +1753,196 @@ describe("Pulse", () => {
     expect(messages).toContain("a-later");
     expect(messages).not.toContain("b-stale");
     expect(sentEvents().map((event) => event.session_id)).not.toContain(staleSessionId);
+  });
+
+  describe("storage namespaces", () => {
+    const SHOP = "pulse:shop.";
+    const shopConfig = { ...config, storageNamespace: "shop" };
+
+    /** Every key of one storage area with its value, sorted by key. */
+    function snapshot(storage: typeof testLocalStorage, prefix: string): Array<[string, string | null]> {
+      return storage.keys().filter((key) => key.startsWith(prefix)).sort()
+        .map((key) => [key, storage.getItem(key)]);
+    }
+
+    /** Stored state of a namespace as an initialized client leaves it. */
+    function seed(prefix: string, label: string): void {
+      testLocalStorage.setItem(`${prefix}${ANONYMOUS_ID_KEY}`, `pulse_anon_${label}`);
+      testLocalStorage.setItem(`${prefix}offline_queue`, JSON.stringify([parkedEvent(label)]));
+      testSessionStorage.setItem(`${prefix}${SESSION_ID_KEY}`, `session-${label}`);
+    }
+
+    it.each(["", "a.b", "A", 42, " x", "a:b", "x".repeat(33)])(
+      "reports an invalid storage namespace %j", (storageNamespace) => {
+        expect(Pulse.init({ ...config, storageNamespace: storageNamespace as string }))
+          .toEqual({ status: "error", reason: "invalid-configuration" });
+        expect(testLocalStorage.length).toBe(0);
+      });
+
+    it("keeps a namespaced client's keys under its own prefix", () => {
+      expect(Pulse.init(shopConfig).reason).toBe("initialized");
+
+      expect(testLocalStorage.getItem(SHOP + ANONYMOUS_ID_KEY)).toBe(Pulse.currentUserId);
+      expect(testSessionStorage.getItem(SHOP + SESSION_ID_KEY)).toBe(Pulse.sessionId);
+      expect(snapshot(testLocalStorage, STORAGE_PREFIX)).toEqual([]);
+      expect(snapshot(testSessionStorage, STORAGE_PREFIX)).toEqual([]);
+    });
+
+    it("ignores an init that changes the namespace of a running client", () => {
+      expect(Pulse.init(config).reason).toBe("initialized");
+      const userId = Pulse.currentUserId;
+
+      expect(Pulse.init(shopConfig)).toEqual({ status: "enabled", reason: "configuration-ignored" });
+      expect(Pulse.currentUserId).toBe(userId);
+      expect(snapshot(testLocalStorage, SHOP)).toEqual([]);
+    });
+
+    it("moves to the new namespace when configure replaces the client", () => {
+      Pulse.configure(config);
+      const defaultUserId = Pulse.currentUserId;
+
+      Pulse.configure(shopConfig);
+
+      expect(Pulse.currentUserId).not.toBe(defaultUserId);
+      expect(testLocalStorage.getItem(SHOP + ANONYMOUS_ID_KEY)).toBe(Pulse.currentUserId);
+      // A reset without a namespace now targets the shop, not the old client.
+      Pulse.reset();
+      expect(testLocalStorage.getItem(STORAGE_PREFIX + ANONYMOUS_ID_KEY)).toBe(defaultUserId);
+      expect(snapshot(testLocalStorage, SHOP)).toEqual([]);
+    });
+
+    it.each([
+      { label: "a default reset", options: undefined },
+      { label: "a tab reset", options: { scope: "tab" } as PulseResetOptions },
+    ])("leaves another namespace byte-identical on $label of the default one", ({ options }) => {
+      seed(SHOP, "shop");
+      const local = snapshot(testLocalStorage, SHOP);
+      const session = snapshot(testSessionStorage, SHOP);
+      Pulse.init(config);
+
+      Pulse.reset(options);
+
+      expect(snapshot(testLocalStorage, SHOP)).toEqual(local);
+      expect(snapshot(testSessionStorage, SHOP)).toEqual(session);
+      expect(snapshot(testSessionStorage, STORAGE_PREFIX)).toEqual([]);
+    });
+
+    it("deletes only the named namespace when reset before any initialization", () => {
+      seed(STORAGE_PREFIX, "default");
+      seed(SHOP, "shop");
+      testLocalStorage.setItem("app.theme", "dark");
+      const defaultLocal = snapshot(testLocalStorage, STORAGE_PREFIX);
+      const defaultSession = snapshot(testSessionStorage, STORAGE_PREFIX);
+
+      Pulse.reset({ storageNamespace: "shop" });
+
+      expect(snapshot(testLocalStorage, SHOP)).toEqual([]);
+      expect(snapshot(testSessionStorage, SHOP)).toEqual([]);
+      expect(snapshot(testLocalStorage, STORAGE_PREFIX)).toEqual(defaultLocal);
+      expect(snapshot(testSessionStorage, STORAGE_PREFIX)).toEqual(defaultSession);
+      expect(testLocalStorage.getItem("app.theme")).toBe("dark");
+    });
+
+    it("targets the running client's namespace when reset names none", () => {
+      seed(STORAGE_PREFIX, "default");
+      const defaultLocal = snapshot(testLocalStorage, STORAGE_PREFIX);
+      const defaultSession = snapshot(testSessionStorage, STORAGE_PREFIX);
+      Pulse.init(shopConfig);
+
+      Pulse.reset();
+
+      expect(snapshot(testLocalStorage, SHOP)).toEqual([]);
+      expect(snapshot(testSessionStorage, SHOP)).toEqual([]);
+      expect(snapshot(testLocalStorage, STORAGE_PREFIX)).toEqual(defaultLocal);
+      expect(snapshot(testSessionStorage, STORAGE_PREFIX)).toEqual(defaultSession);
+    });
+
+    it("disables the running client when reset targets another namespace", () => {
+      Pulse.init(config);
+
+      Pulse.reset({ storageNamespace: "shop" });
+
+      expect(Pulse.sessionId).toBeUndefined();
+      expect(Pulse.currentUserId).toBeUndefined();
+    });
+
+    it.each([
+      { label: "an invalid namespace", options: { storageNamespace: "Shop" } },
+      { label: "an invalid namespace with tab scope", options: { storageNamespace: "a.b", scope: "tab" } },
+      { label: "a non-string namespace", options: { storageNamespace: 42 } },
+      {
+        label: "a namespace getter that throws",
+        options: Object.defineProperty({}, "storageNamespace", {
+          get(): string {
+            throw new Error("hostile");
+          },
+        }),
+      },
+    ])("deletes every namespace browser-wide for $label", ({ options }) => {
+      seed(STORAGE_PREFIX, "default");
+      seed(SHOP, "shop");
+      seed("pulse:blog.", "blog");
+      testLocalStorage.setItem("app.theme", "dark");
+      testSessionStorage.setItem("app.tab", "1");
+      Pulse.init({ ...config, storageNamespace: "live" });
+      Pulse.info("buffered");
+      testWindow.dispatchEvent(new Event("pagehide"));
+
+      expect(() => Pulse.reset(options as PulseResetOptions)).not.toThrow();
+
+      expect(testLocalStorage.keys()).toEqual(["app.theme"]);
+      expect(testSessionStorage.keys()).toEqual(["app.tab"]);
+      expect(Pulse.currentUserId).toBeUndefined();
+    });
+
+    it("never replays a queue another namespace parked", async () => {
+      testLocalStorage.setItem(`${SHOP}offline_queue`, JSON.stringify([parkedEvent("shop-parked")]));
+      testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("default-parked")]));
+
+      Pulse.init(config);
+      await Pulse.flush();
+      await settle();
+      expect(sentEvents().map((event) => event.message)).toContain("default-parked");
+      expect(sentEvents().map((event) => event.message)).not.toContain("shop-parked");
+      expect(testLocalStorage.getItem(`${SHOP}offline_queue`)).not.toBeNull();
+
+      await Pulse.shutdown();
+      fetchMock.mockClear();
+      testLocalStorage.setItem(`${STORAGE_PREFIX}offline_queue`, JSON.stringify([parkedEvent("default-later")]));
+      Pulse.init(shopConfig);
+      await Pulse.flush();
+      await settle();
+
+      const messages = sentEvents().map((event) => event.message);
+      expect(messages).toContain("shop-parked");
+      expect(messages).not.toContain("default-later");
+    });
+
+    it("keeps another namespace's state trusted after a reset it could not confirm", async () => {
+      Pulse.init(config);
+      const anonymousId = Pulse.currentUserId;
+      const sessionId = Pulse.sessionId;
+      await Pulse.shutdown();
+      seed(SHOP, "shop");
+      testLocalStorage.throwOnRemove = true;
+      testSessionStorage.throwOnRemove = true;
+
+      Pulse.reset({ storageNamespace: "shop" });
+
+      testLocalStorage.throwOnRemove = false;
+      testSessionStorage.throwOnRemove = false;
+      // The default init adopts its identity and resumes its session.
+      expect(Pulse.init(config).reason).toBe("initialized");
+      expect(Pulse.currentUserId).toBe(anonymousId);
+      expect(Pulse.sessionId).toBe(sessionId);
+
+      // The shop's own guards still hold: its survivors are not adopted.
+      await Pulse.shutdown();
+      expect(Pulse.init(shopConfig).reason).toBe("initialized");
+      expect(Pulse.currentUserId).toMatch(/^pulse_anon_/);
+      expect(Pulse.currentUserId).not.toBe("pulse_anon_shop");
+      expect(Pulse.sessionId).not.toBe("session-shop");
+    });
   });
 
   it("reverts to the anonymous id on clearUser", async () => {
