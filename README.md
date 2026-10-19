@@ -60,7 +60,9 @@ browser `init` still works. `captureException` is a quiet no-op before initializ
 The first successful initialization wins. Equivalent normalized options return `unchanged` without
 restarting a session; callback identity matters. Changed valid options return `configuration-ignored`
 and keep the running client. To change options, use `await Pulse.shutdown()` (which drains), then
-`init` again, or disable first when queued events must be discarded.
+`init` again, or disable first when queued events must be discarded. That includes
+`storageNamespace`: an `init` with a different namespace while a client runs returns
+`configuration-ignored`, so call `await Pulse.shutdown()` first.
 
 `Pulse.init({ enabled: false })` stops an active client and discards its pending in-memory telemetry
 without flushing or parking it. It leaves pre-existing browser storage intact; a later enabled
@@ -488,7 +490,9 @@ The next `Pulse.init` starts as a new browser with a fresh anonymous id, and wit
 reset, of either scope, lets the next `init` resume a stored session. Nothing already sent to the
 server is recalled by it; delete that server-side. Calling it before any initialization is a safe
 no-op, and it never throws into your app. For the narrower job of tidying up a single tab, see
-[Cleaning up one stale tab](#cleaning-up-one-stale-tab).
+[Cleaning up one stale tab](#cleaning-up-one-stale-tab). When more than one app shares the origin,
+a reset deletes one app's storage namespace; see
+[Several apps on one origin](#several-apps-on-one-origin).
 
 Some browsers refuse the deletion itself — a sandboxed iframe, a privacy mode, a host app that
 replaced `localStorage`, where `removeItem` throws while `getItem` keeps working. A reset that
@@ -547,6 +551,52 @@ What it does not promise:
   parked them.
 - **It is not a consent withdrawal**, and nothing already sent to the server is recalled. Use
   `Pulse.reset()` for that, and delete the server-side data separately.
+
+### Several apps on one origin
+
+Two apps on one origin share `localStorage`, so by default they share the anonymous id, the offline
+queue and its Web Lock, and a reset in one deletes the other's state. Pubky App at `pubky.app` and
+its Shop at `pubky.app/shop` are an example. Give each app, or every app but one, its own
+`storageNamespace`:
+
+```ts
+// pubky.app: keeps the default namespace and its existing pulse.* keys
+Pulse.init({ apiKey: import.meta.env.VITE_PULSE_APP_KEY });
+
+// pubky.app/shop: its own namespace
+Pulse.init({ apiKey: import.meta.env.VITE_PULSE_SHOP_KEY, storageNamespace: "shop" });
+```
+
+A name is 1 to 32 characters matching `/^[a-z0-9][a-z0-9_-]{0,31}$/`: lowercase ASCII letters,
+digits, `_` and `-`, starting with a letter or digit. Anything else, uppercase included, is rejected
+rather than normalized: `configure` throws and `init` returns `invalid-configuration`. Without a
+namespace, every key stays under `pulse.` exactly as before (`pulse.anonymous_id`,
+`pulse.offline_queue`, and so on) and the queue lock is `pulse_offline_queue`. With `"shop"`, the
+keys move under `pulse:shop.` (`pulse:shop.anonymous_id`) and the lock becomes
+`pulse_offline_queue:shop`. Each namespace has its own anonymous id, user id, session, offline
+queue and lock, so neither app replays or deletes the other's events.
+
+A namespace isolates storage only. One client still runs per JavaScript realm, so the apps must run
+in separate pages or iframes, not side by side in one page. Adding a namespace to an app that
+already ran without one starts it as a new browser: its old `pulse.` state is not migrated.
+
+`Pulse.reset` acts on one namespace and leaves the others byte-identical:
+
+- `reset({ storageNamespace: "shop" })` deletes the Shop's state. It works before any `init`, so a
+  consent-withdrawal page can delete an app's data without starting that app's client.
+- `reset()` without the option targets the running client's namespace, or the default namespace when
+  no client is configured.
+- A `storageNamespace` that is present but invalid, or an option getter that throws, deletes more:
+  the default namespace, every `pulse:<name>.` namespace found in this browser and the running
+  client's are all deleted browser-wide, whatever `scope` says.
+- `scope: "tab"` applies within the target namespace. If the tab cleanup cannot be confirmed, it
+  falls back to a browser-wide deletion of that namespace only.
+- Every reset disables the running client, whichever namespace it targets.
+
+The reset guards are per namespace too. A reset requires a fresh session on the next `init` of the
+namespaces it deleted, and a deletion the browser refused makes only that namespace's stored state
+untrusted for the rest of the page. Resetting the Shop does not make the App's next `init` distrust
+its state or abandon its session.
 
 ## User properties
 
@@ -770,12 +820,14 @@ await Pulse.flush(); // attempt queued events and wait within the attachment dea
 await Pulse.shutdown(); // flush, then remove every page hook the SDK installed
 Pulse.reset(); // stop without flushing and delete this browser's stored SDK data
 Pulse.reset({ scope: "tab" }); // the same, but only this tab's state
+Pulse.reset({ storageNamespace: "shop" }); // delete another namespace's data, even before init
 ```
 
 `shutdown` drains what is pending and leaves the offline queue for the next page load; `reset` is
 the consent-withdrawal path and deletes it, while `reset({ scope: "tab" })` leaves the shared queue
-for the other tabs. See [Identity](#identity) and
-[Cleaning up one stale tab](#cleaning-up-one-stale-tab).
+for the other tabs. Each reset acts on one storage namespace. See [Identity](#identity),
+[Cleaning up one stale tab](#cleaning-up-one-stale-tab) and
+[Several apps on one origin](#several-apps-on-one-origin).
 
 When the page is hidden or unloaded the SDK flushes on its own with a `keepalive` request and parks
 whatever does not fit — including the batch that was still waiting out a retry — in an offline queue
@@ -833,6 +885,7 @@ can also discard telemetry. Increasing `maxBufferSize` does not increase these b
 | `sessionTimeoutMs` | `number` | `1800000` | Idle time after which a new session starts. |
 | `deviceInfo` | `boolean \| { os?: boolean; browser?: boolean; language?: boolean }` | `true` | Device and locale fields derived from the browser; `false` sends none of them. |
 | `supportedLanguages` | `string[]` | not sent | The locales your app ships. Written through to the app record on the server and used for localization-gap analysis. Set it explicitly; the SDK never derives it from the browser. |
+| `storageNamespace` | `string` | None: keys under `pulse.`, lock `pulse_offline_queue` | Isolates this app's stored state from other apps on the origin. Must match `/^[a-z0-9][a-z0-9_-]{0,31}$/`. A name moves keys to `pulse:<name>.` and the queue lock to `pulse_offline_queue:<name>`. See [Several apps on one origin](#several-apps-on-one-origin). |
 
 `deviceInfo` gates what the SDK reads from the browser and stamps on every event and on feedback:
 `os` drops `os_version`, `browser` drops `device_model`, and `language` drops both `locale` and
